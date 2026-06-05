@@ -396,7 +396,8 @@ pub(crate) fn get_arrow_struct_record_batch() -> (RecordBatch, SchemaRef) {
 }
 
 pub(crate) fn get_arrow_decimal_record_batch() -> (RecordBatch, SchemaRef) {
-    let decimal32_array = Decimal32Array::from(vec![123, 222, 321]);
+    let decimal32_array =
+        Decimal32Array::from(vec![i32::from(123), i32::from(222), i32::from(321)]);
     let decimal64_array =
         Decimal64Array::from(vec![i64::from(123), i64::from(222), i64::from(321)]);
     let decimal128_array =
@@ -426,7 +427,8 @@ pub(crate) fn get_arrow_decimal_record_batch() -> (RecordBatch, SchemaRef) {
 }
 
 pub(crate) fn get_mysql_arrow_decimal_record() -> (RecordBatch, SchemaRef) {
-    let decimal32_array = Decimal32Array::from(vec![123, 222, 321]);
+    let decimal32_array =
+        Decimal32Array::from(vec![i32::from(123), i32::from(222), i32::from(321)]);
     let decimal64_array =
         Decimal64Array::from(vec![i64::from(123), i64::from(222), i64::from(321)]);
     let decimal128_array =
@@ -598,42 +600,6 @@ pub(crate) fn get_arrow_list_record_batch() -> (RecordBatch, SchemaRef) {
         ],
     )
     .expect("Failed to created arrow list record batch");
-
-    (record_batch, schema)
-}
-
-// List(Utf8) - List of strings
-pub(crate) fn get_arrow_list_utf8_record_batch() -> (RecordBatch, SchemaRef) {
-    let mut list_builder = ListBuilder::new(StringBuilder::new());
-    list_builder.append_value([Some("foo"), Some("bar"), Some("baz")]);
-    list_builder.append_value([Some("hello")]);
-    list_builder.append_value([Some("world"), Some("test")]);
-    let list_array = list_builder.finish();
-
-    let mut large_list_builder = LargeListBuilder::new(StringBuilder::new());
-    large_list_builder.append_value([Some("alpha"), Some("beta"), Some("gamma")]);
-    large_list_builder.append_value([Some("delta")]);
-    large_list_builder.append_value([Some("epsilon")]);
-    let large_list_array = large_list_builder.finish();
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new(
-            "list_utf8",
-            DataType::List(Field::new("item", DataType::Utf8, true).into()),
-            false,
-        ),
-        Field::new(
-            "large_list_utf8",
-            DataType::LargeList(Field::new("item", DataType::Utf8, true).into()),
-            false,
-        ),
-    ]));
-
-    let record_batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![Arc::new(list_array), Arc::new(large_list_array)],
-    )
-    .expect("Failed to created arrow list utf8 record batch");
 
     (record_batch, schema)
 }

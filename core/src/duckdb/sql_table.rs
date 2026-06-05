@@ -1,43 +1,37 @@
 use crate::sql::db_connection_pool::DbConnectionPool;
-use crate::sql::sql_provider_datafusion::expr::Engine;
-use crate::sql::sql_provider_datafusion::{
-    get_stream, to_execution_error, Result as SqlResult, SqlExec, SqlTable,
-};
-use crate::util::column_reference::ColumnReference;
-use crate::util::indexes::IndexType;
-use crate::util::supported_functions::FunctionSupport;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::Constraints;
 use datafusion::sql::unparser::dialect::Dialect;
-use datafusion::{
-    arrow::datatypes::SchemaRef,
-    datasource::TableProvider,
-    error::Result as DataFusionResult,
-    execution::TaskContext,
-    logical_expr::{Expr, TableProviderFilterPushDown, TableType},
-    physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan,
-        PlanProperties, SendableRecordBatchStream,
-    },
-    sql::{unparser::dialect::DuckDBDialect, TableReference},
-};
-use datafusion_physical_expr::EquivalenceProperties;
 use futures::TryStreamExt;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::{any::Any, fmt, sync::Arc};
+
+use crate::sql::sql_provider_datafusion::{
+    get_stream, to_execution_error, Result as SqlResult, SqlExec, SqlTable,
+};
+use datafusion::{
+    arrow::datatypes::SchemaRef,
+    config::ConfigOptions,
+    datasource::TableProvider,
+    error::{DataFusionError, Result as DataFusionResult},
+    execution::TaskContext,
+    logical_expr::{Expr, TableProviderFilterPushDown, TableType},
+    physical_expr::PhysicalSortExpr,
+    physical_plan::{
+        filter_pushdown::{ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation},
+        sort_pushdown::SortOrderPushdownResult,
+        stream::RecordBatchStreamAdapter,
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+    },
+    sql::{unparser::dialect::DuckDBDialect, TableReference},
+};
 
 pub struct DuckDBTable<T: 'static, P: 'static> {
     pub(crate) base_table: SqlTable<T, P>,
 
     /// A mapping of table/view names to `DuckDB` functions that can instantiate a table (e.g. "`read_parquet`('`my_file.parquet`')").
     pub(crate) table_functions: Option<HashMap<String, String>>,
-
-    pub(crate) function_support: Option<FunctionSupport>,
-
-    /// A list of indexes as expressed by columns reference in their index expressions.
-    pub(crate) indexes: Vec<(ColumnReference, IndexType)>,
 }
 
 impl<T, P> std::fmt::Debug for DuckDBTable<T, P> {
@@ -49,58 +43,35 @@ impl<T, P> std::fmt::Debug for DuckDBTable<T, P> {
 }
 
 impl<T, P> DuckDBTable<T, P> {
-    #[allow(clippy::too_many_arguments)]
     pub fn new_with_schema(
         pool: &Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
         schema: impl Into<SchemaRef>,
         table_reference: impl Into<TableReference>,
         table_functions: Option<HashMap<String, String>>,
         dialect: Option<Arc<dyn Dialect + Send + Sync>>,
-        constraints: Option<Constraints>,
-        function_support: Option<FunctionSupport>,
-        indexes: Vec<(ColumnReference, IndexType)>,
     ) -> Self {
-        let base_table = SqlTable::new_with_schema(
-            "duckdb",
-            pool,
-            schema,
-            table_reference,
-            Some(Engine::DuckDB),
-        )
-        .with_dialect(dialect.unwrap_or(Arc::new(DuckDBDialect::new())))
-        .with_constraints_opt(constraints)
-        .with_function_support(function_support.clone());
+        let base_table = SqlTable::new_with_schema("duckdb", pool, schema, table_reference)
+            .with_dialect(dialect.unwrap_or(Arc::new(DuckDBDialect::new())));
 
         Self {
             base_table,
             table_functions,
-            function_support,
-            indexes,
         }
-    }
-
-    #[must_use]
-    pub fn with_indexes(mut self, indexes: Vec<(ColumnReference, IndexType)>) -> Self {
-        self.indexes = indexes;
-        self
     }
 
     fn create_physical_plan(
         &self,
-        projections: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         schema: &SchemaRef,
-        filters: &[Expr],
-        limit: Option<usize>,
+        sql: String,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DuckSqlExec::new(
-            projections,
+            projection,
             schema,
-            &self.base_table.table_reference,
             self.base_table.clone_pool(),
-            filters,
-            limit,
+            sql,
             self.table_functions.clone(),
-            self.indexes.clone(),
+            self.base_table.dialect_arc(),
         )?))
     }
 }
@@ -126,10 +97,6 @@ impl<T, P> TableProvider for DuckDBTable<T, P> {
         self.base_table.supports_filters_pushdown(filters)
     }
 
-    fn constraints(&self) -> Option<&Constraints> {
-        self.base_table.constraints()
-    }
-
     async fn scan(
         &self,
         _state: &dyn Session,
@@ -137,7 +104,8 @@ impl<T, P> TableProvider for DuckDBTable<T, P> {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        return self.create_physical_plan(projection, &self.schema(), filters, limit);
+        let sql = self.base_table.scan_to_sql(projection, filters, limit)?;
+        return self.create_physical_plan(projection, &self.schema(), sql);
     }
 }
 
@@ -147,69 +115,30 @@ impl<T, P> Display for DuckDBTable<T, P> {
     }
 }
 
-pub struct DuckSqlExec<T, P> {
+#[derive(Clone)]
+struct DuckSqlExec<T, P> {
     base_exec: SqlExec<T, P>,
     table_functions: Option<HashMap<String, String>>,
-    indexes: Vec<(ColumnReference, IndexType)>,
-    optimized_sql: Option<String>,
-    optimized_sql_schema: Option<SchemaRef>,
-    optimized_sql_properties: Option<PlanProperties>,
 }
 
-impl<T, P> Clone for DuckSqlExec<T, P> {
-    fn clone(&self) -> Self {
-        DuckSqlExec {
-            base_exec: self.base_exec.clone(),
-            table_functions: self.table_functions.clone(),
-            indexes: self.indexes.clone(),
-            optimized_sql: self.optimized_sql.clone(),
-            optimized_sql_schema: self.optimized_sql_schema.clone(),
-            optimized_sql_properties: self.optimized_sql_properties.clone(),
-        }
-    }
-}
-
-impl<T: 'static, P: 'static> DuckSqlExec<T, P> {
-    #[allow(clippy::too_many_arguments)]
+impl<T, P> DuckSqlExec<T, P> {
     fn new(
-        projections: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         schema: &SchemaRef,
-        table_reference: &TableReference,
         pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
-        filters: &[Expr],
-        limit: Option<usize>,
+        sql: String,
         table_functions: Option<HashMap<String, String>>,
-        indexes: Vec<(ColumnReference, IndexType)>,
+        dialect: Arc<dyn Dialect + Send + Sync>,
     ) -> DataFusionResult<Self> {
-        let base_exec = SqlExec::new(
-            projections,
-            schema,
-            table_reference,
-            pool,
-            filters,
-            limit,
-            Some(Engine::DuckDB),
-        )?;
+        let base_exec = SqlExec::new(projection, schema, pool, sql, dialect)?;
 
         Ok(Self {
             base_exec,
             table_functions,
-            indexes,
-            optimized_sql: None,
-            optimized_sql_schema: None,
-            optimized_sql_properties: None,
         })
     }
-}
 
-impl<T: 'static, P: 'static> DuckSqlExec<T, P> {
-    /// The SQL expression for this execution node. This may differ from `DuckSqlExec::base_sql`
-    /// if rewritten by an optimization step.
-    pub fn sql(&self) -> SqlResult<String> {
-        if let Some(sql) = &self.optimized_sql {
-            return Ok(sql.clone());
-        }
-
+    fn sql(&self) -> SqlResult<String> {
         let sql = self.base_exec.sql()?;
 
         Ok(format!(
@@ -217,48 +146,16 @@ impl<T: 'static, P: 'static> DuckSqlExec<T, P> {
             cte_expr = get_cte(&self.table_functions)
         ))
     }
-
-    /// Indexes that may be bound for the SQL expression in this execution node
-    #[must_use]
-    pub fn indexes(&self) -> &[(ColumnReference, IndexType)] {
-        &self.indexes
-    }
-
-    /// The unoptimized SQL expression for this execution node
-    pub fn base_sql(&self) -> SqlResult<String> {
-        self.base_exec.sql()
-    }
-
-    /// Use this method to bind an optimized SQL expression from a `PhysicalOptimizerRule`. Provide
-    /// a `new_schema` if changing the output schema of this node.
-    #[must_use]
-    pub fn with_optimized_sql(
-        mut self,
-        sql: impl Into<String>,
-        new_schema: Option<SchemaRef>,
-    ) -> Self {
-        self.optimized_sql = Some(sql.into());
-        self.optimized_sql_schema = new_schema;
-
-        if let Some(schema) = self.optimized_sql_schema.as_ref() {
-            let mut properties = self.base_exec.properties().clone();
-            let eq_properties = EquivalenceProperties::new(Arc::clone(schema));
-            properties.eq_properties = eq_properties;
-            self.optimized_sql_properties = Some(properties);
-        }
-
-        self
-    }
 }
 
-impl<T: 'static, P: 'static> std::fmt::Debug for DuckSqlExec<T, P> {
+impl<T, P> std::fmt::Debug for DuckSqlExec<T, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let sql = self.sql().unwrap_or_default();
         write!(f, "DuckSqlExec sql={sql}")
     }
 }
 
-impl<T: 'static, P: 'static> DisplayAs for DuckSqlExec<T, P> {
+impl<T, P> DisplayAs for DuckSqlExec<T, P> {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         let sql = self.sql().unwrap_or_default();
         write!(f, "DuckSqlExec sql={sql}")
@@ -275,16 +172,11 @@ impl<T: 'static, P: 'static> ExecutionPlan for DuckSqlExec<T, P> {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.optimized_sql_schema
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| self.base_exec.schema())
+        self.base_exec.schema()
     }
 
-    fn properties(&self) -> &PlanProperties {
-        self.optimized_sql_properties
-            .as_ref()
-            .unwrap_or_else(|| self.base_exec.properties())
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.base_exec.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -296,6 +188,103 @@ impl<T: 'static, P: 'static> ExecutionPlan for DuckSqlExec<T, P> {
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> DataFusionResult<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        match self.base_exec.try_pushdown_sort(order)? {
+            SortOrderPushdownResult::Exact { inner } => {
+                let base_exec = inner
+                    .as_any()
+                    .downcast_ref::<SqlExec<T, P>>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "Failed to downcast SqlExec in sort pushdown".to_string(),
+                        )
+                    })?
+                    .clone();
+                Ok(SortOrderPushdownResult::Exact {
+                    inner: Arc::new(DuckSqlExec {
+                        base_exec,
+                        table_functions: self.table_functions.clone(),
+                    }),
+                })
+            }
+            SortOrderPushdownResult::Inexact { inner } => {
+                let base_exec = inner
+                    .as_any()
+                    .downcast_ref::<SqlExec<T, P>>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "Failed to downcast SqlExec in sort pushdown".to_string(),
+                        )
+                    })?
+                    .clone();
+                Ok(SortOrderPushdownResult::Inexact {
+                    inner: Arc::new(DuckSqlExec {
+                        base_exec,
+                        table_functions: self.table_functions.clone(),
+                    }),
+                })
+            }
+            SortOrderPushdownResult::Unsupported => Ok(SortOrderPushdownResult::Unsupported),
+        }
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.base_exec.fetch()
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        let base_exec = self
+            .base_exec
+            .with_fetch(limit)?
+            .as_any()
+            .downcast_ref::<SqlExec<T, P>>()?
+            .clone();
+        Some(Arc::new(DuckSqlExec {
+            base_exec,
+            table_functions: self.table_functions.clone(),
+        }))
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        config: &ConfigOptions,
+    ) -> DataFusionResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        let result =
+            self.base_exec
+                .handle_child_pushdown_result(phase, child_pushdown_result, config)?;
+        let updated_node = result
+            .updated_node
+            .map(|node| {
+                let base_exec = node
+                    .as_any()
+                    .downcast_ref::<SqlExec<T, P>>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "Failed to downcast SqlExec in filter pushdown".to_string(),
+                        )
+                    })?
+                    .clone();
+                Ok::<_, DataFusionError>(Arc::new(DuckSqlExec {
+                    base_exec,
+                    table_functions: self.table_functions.clone(),
+                }) as Arc<dyn ExecutionPlan>)
+            })
+            .transpose()?;
+        Ok(FilterPushdownPropagation {
+            filters: result.filters,
+            updated_node,
+        })
     }
 
     fn execute(

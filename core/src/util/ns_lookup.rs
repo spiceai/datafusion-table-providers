@@ -1,10 +1,8 @@
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use hickory_resolver::Resolver;
+use hickory_resolver::TokioResolver;
 use snafu::prelude::*;
-use tokio::net::TcpStream;
-use tokio::time::timeout;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -64,7 +62,7 @@ pub async fn verify_endpoint_connection(endpoint: &str) -> Result<()> {
 pub async fn verify_ns_lookup_and_tcp_connect(host: &str, port: u16) -> Result<()> {
     // DefaultConfig uses google as upstream nameservers which won't work for kubernetes name
     // resolving
-    let resolver = Resolver::builder_tokio()
+    let resolver = TokioResolver::builder_tokio()
         .map_err(|_| Error::UnableToConnect {
             host: host.to_string(),
             port,
@@ -74,19 +72,12 @@ pub async fn verify_ns_lookup_and_tcp_connect(host: &str, port: u16) -> Result<(
         Ok(ips) => {
             for ip in ips.iter() {
                 let addr = SocketAddr::new(ip, port);
-                match timeout(Duration::from_secs(30), TcpStream::connect(addr)).await {
-                    Ok(Ok(stream)) => {
-                        drop(stream);
-                        return Ok(());
-                    }
-                    Ok(Err(err)) => {
-                        tracing::debug!("Failed to connect to {addr}: {err}");
-                    }
-                    Err(_) => {
-                        tracing::debug!("Failed to connect to {addr}, connection timed out");
-                    }
+                if TcpStream::connect_timeout(&addr, Duration::from_secs(30)).is_ok() {
+                    return Ok(());
                 }
             }
+
+            tracing::debug!("Failed to connect to {host}:{port}, connection timed out");
 
             UnableToConnectSnafu {
                 host: host.to_string(),

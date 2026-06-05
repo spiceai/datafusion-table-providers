@@ -1,5 +1,6 @@
 use crate::sql::db_connection_pool::{dbconnection::get_schema, JoinPushDown};
 use async_trait::async_trait;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion_federation::sql::{
     RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
 };
@@ -22,7 +23,11 @@ use datafusion::{
 };
 
 impl<T, P> SqlTable<T, P> {
-    #[allow(dead_code)]
+    // Return the current memory location of the object as a unique identifier
+    fn unique_id(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
     fn arc_dialect(&self) -> Arc<dyn Dialect + Send + Sync> {
         match &self.dialect {
             Some(dialect) => Arc::clone(dialect),
@@ -30,26 +35,23 @@ impl<T, P> SqlTable<T, P> {
         }
     }
 
-    fn create_federated_table_source(self: Arc<Self>) -> Arc<dyn FederatedTableSource> {
+    fn create_federated_table_source(
+        self: Arc<Self>,
+    ) -> DataFusionResult<Arc<dyn FederatedTableSource>> {
         let table_reference = self.table_reference.clone();
         let schema = Arc::clone(&self.schema);
         let fed_provider = Arc::new(SQLFederationProvider::new(self));
-        Arc::new(SQLTableSource::new_with_schema(
+        Ok(Arc::new(SQLTableSource::new_with_schema(
             fed_provider,
             RemoteTableRef::from(table_reference),
             schema,
-        ))
+        )))
     }
 
-    /// Creates a federated table provider.
-    ///
-    /// # Errors
-    ///
-    /// This function currently never returns an error, but the Result type is kept for API compatibility.
     pub fn create_federated_table_provider(
         self: Arc<Self>,
     ) -> DataFusionResult<FederatedTableProviderAdaptor> {
-        let table_source = Self::create_federated_table_source(Arc::clone(&self));
+        let table_source = Self::create_federated_table_source(Arc::clone(&self))?;
         Ok(FederatedTableProviderAdaptor::new_with_provider(
             table_source,
             self,
@@ -60,7 +62,7 @@ impl<T, P> SqlTable<T, P> {
 #[async_trait]
 impl<T, P> SQLExecutor for SqlTable<T, P> {
     fn name(&self) -> &str {
-        self.name
+        &self.name
     }
 
     fn compute_context(&self) -> Option<String> {
@@ -68,23 +70,19 @@ impl<T, P> SQLExecutor for SqlTable<T, P> {
             JoinPushDown::AllowedFor(context) => Some(context),
             // Don't return None here - it will cause incorrect federation with other providers of the same name that also have a compute_context of None.
             // Instead return a random string that will never match any other provider's context.
-            JoinPushDown::Disallow => Some(format!("{}", std::ptr::from_ref(self) as usize)),
+            JoinPushDown::Disallow => Some(format!("{}", self.unique_id())),
         }
     }
 
-    /// Return the provided [`Dialect`], defaulting to [`DefaultDialect`].
     fn dialect(&self) -> Arc<dyn Dialect> {
-        let Some(ref dialect) = self.dialect else {
-            // TODO: Derive default from [`SQLExecutor::engine`].
-            return Arc::new(DefaultDialect {});
-        };
-        Arc::clone(dialect) as Arc<_>
+        self.arc_dialect()
     }
 
     fn execute(
         &self,
         query: &str,
         schema: SchemaRef,
+        _filters: &[Arc<dyn PhysicalExpr>],
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let fut = get_stream(
             Arc::clone(&self.pool),

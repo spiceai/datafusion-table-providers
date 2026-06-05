@@ -31,22 +31,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 
 use super::creator::{TableDefinition, TableManager, ViewCreator};
-use super::write_settings::DuckDBWriteSettings;
 use super::{to_datafusion_error, RelationName};
-
-/// A callback handler that is invoked after data has been successfully written to a DuckDB table
-/// but before the transaction is committed.
-///
-/// The handler executes within the same transaction as the data write operation. This means:
-/// - Any operations performed by the handler are atomic with the data write
-/// - If the handler returns an error, both the handler's operations and the data write are rolled back
-/// - The handler has access to the newly written data for queries and validations
-pub type WriteCompletionHandler = Arc<
-    dyn Fn(&Transaction<'_>, &TableManager, &SchemaRef, u64) -> datafusion::common::Result<()>
-        + Send
-        + Sync
-        + 'static,
->;
 
 // checking schemas are equivalent is disabled because it incorrectly marks single-level list fields are different when the name of the field is different
 // e.g. List(Field { name: 'a', data_type: Int32 }) != List(Field { name: 'b', data_type: Int32 })
@@ -59,9 +44,7 @@ pub struct DuckDBTableWriterBuilder {
     read_provider: Option<Arc<dyn TableProvider>>,
     pool: Option<Arc<DuckDbConnectionPool>>,
     on_conflict: Option<OnConflict>,
-    table_definition: Option<Arc<TableDefinition>>,
-    on_data_written: Option<WriteCompletionHandler>,
-    write_settings: Option<DuckDBWriteSettings>,
+    table_definition: Option<TableDefinition>,
 }
 
 impl DuckDBTableWriterBuilder {
@@ -90,19 +73,7 @@ impl DuckDBTableWriterBuilder {
 
     #[must_use]
     pub fn with_table_definition(mut self, table_definition: TableDefinition) -> Self {
-        self.table_definition = Some(Arc::new(table_definition));
-        self
-    }
-
-    #[must_use]
-    pub fn with_on_data_written(mut self, on_data_written: WriteCompletionHandler) -> Self {
-        self.on_data_written = Some(on_data_written);
-        self
-    }
-
-    #[must_use]
-    pub fn with_write_settings(mut self, write_settings: DuckDBWriteSettings) -> Self {
-        self.write_settings = Some(write_settings);
+        self.table_definition = Some(table_definition);
         self
     }
 
@@ -130,10 +101,8 @@ impl DuckDBTableWriterBuilder {
         Ok(DuckDBTableWriter {
             read_provider,
             on_conflict: self.on_conflict,
-            table_definition,
+            table_definition: Arc::new(table_definition),
             pool,
-            on_data_written: self.on_data_written,
-            write_settings: self.write_settings.unwrap_or_default(),
         })
     }
 }
@@ -144,26 +113,11 @@ pub struct DuckDBTableWriter {
     pool: Arc<DuckDbConnectionPool>,
     table_definition: Arc<TableDefinition>,
     on_conflict: Option<OnConflict>,
-    on_data_written: Option<WriteCompletionHandler>,
-    write_settings: DuckDBWriteSettings,
 }
 
 impl std::fmt::Debug for DuckDBTableWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DuckDBTableWriter")
-            .field("read_provider", &self.read_provider)
-            .field("pool", &self.pool)
-            .field("table_definition", &self.table_definition)
-            .field("on_conflict", &self.on_conflict)
-            .field(
-                "on_data_written",
-                &self
-                    .on_data_written
-                    .as_ref()
-                    .map_or("None", |_| "Some(callback)"),
-            )
-            .field("write_settings", &self.write_settings)
-            .finish()
+        write!(f, "DuckDBTableWriter")
     }
 }
 
@@ -176,22 +130,6 @@ impl DuckDBTableWriter {
     #[must_use]
     pub fn table_definition(&self) -> Arc<TableDefinition> {
         Arc::clone(&self.table_definition)
-    }
-
-    #[must_use]
-    pub fn on_conflict(&self) -> Option<&OnConflict> {
-        self.on_conflict.as_ref()
-    }
-
-    #[must_use]
-    pub fn write_settings(&self) -> &DuckDBWriteSettings {
-        &self.write_settings
-    }
-
-    #[must_use]
-    pub fn with_on_data_written_handler(mut self, on_data_written: WriteCompletionHandler) -> Self {
-        self.on_data_written = Some(on_data_written);
-        self
     }
 }
 
@@ -231,31 +169,27 @@ impl TableProvider for DuckDBTableWriter {
         input: Arc<dyn ExecutionPlan>,
         op: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let mut sink = DuckDBDataSink::new(
-            Arc::clone(&self.pool),
-            Arc::clone(&self.table_definition),
-            op,
-            self.on_conflict.clone(),
-            self.schema(),
-        )
-        .with_write_settings(self.write_settings.clone());
-
-        if let Some(handler) = &self.on_data_written {
-            sink = sink.with_on_data_written_handler(Arc::clone(handler));
-        }
-
-        Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)) as _)
+        Ok(Arc::new(DataSinkExec::new(
+            input,
+            Arc::new(DuckDBDataSink::new(
+                Arc::clone(&self.pool),
+                Arc::clone(&self.table_definition),
+                op,
+                self.on_conflict.clone(),
+                self.schema(),
+            )),
+            None,
+        )) as _)
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct DuckDBDataSink {
     pool: Arc<DuckDbConnectionPool>,
     table_definition: Arc<TableDefinition>,
     overwrite: InsertOp,
     on_conflict: Option<OnConflict>,
     schema: SchemaRef,
-    on_data_written: Option<WriteCompletionHandler>,
-    write_settings: DuckDBWriteSettings,
 }
 
 #[async_trait]
@@ -281,8 +215,6 @@ impl DataSink for DuckDBDataSink {
         let table_definition = Arc::clone(&self.table_definition);
         let overwrite = self.overwrite;
         let on_conflict = self.on_conflict.clone();
-        let on_data_written = self.on_data_written.clone();
-        let write_settings = self.write_settings.clone();
 
         // Limit channel size to a maximum of 100 RecordBatches queued for cases when DuckDB is slower than the writer stream,
         // so that we don't significantly increase memory usage. After the maximum RecordBatches are queued, the writer stream will wait
@@ -302,20 +234,16 @@ impl DataSink for DuckDBDataSink {
                         &table_definition,
                         batch_rx,
                         on_conflict.as_ref(),
-                        on_data_written.as_ref(),
                         on_commit_transaction,
                         schema,
-                        &write_settings,
                     )?,
                     InsertOp::Append | InsertOp::Replace => insert_append(
                         pool,
                         &table_definition,
                         batch_rx,
                         on_conflict.as_ref(),
-                        on_data_written.as_ref(),
                         on_commit_transaction,
                         schema,
-                        &write_settings,
                     )?,
                 };
 
@@ -327,9 +255,8 @@ impl DataSink for DuckDBDataSink {
 
             if let Some(constraints) = self.table_definition.constraints() {
                 constraints::validate_batch_with_constraints(
-                    vec![batch.clone()],
+                    std::slice::from_ref(&batch),
                     constraints,
-                    &crate::util::constraints::UpsertOptions::default(),
                 )
                 .await
                 .context(super::ConstraintViolationSnafu)
@@ -387,21 +314,7 @@ impl DuckDBDataSink {
             overwrite,
             on_conflict,
             schema,
-            on_data_written: None,
-            write_settings: DuckDBWriteSettings::default(),
         }
-    }
-
-    #[must_use]
-    pub fn with_on_data_written_handler(mut self, handler: WriteCompletionHandler) -> Self {
-        self.on_data_written = Some(handler);
-        self
-    }
-
-    #[must_use]
-    pub fn with_write_settings(mut self, write_settings: DuckDBWriteSettings) -> Self {
-        self.write_settings = write_settings;
-        self
     }
 }
 
@@ -417,16 +330,13 @@ impl DisplayAs for DuckDBDataSink {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn insert_append(
     pool: Arc<DuckDbConnectionPool>,
     table_definition: &Arc<TableDefinition>,
     batch_rx: Receiver<RecordBatch>,
     on_conflict: Option<&OnConflict>,
-    on_data_written: Option<&WriteCompletionHandler>,
     mut on_commit_transaction: tokio::sync::oneshot::Receiver<()>,
     schema: SchemaRef,
-    write_settings: &DuckDBWriteSettings,
 ) -> datafusion::common::Result<u64> {
     let mut db_conn = pool
         .connect_sync()
@@ -441,9 +351,35 @@ fn insert_append(
         .context(super::UnableToBeginTransactionSnafu)
         .map_err(to_retriable_data_write_error)?;
 
-    let append_table = TableManager::new(Arc::clone(table_definition))
-        .with_internal(false)
-        .map_err(to_retriable_data_write_error)?;
+    // Check if there's an internal table from a previous Overwrite operation.
+    // If so, we need to append to that internal table instead of the base table name
+    // (which would be a view after Overwrite).
+    let append_table = {
+        let base_table_manager = TableManager::new(Arc::clone(table_definition))
+            .with_internal(false)
+            .map_err(to_retriable_data_write_error)?;
+
+        // List internal tables to see if a previous Overwrite created a view structure
+        let internal_tables = table_definition
+            .list_internal_tables(&tx)
+            .map_err(to_retriable_data_write_error)?;
+
+        if let Some((latest_internal_table_name, _)) = internal_tables.last() {
+            // There's an internal table from a previous Overwrite - use it for appending
+            tracing::debug!(
+                "Found internal table {} from previous overwrite, using it for append instead of base table {}",
+                latest_internal_table_name,
+                base_table_manager.table_name()
+            );
+            TableManager::from_table_name(
+                Arc::clone(table_definition),
+                latest_internal_table_name.clone(),
+            )
+        } else {
+            // No internal tables - use the base table as normal
+            base_table_manager
+        }
+    };
 
     let should_have_indexes = !append_table.indexes_vec().is_empty();
     let has_indexes = !append_table
@@ -471,22 +407,8 @@ fn insert_append(
         "Append load for {table_name}",
         table_name = append_table.table_name()
     );
-    let num_rows = write_to_table(
-        &append_table,
-        &tx,
-        Arc::clone(&schema),
-        batch_rx,
-        on_conflict,
-    )
-    .map_err(to_retriable_data_write_error)?;
-
-    if let Some(callback) = on_data_written {
-        callback(&tx, &append_table, &schema, num_rows)?;
-    }
-
-    if write_settings.recompute_statistics_on_write {
-        execute_analyze_sql(&tx, &append_table.table_name().to_string());
-    }
+    let num_rows = write_to_table(&append_table, &tx, schema, batch_rx, on_conflict)
+        .map_err(to_retriable_data_write_error)?;
 
     on_commit_transaction
         .try_recv()
@@ -541,16 +463,13 @@ fn insert_append(
 }
 
 #[allow(clippy::too_many_lines)]
-#[allow(clippy::too_many_arguments)]
 fn insert_overwrite(
     pool: Arc<DuckDbConnectionPool>,
     table_definition: &Arc<TableDefinition>,
     batch_rx: Receiver<RecordBatch>,
     on_conflict: Option<&OnConflict>,
-    on_data_written: Option<&WriteCompletionHandler>,
     mut on_commit_transaction: tokio::sync::oneshot::Receiver<()>,
     schema: SchemaRef,
-    write_settings: &DuckDBWriteSettings,
 ) -> datafusion::common::Result<u64> {
     let cloned_pool = Arc::clone(&pool);
     let mut db_conn = pool
@@ -643,7 +562,7 @@ fn insert_overwrite(
     }
 
     tracing::debug!("Initial load for {}", new_table.table_name());
-    let num_rows = write_to_table(&new_table, &tx, Arc::clone(&schema), batch_rx, on_conflict)
+    let num_rows = write_to_table(&new_table, &tx, schema, batch_rx, on_conflict)
         .map_err(to_retriable_data_write_error)?;
 
     on_commit_transaction
@@ -659,14 +578,6 @@ fn insert_overwrite(
     new_table
         .create_view(&tx)
         .map_err(to_retriable_data_write_error)?;
-
-    if let Some(callback) = on_data_written {
-        callback(&tx, &new_table, &schema, num_rows)?;
-    }
-
-    if write_settings.recompute_statistics_on_write {
-        execute_analyze_sql(&tx, &new_table.table_name().to_string());
-    }
 
     tx.commit()
         .context(super::UnableToCommitTransactionSnafu)
@@ -733,30 +644,6 @@ fn write_to_table(
     view.drop(tx).map_err(to_datafusion_error)?;
 
     Ok(rows as u64)
-}
-
-/// Executes an ANALYZE statement to update query optimizer statistics.
-/// This helps DuckDB's query planner generate better execution plans, especially after large data changes.
-/// https://duckdb.org/docs/stable/sql/statements/analyze
-///
-/// Errors are logged but do not fail the operation since statistics updates are non-critical.
-pub fn execute_analyze_sql(tx: &Transaction, table_name: &str) {
-    // DuckDB doesn't support parameterized table names in the ANALYZE statement
-    let analyze_sql = format!(r#"ANALYZE "{table_name}""#);
-    tracing::debug!("Executing analyze SQL: {analyze_sql}");
-    match tx.prepare(&analyze_sql) {
-        Ok(mut stmt) => match stmt.execute([]) {
-            Ok(_) => {
-                tracing::debug!("Analyze SQL executed for table '{table_name}'");
-            }
-            Err(e) => {
-                tracing::error!("Failed to execute analyze SQL for table '{table_name}': {e}");
-            }
-        },
-        Err(e) => {
-            tracing::error!("Failed to prepare analyze SQL for table '{table_name}': {e}");
-        }
-    }
 }
 
 struct RecordBatchReaderFromStream {
@@ -1076,6 +963,141 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_write_to_table_append_after_overwrite() {
+        // Test scenario: Write with Overwrite, then write with Append
+        // This tests the fix for the issue where Append fails after Overwrite because
+        // Overwrite creates a view pointing to an internal table, and Append was trying
+        // to insert into the view instead of the internal table.
+        // Expected behavior: Append should detect the internal table and insert into it.
+
+        let _guard = init_tracing(None);
+        let pool = get_mem_duckdb();
+
+        let table_definition = get_basic_table_definition();
+
+        // Step 1: Do an Overwrite operation (creates internal table + view)
+        let duckdb_sink = DuckDBDataSink::new(
+            Arc::clone(&pool),
+            Arc::clone(&table_definition),
+            InsertOp::Overwrite,
+            None,
+            table_definition.schema(),
+        );
+        let data_sink: Arc<dyn DataSink> = Arc::new(duckdb_sink);
+
+        let batches = vec![RecordBatch::try_new(
+            Arc::clone(&table_definition.schema()),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), Some(2)])),
+                Arc::new(StringArray::from(vec![Some("a"), Some("b")])),
+            ],
+        )
+        .expect("should create a record batch")];
+
+        let stream = Box::pin(
+            MemoryStream::try_new(batches, table_definition.schema(), None).expect("to get stream"),
+        );
+
+        data_sink
+            .write_all(stream, &Arc::new(TaskContext::default()))
+            .await
+            .expect("to write all with overwrite");
+
+        // Verify Overwrite created an internal table and view
+        {
+            let mut conn = Arc::clone(&pool).connect_sync().expect("to connect");
+            let duckdb = DuckDB::duckdb_conn(&mut conn).expect("to get duckdb conn");
+            let tx = duckdb.conn.transaction().expect("to begin transaction");
+            let internal_tables = table_definition
+                .list_internal_tables(&tx)
+                .expect("to list internal tables");
+            assert_eq!(
+                internal_tables.len(),
+                1,
+                "Overwrite should create 1 internal table"
+            );
+
+            let view_rows: i64 = tx
+                .query_row(
+                    &format!("SELECT COUNT(1) FROM {}", table_definition.name()),
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("to query view");
+            assert_eq!(view_rows, 2, "View should have 2 rows after overwrite");
+            tx.rollback().expect("to rollback");
+        }
+
+        // Step 2: Do an Append operation (should append to the internal table, not fail)
+        let duckdb_sink_append = DuckDBDataSink::new(
+            Arc::clone(&pool),
+            Arc::clone(&table_definition),
+            InsertOp::Append,
+            None,
+            table_definition.schema(),
+        );
+        let data_sink_append: Arc<dyn DataSink> = Arc::new(duckdb_sink_append);
+
+        let batches_append = vec![RecordBatch::try_new(
+            Arc::clone(&table_definition.schema()),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(3), Some(4)])),
+                Arc::new(StringArray::from(vec![Some("c"), Some("d")])),
+            ],
+        )
+        .expect("should create a record batch")];
+
+        let stream_append = Box::pin(
+            MemoryStream::try_new(batches_append, table_definition.schema(), None)
+                .expect("to get stream"),
+        );
+
+        // This should NOT fail with "is not a table" error
+        data_sink_append
+            .write_all(stream_append, &Arc::new(TaskContext::default()))
+            .await
+            .expect("to write all with append after overwrite");
+
+        // Verify the append worked - should now have 4 rows total
+        let mut conn = pool.connect_sync().expect("to connect");
+        let duckdb = DuckDB::duckdb_conn(&mut conn).expect("to get duckdb conn");
+        let tx = duckdb.conn.transaction().expect("to begin transaction");
+
+        // Still should have just 1 internal table
+        let internal_tables = table_definition
+            .list_internal_tables(&tx)
+            .expect("to list internal tables");
+        assert_eq!(
+            internal_tables.len(),
+            1,
+            "Should still have 1 internal table after append"
+        );
+
+        // Query through the view - should see all 4 rows
+        let total_rows: i64 = tx
+            .query_row(
+                &format!("SELECT COUNT(1) FROM {}", table_definition.name()),
+                [],
+                |row| row.get(0),
+            )
+            .expect("to query view");
+        assert_eq!(total_rows, 4, "View should have 4 rows after append");
+
+        // Query the internal table directly - should also have 4 rows
+        let (internal_table_name, _) = internal_tables.first().expect("should have internal table");
+        let internal_rows: i64 = tx
+            .query_row(
+                &format!("SELECT COUNT(1) FROM {internal_table_name}"),
+                [],
+                |row| row.get(0),
+            )
+            .expect("to query internal table");
+        assert_eq!(internal_rows, 4, "Internal table should have 4 rows");
+
+        tx.rollback().expect("to rollback");
+    }
+
+    #[tokio::test]
     async fn test_write_to_table_append_with_previous_table() {
         // Test scenario: Write to a table with append mode with a previous table
         // Expected behavior: Data sink appends data to the existing table. No new internal table should be created.
@@ -1269,124 +1291,6 @@ mod test {
         // at this point, indexes should be applied
         let indexes = append_table.current_indexes(&tx).expect("to get indexes");
         assert_eq!(indexes.len(), 1);
-
-        tx.rollback().expect("to rollback");
-    }
-
-    #[tokio::test]
-    async fn test_write_completion_custom_handler() {
-        // Test scenario: Verify that the on_data_written callback signature is correct and callback is called during write_all
-        // Expected behavior: The callback is executed, callback can delete data as part of append operation
-
-        //Custom callback that removes records with id > 1
-        let callback: WriteCompletionHandler = Arc::new(
-            |tx: &Transaction<'_>,
-             table_manager: &TableManager,
-             schema: &SchemaRef,
-             num_rows: u64| {
-                assert!(!schema.fields().is_empty(), "Schema should have fields");
-                assert_eq!(table_manager.table_name().to_string(), "test_table");
-                assert_eq!(num_rows, 2, "Should have written 2 rows");
-                let table_name = table_manager.table_name();
-                tx.execute(&format!("DELETE FROM {table_name} WHERE id > 1"), [])
-                    .map_err(|e| {
-                        DataFusionError::Execution(format!(
-                            "Failed to delete rows with id > 1: {e}"
-                        ))
-                    })?;
-                Ok(())
-            },
-        );
-
-        let _guard = init_tracing(None);
-        let pool = get_mem_duckdb();
-
-        let cloned_pool = Arc::clone(&pool);
-        let mut conn = cloned_pool.connect_sync().expect("to connect");
-        let duckdb = DuckDB::duckdb_conn(&mut conn).expect("to get duckdb conn");
-        let tx = duckdb.conn.transaction().expect("to begin transaction");
-
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
-            arrow::datatypes::Field::new("name", arrow::datatypes::DataType::Utf8, false),
-        ]));
-
-        let table_definition = Arc::new(
-            TableDefinition::new(RelationName::new("test_table"), Arc::clone(&schema))
-                .with_indexes(
-                    vec![(
-                        ColumnReference::try_from("id").expect("valid column ref"),
-                        IndexType::Enabled,
-                    )]
-                    .into_iter()
-                    .collect(),
-                ),
-        );
-
-        // make an existing table to append from
-        let append_table = TableManager::new(Arc::clone(&table_definition))
-            .with_internal(false)
-            .expect("to create table");
-
-        append_table
-            .create_table(Arc::clone(&pool), &tx)
-            .expect("to create table");
-
-        // don't apply indexes, and leave the table empty to simulate a new table from TableProviderFactory::create()
-
-        tx.commit().expect("to commit");
-
-        let duckdb_sink = DuckDBDataSink::new(
-            Arc::clone(&pool),
-            Arc::clone(&table_definition),
-            InsertOp::Append,
-            None,
-            table_definition.schema(),
-        )
-        .with_on_data_written_handler(callback);
-        let data_sink: Arc<dyn DataSink> = Arc::new(duckdb_sink);
-
-        // id, name
-        // 1, "a"
-        // 2, "b"
-        let batches = vec![RecordBatch::try_new(
-            Arc::clone(&table_definition.schema()),
-            vec![
-                Arc::new(Int64Array::from(vec![Some(1), Some(2)])),
-                Arc::new(StringArray::from(vec![Some("a"), Some("b")])),
-            ],
-        )
-        .expect("should create a record batch")];
-
-        let stream = Box::pin(
-            MemoryStream::try_new(batches, table_definition.schema(), None).expect("to get stream"),
-        );
-
-        data_sink
-            .write_all(stream, &Arc::new(TaskContext::default()))
-            .await
-            .expect("to write all");
-
-        let tx = duckdb.conn.transaction().expect("to begin transaction");
-
-        let base_table = append_table
-            .base_table(&tx)
-            .expect("to get base table")
-            .expect("should have a base table");
-
-        let rows = tx
-            .query_row(
-                &format!(
-                    "SELECT COUNT(1) FROM {table_name}",
-                    table_name = base_table.table_name()
-                ),
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("to get count");
-
-        // Must be single row with id = 1 only
-        assert_eq!(rows, 1);
 
         tx.rollback().expect("to rollback");
     }

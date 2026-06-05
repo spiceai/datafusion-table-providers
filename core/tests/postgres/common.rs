@@ -1,8 +1,12 @@
 use bollard::secret::HealthConfig;
 #[cfg(feature = "postgres")]
-use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use datafusion_table_providers::sql::db_connection_pool::{
+    postgrespool::PostgresConnectionPool, StaticPasswordProvider,
+};
 use datafusion_table_providers::util::secrets::to_secret_map;
+use secrecy::SecretString;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::instrument;
 
 use crate::{
@@ -26,15 +30,13 @@ pub(super) fn get_pg_params(port: usize) -> HashMap<String, String> {
 
 #[instrument]
 pub(super) async fn start_postgres_docker_container(
-    image: &str,
     port: usize,
-    registry: Option<&str>,
 ) -> Result<RunningContainer, anyhow::Error> {
     let container_name = format!("{PG_DOCKER_CONTAINER}-{port}");
     let port = port.try_into().unwrap_or(15432);
 
     let pg_docker_image = std::env::var("PG_DOCKER_IMAGE")
-        .unwrap_or_else(|_| format!("{}/{}", registry.unwrap_or(&container_registry()), image));
+        .unwrap_or_else(|_| format!("{}postgres:latest", container_registry()));
 
     let running_container = ContainerRunnerBuilder::new(container_name)
         .image(pg_docker_image)
@@ -45,10 +47,10 @@ pub(super) async fn start_postgres_docker_container(
                 "CMD-SHELL".to_string(),
                 "pg_isready -U postgres".to_string(),
             ]),
-            interval: Some(1_000_000_000), // 1s
-            timeout: Some(500_000_000),    // 500ms
+            interval: Some(250_000_000), // 250ms
+            timeout: Some(100_000_000),  // 100ms
             retries: Some(5),
-            start_period: Some(100_000_000), // 100ms
+            start_period: Some(500_000_000), // 100ms
             start_interval: None,
         })
         .build()?
@@ -64,6 +66,21 @@ pub(super) async fn get_postgres_connection_pool(
     port: usize,
 ) -> Result<PostgresConnectionPool, anyhow::Error> {
     let pool = PostgresConnectionPool::new(to_secret_map(get_pg_params(port))).await?;
+
+    Ok(pool)
+}
+
+/// Creates a connection pool using [`PostgresConnectionPool::new_with_password_provider`]
+/// with a [`StaticPasswordProvider`], exercising the dynamic password path.
+#[instrument]
+pub(super) async fn get_postgres_pool_with_password_provider(
+    port: usize,
+) -> Result<PostgresConnectionPool, anyhow::Error> {
+    let mut params = get_pg_params(port);
+    let password = params.remove("pg_pass").expect("pg_pass should be present");
+    let provider = Arc::new(StaticPasswordProvider::new(SecretString::from(password)));
+    let pool =
+        PostgresConnectionPool::new_with_password_provider(to_secret_map(params), provider).await?;
 
     Ok(pool)
 }

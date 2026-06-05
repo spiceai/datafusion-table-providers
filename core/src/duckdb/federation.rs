@@ -1,8 +1,7 @@
 use crate::sql::db_connection_pool::dbconnection::{get_schema, Error as DbError};
 use crate::sql::sql_provider_datafusion::{get_stream, to_execution_error};
-use crate::util::supported_functions::contains_unsupported_functions;
-use arrow::datatypes::SchemaRef;
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion_federation::sql::{
     RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
@@ -66,6 +65,7 @@ impl<T, P> SQLExecutor for DuckDBTable<T, P> {
         &self,
         query: &str,
         schema: SchemaRef,
+        _filters: &[Arc<dyn PhysicalExpr>],
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let fut = get_stream(
             self.base_table.clone_pool(),
@@ -75,13 +75,6 @@ impl<T, P> SQLExecutor for DuckDBTable<T, P> {
 
         let stream = futures::stream::once(fut).try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
-    }
-
-    fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
-        // Default to not federate if [`Self::function_support`] provided, otherwise true.
-        self.function_support.as_ref().is_none_or(|func_supp| {
-            !contains_unsupported_functions(plan, func_supp).unwrap_or(false)
-        })
     }
 
     async fn table_names(&self) -> DataFusionResult<Vec<String>> {

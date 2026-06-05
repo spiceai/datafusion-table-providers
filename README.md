@@ -27,7 +27,20 @@ let ctx = SessionContext::with_state(state);
 - DuckDB
 - Flight SQL
 - MongoDB
+- ADBC
 - ODBC
+
+## Development
+
+During development, and especially before opening a PR, it is recommended to run:
+
+```bash
+cargo check --all-features --all
+```
+
+This verifies that all features and all crates compile without building
+binaries. It’s much faster than cargo build and avoids issues with
+native/shared library dependencies and heavy compilation.
 
 ## Examples (in Rust)
 
@@ -166,6 +179,36 @@ EOF
 cargo run -p datafusion-table-providers --example mysql --features mysql
 ```
 
+### MongoDB
+
+In order to run the MongoDB example, you need to have a MongoDB server running. You can use the following command to start a MongoDB server in a Docker container the example can use:
+
+```bash
+docker run --name mongodb \
+    -e MONGO_INITDB_ROOT_USERNAME=root \
+    -e MONGO_INITDB_ROOT_PASSWORD=password \
+    -e MONGO_INITDB_DATABASE=mongo_db \
+    -p 27017:27017 \
+    -d mongo:7.0
+# Wait for the MongoDB server to start
+sleep 30
+
+# Create a collection in the MongoDB server and insert some data
+docker exec -i mongodb mongosh -u root -p password --authenticationDatabase admin <<EOF
+use mongo_db;
+
+db.companies.insertOne({
+  id: 1,
+  name: "Acme Corporation"
+});
+EOF
+```
+
+```bash
+# Run from repo folder
+cargo run -p datafusion-table-providers --example mongodb --features mongodb
+```
+
 ### Flight SQL
 
 ```bash
@@ -178,31 +221,18 @@ roapi -t taxi=https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_20
 cargo run -p datafusion-table-providers --example flight-sql --features flight
 ```
 
-### MongoDB
+### ADBC
 
-In order to run the MongoDB example, you need to have a MongoDB server running. You can use the following command to start a MongoDB server in a Docker container the example can use:
+Install an ADBC driver using [dbc](https://github.com/columnar-tech/dbc):
 
 ```bash
-docker run --name mongodb \
-  -e MONGO_INITDB_ROOT_USERNAME=root \
-  -e MONGO_INITDB_ROOT_PASSWORD=password \
-  -e MONGO_INITDB_DATABASE=mongo_db \
-  -p 27017:27017 \
-  -d mongo:7.0
-# Wait for the MongoDB server to start
-sleep 30
+dbc install duckdb
+```
 
-# Create a table in the MongoDB server and insert some data
-docker exec -i mongodb mongosh -u root -p password --authenticationDatabase admin <<EOF
-use mongo_db;
-db.companies.insertOne({
-  id: 1,
-  name: "Acme Corporation"
-});
-EOF
+Read from a table via the installed driver (using DuckDB as an example):
 
-# Run from repo folder
-cargo run -p datafusion-table-providers --example mongodb --features mongodb
+```bash
+cargo run --example adbc --features adbc
 ```
 
 ### ODBC

@@ -54,7 +54,6 @@ pub async fn start_clickhouse_docker_container() -> Result<RunningContainer, any
 }
 
 #[instrument]
-#[allow(dead_code)]
 pub(super) async fn get_mysql_connection_pool(
     port: usize,
 ) -> Result<ClickHouseConnectionPool, anyhow::Error> {

@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use duckdb::{vtab::arrow::ArrowVTab, AccessMode, DuckdbConnectionManager};
-use once_cell::sync::OnceCell;
 use snafu::{prelude::*, ResultExt};
 use std::sync::Arc;
 
@@ -97,8 +96,6 @@ impl DuckDbConnectionPoolBuilder {
         let manager =
             DuckdbConnectionManager::memory_with_flags(config).context(DuckDBConnectionSnafu)?;
 
-        tracing::debug!("Creating DuckDB connection pool for memory instance with max_size {:?} and min_idle {:?}", self.max_size, self.min_idle);
-
         let mut pool_builder = r2d2::Pool::builder();
 
         if let Some(size) = self.max_size {
@@ -120,7 +117,7 @@ impl DuckDbConnectionPoolBuilder {
             path: ":memory:".into(),
             pool,
             join_push_down: JoinPushDown::AllowedFor(":memory:".to_string()),
-            attached_databases: Arc::new(OnceCell::new()),
+            attached_databases: Vec::new(),
             mode: Mode::Memory,
             unsupported_type_action: UnsupportedTypeAction::Error,
             connection_setup_queries: self.connection_setup_queries,
@@ -133,13 +130,6 @@ impl DuckDbConnectionPoolBuilder {
             .context(DuckDBConnectionSnafu)?;
 
         let mut pool_builder = r2d2::Pool::builder();
-
-        tracing::debug!(
-            "Creating DuckDB connection pool for path {} with max_size {:?} and min_idle {:?}",
-            self.path,
-            self.max_size,
-            self.min_idle
-        );
 
         if let Some(size) = self.max_size {
             pool_builder = pool_builder.max_size(size)
@@ -161,7 +151,7 @@ impl DuckDbConnectionPoolBuilder {
             pool,
             // Allow join-push down for any other instances that connect to the same underlying file.
             join_push_down: JoinPushDown::AllowedFor(self.path),
-            attached_databases: Arc::new(OnceCell::new()),
+            attached_databases: Vec::new(),
             mode: Mode::File,
             unsupported_type_action: UnsupportedTypeAction::Error,
             connection_setup_queries: self.connection_setup_queries,
@@ -181,8 +171,7 @@ pub struct DuckDbConnectionPool {
     path: Arc<str>,
     pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
     join_push_down: JoinPushDown,
-    /// Shared across clones. Initialized once, first set of attached databases wins.
-    attached_databases: Arc<OnceCell<Arc<DuckDBAttachments>>>,
+    attached_databases: Vec<Arc<str>>,
     mode: Mode,
     unsupported_type_action: UnsupportedTypeAction,
     connection_setup_queries: Vec<Arc<str>>,
@@ -193,7 +182,7 @@ impl std::fmt::Debug for DuckDbConnectionPool {
         f.debug_struct("DuckDbConnectionPool")
             .field("path", &self.path)
             .field("join_push_down", &self.join_push_down)
-            .field("attached_databases", &self.attached_databases.get())
+            .field("attached_databases", &self.attached_databases)
             .field("mode", &self.mode)
             .field("unsupported_type_action", &self.unsupported_type_action)
             .finish()
@@ -256,58 +245,19 @@ impl DuckDbConnectionPool {
         self
     }
 
-    /// Sets the databases to attach for cross-database queries.
-    /// Attachments are performed lazily on first query using `OnceCell`.
-    ///
-    /// If attachments are already configured with the same databases, this is a no-op.
-    /// If attachments are already configured with different databases, a warning is logged
-    /// and the existing attachments are preserved.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if unable to extract database name from path.
-    pub fn set_attached_databases(mut self, databases: &[Arc<str>]) -> Result<Self> {
+    #[must_use]
+    pub fn set_attached_databases(mut self, databases: &[Arc<str>]) -> Self {
+        self.attached_databases = databases.to_vec();
+
         if !databases.is_empty() {
-            let mut paths: Vec<Arc<str>> = databases.to_vec();
+            let mut paths = self.attached_databases.clone();
             paths.push(Arc::clone(&self.path));
             paths.sort();
-            let push_down_context = paths
-                .iter()
-                .map(|p| p.as_ref())
-                .collect::<Vec<_>>()
-                .join(";");
+            let push_down_context = paths.join(";");
             self.join_push_down = JoinPushDown::AllowedFor(push_down_context);
         }
 
-        let db_name = extract_db_name(Arc::clone(&self.path))?;
-        let new_set: std::collections::HashSet<Arc<str>> = databases.iter().cloned().collect();
-        let path = Arc::clone(&self.path);
-
-        let existing = self.attached_databases.get_or_init(|| {
-            tracing::debug!(
-                "pool_path = {}, db_name = {}, databases = {:?}, set_attached_databases: creating new DuckDBAttachments",
-                path, db_name, databases
-            );
-            Arc::new(DuckDBAttachments::new(&db_name, databases))
-        });
-
-        // Check if the existing attachments match what was requested
-        let existing_set = existing.attachments();
-        if *existing_set != new_set {
-            tracing::warn!(
-                "Unable to reconfigure DuckDB attachments for database {}: attachments are already configured with a different set of databases. \
-                 Existing: {existing_set:?}, Requested: {new_set:?}. Keeping existing attachments.",
-                self.path
-            );
-        }
-
-        Ok(self)
-    }
-
-    /// Returns the attachments configuration.
-    #[must_use]
-    pub fn get_attachments(&self) -> Option<&Arc<DuckDBAttachments>> {
-        self.attached_databases.get()
+        self
     }
 
     #[must_use]
@@ -330,6 +280,8 @@ impl DuckDbConnectionPool {
         let conn: r2d2::PooledConnection<DuckdbConnectionManager> =
             pool.get().context(ConnectionPoolSnafu)?;
 
+        let attachments = self.get_attachments()?;
+
         for query in self.connection_setup_queries.iter() {
             tracing::debug!("DuckDB connection setup: {}", query);
             conn.execute(query, []).context(DuckDBConnectionSnafu)?;
@@ -337,7 +289,7 @@ impl DuckDbConnectionPool {
 
         Ok(Box::new(
             DuckDbConnection::new(conn)
-                .with_attachments(self.attached_databases.get().cloned())
+                .with_attachments(attachments)
                 .with_connection_setup_queries(self.connection_setup_queries.clone())
                 .with_unsupported_type_action(self.unsupported_type_action),
         ))
@@ -346,6 +298,21 @@ impl DuckDbConnectionPool {
     #[must_use]
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    pub fn get_attachments(&self) -> Result<Option<Arc<DuckDBAttachments>>> {
+        if self.attached_databases.is_empty() {
+            Ok(None)
+        } else {
+            #[cfg(not(feature = "duckdb-federation"))]
+            return Ok(None);
+
+            #[cfg(feature = "duckdb-federation")]
+            Ok(Some(Arc::new(DuckDBAttachments::new(
+                &extract_db_name(Arc::clone(&self.path))?,
+                &self.attached_databases,
+            ))))
+        }
     }
 }
 
@@ -362,6 +329,8 @@ impl DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
         let conn: r2d2::PooledConnection<DuckdbConnectionManager> =
             pool.get().context(ConnectionPoolSnafu)?;
 
+        let attachments = self.get_attachments()?;
+
         for query in self.connection_setup_queries.iter() {
             tracing::debug!("DuckDB connection setup: {}", query);
             conn.execute(query, []).context(DuckDBConnectionSnafu)?;
@@ -369,7 +338,7 @@ impl DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
 
         Ok(Box::new(
             DuckDbConnection::new(conn)
-                .with_attachments(self.attached_databases.get().cloned())
+                .with_attachments(attachments)
                 .with_connection_setup_queries(self.connection_setup_queries.clone())
                 .with_unsupported_type_action(self.unsupported_type_action),
         ))
@@ -460,14 +429,12 @@ mod test {
         let db_attached_name = random_db_name();
         let pool = DuckDbConnectionPool::new_file(&db_base_name, &AccessMode::ReadWrite)
             .expect("DuckDB connection pool to be created")
-            .set_attached_databases(&[Arc::from(db_attached_name.as_str())])
-            .expect("Attached databases should be set");
+            .set_attached_databases(&[Arc::from(db_attached_name.as_str())]);
 
         let pool_attached =
             DuckDbConnectionPool::new_file(&db_attached_name, &AccessMode::ReadWrite)
                 .expect("DuckDB connection pool to be created")
-                .set_attached_databases(&[Arc::from(db_base_name.as_str())])
-                .expect("Attached databases should be set");
+                .set_attached_databases(&[Arc::from(db_base_name.as_str())]);
 
         let conn = pool
             .pool

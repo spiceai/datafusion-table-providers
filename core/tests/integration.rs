@@ -5,6 +5,12 @@ mod adbc;
 mod arrow_record_batch_gen;
 #[cfg(feature = "clickhouse")]
 mod clickhouse;
+#[cfg(any(
+    feature = "clickhouse",
+    feature = "mongodb",
+    feature = "mysql",
+    feature = "postgres"
+))]
 mod docker;
 #[cfg(all(feature = "duckdb", feature = "federation"))]
 mod duckdb;
@@ -21,7 +27,7 @@ mod sqlite;
 
 fn container_registry() -> String {
     std::env::var("CONTAINER_REGISTRY")
-        .unwrap_or_else(|_| "public.ecr.aws/docker/library".to_string())
+        .unwrap_or_else(|_| "public.ecr.aws/docker/library/".to_string())
 }
 
 fn get_random_port() -> usize {

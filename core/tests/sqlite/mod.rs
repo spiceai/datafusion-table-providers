@@ -1,9 +1,9 @@
 use crate::arrow_record_batch_gen::*;
 use arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int16Array,
-    Int32Array, Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, RecordBatch,
-    StringArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
-    Time64NanosecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    Int8Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
+    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+    UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::catalog::TableProviderFactory;
@@ -82,12 +82,10 @@ async fn arrow_sqlite_round_trip(
         }
 
         let table = match projected_schema {
-            None => SqlTable::new("sqlite", &sqltable_pool, table_name, None)
+            None => SqlTable::new("sqlite", &sqltable_pool, table_name)
                 .await
                 .expect("Table should be created"),
-            Some(schema) => {
-                SqlTable::new_with_schema("sqlite", &sqltable_pool, schema, table_name, None)
-            }
+            Some(schema) => SqlTable::new_with_schema("sqlite", &sqltable_pool, schema, table_name),
         };
 
         ctx.register_table(table_name, Arc::new(table))
@@ -135,7 +133,6 @@ async fn arrow_sqlite_round_trip(
 #[case::interval(get_arrow_interval_record_batch(), "interval")]
 #[case::duration(get_arrow_duration_record_batch(), "duration")]
 #[case::list(get_arrow_list_record_batch(), "list")]
-#[case::list_utf8(get_arrow_list_utf8_record_batch(), "list_utf8")]
 #[case::null(get_arrow_null_record_batch(), "null")]
 #[test_log::test(tokio::test)]
 async fn test_arrow_sqlite_roundtrip(
@@ -489,4 +486,116 @@ async fn download_parquet_as_record_batch(url: &str) -> anyhow::Result<RecordBat
         .ok_or_else(|| anyhow::anyhow!("No record batches found in parquet file"))?;
 
     Ok(record_batch)
+}
+
+#[cfg(feature = "sqlite-federation")]
+mod sort_limit_pushdown {
+    use super::*;
+
+    async fn setup_table(ctx: &SessionContext, name: &str) {
+        let factory = SqliteTableProviderFactory::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("label", DataType::Utf8, false),
+        ]));
+
+        let ids: Vec<i32> = (1..=20).collect();
+        let labels: Vec<String> = ids.iter().map(|i| format!("row-{i:02}")).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(labels)),
+            ],
+        )
+        .unwrap();
+
+        let cmd = CreateExternalTable {
+            schema: Arc::new(batch.schema().to_dfschema().unwrap()),
+            name: name.into(),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: false,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::from([("mode".to_string(), "memory".to_string())]),
+            constraints: Constraints::default(),
+            column_defaults: HashMap::new(),
+            temporary: false,
+        };
+        let table = factory.create(&ctx.state(), &cmd).await.unwrap();
+        let mem = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+            &[vec![batch.clone()]],
+            batch.schema(),
+            None,
+        )
+        .unwrap();
+        let insert = table
+            .insert_into(&ctx.state(), mem, InsertOp::Append)
+            .await
+            .unwrap();
+        let _ = collect(insert, ctx.task_ctx()).await.unwrap();
+        ctx.register_table(name, table).unwrap();
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn order_by_limit_returns_exactly_n_rows() {
+        let ctx = SessionContext::new();
+        setup_table(&ctx, "sort_limit_test").await;
+
+        let df = ctx
+            .sql("SELECT id FROM sort_limit_test ORDER BY id DESC LIMIT 5")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 5, "LIMIT 5 must return exactly 5 rows");
+
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let got: Vec<i32> = (0..col.len()).map(|i| col.value(i)).collect();
+        assert_eq!(got, vec![20, 19, 18, 17, 16], "top-5 DESC rows");
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn order_by_limit_with_filter() {
+        let ctx = SessionContext::new();
+        setup_table(&ctx, "sort_limit_filter_test").await;
+
+        let df = ctx
+            .sql("SELECT id FROM sort_limit_filter_test WHERE id > 10 ORDER BY id ASC LIMIT 3")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3);
+
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let got: Vec<i32> = (0..col.len()).map(|i| col.value(i)).collect();
+        assert_eq!(got, vec![11, 12, 13]);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn limit_without_order_by() {
+        let ctx = SessionContext::new();
+        setup_table(&ctx, "limit_only_test").await;
+
+        let df = ctx
+            .sql("SELECT id FROM limit_only_test LIMIT 7")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 7, "LIMIT without ORDER BY must still cap rows");
+    }
 }

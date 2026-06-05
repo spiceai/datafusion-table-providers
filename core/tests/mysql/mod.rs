@@ -121,75 +121,6 @@ VALUES
         create_table_stmt,
         insert_table_stmt,
         expected_record,
-        None,
-    )
-    .await;
-}
-
-/// Tests the MySQL TIMESTAMP with time zone override.
-/// The test verifies that the TIMESTAMP type correctly adjusts to the specified time zone when retrieved from the database.
-/// `TIMESTAMP` columns should be automatically converted to the specified time zone,
-/// while `DATETIME` columns should remain unchanged.
-async fn test_mysql_timestamp_tz_override(port: usize) {
-    let create_table_stmt = "
-        CREATE TABLE timestamp_tz_table (
-            ts TIMESTAMP,
-            dt DATETIME
-        );
-    ";
-    // values will be inserted in UTC
-    let insert_table_stmt = "
-        INSERT INTO timestamp_tz_table (ts, dt)
-        VALUES
-            ('2024-09-12 10:00:00', '2024-09-12 10:00:00');
-    ";
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
-        Field::new("dt", DataType::Timestamp(TimeUnit::Microsecond, None), true),
-    ]));
-
-    // Both columns should remain unchanged as target time zone is UTC (same as insert time zone)
-    let expected_utc = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(TimestampMicrosecondArray::from(vec![1_726_135_200_000_000])),
-            Arc::new(TimestampMicrosecondArray::from(vec![1_726_135_200_000_000])),
-        ],
-    )
-    .expect("Failed to created arrow record batch");
-
-    arrow_mysql_one_way(
-        port,
-        "timestamp_tz_table",
-        create_table_stmt,
-        insert_table_stmt,
-        expected_utc,
-        Some("UTC"),
-    )
-    .await;
-
-    // "+02:00"
-    let expected_custom_tz = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            // ts: TIMESTAMP column, should be shifted +2 hours (timezone override)
-            Arc::new(TimestampMicrosecondArray::from(vec![
-                1_726_135_200_000_000 + 2 * 60 * 60 * 1_000_000,
-            ])),
-            // dt: DATETIME column, should remain unchanged
-            Arc::new(TimestampMicrosecondArray::from(vec![1_726_135_200_000_000])),
-        ],
-    )
-    .expect("Failed to created arrow record batch");
-
-    arrow_mysql_one_way(
-        port,
-        "timestamp_tz_table",
-        create_table_stmt,
-        insert_table_stmt,
-        expected_custom_tz,
-        Some("+02:00"), // Override time zone to +02:00
     )
     .await;
 }
@@ -278,7 +209,6 @@ VALUES (
         create_table_stmt,
         insert_table_stmt,
         expected_record,
-        None,
     )
     .await;
 }
@@ -351,7 +281,6 @@ VALUES
         create_table_stmt,
         insert_table_stmt,
         expected_record,
-        None,
     )
     .await;
 }
@@ -398,7 +327,6 @@ VALUES
         create_table_stmt,
         insert_table_stmt,
         expected_record,
-        None,
     )
     .await;
 }
@@ -461,7 +389,6 @@ VALUES
         create_table_stmt,
         insert_table_stmt,
         expected_record,
-        None,
     )
     .await;
 }
@@ -514,7 +441,6 @@ VALUES
         create_table_stmt,
         insert_table_stmt,
         expected_record,
-        None,
     )
     .await;
 }
@@ -570,7 +496,6 @@ INSERT INTO high_precision_decimal (decimal_values) VALUES
         create_table_stmt,
         insert_table_stmt,
         expected_record,
-        None,
     )
     .await;
 }
@@ -646,7 +571,6 @@ async fn test_mysql_zero_date_type(port: usize) {
         create_table_stmt,
         insert_table_stmt,
         expected_record,
-        None,
     )
     .await;
 }
@@ -681,64 +605,6 @@ async fn test_mysql_decimal_types_to_decimal128(port: usize) {
         create_table_stmt,
         insert_table_stmt,
         expected_record,
-        None,
-    )
-    .await;
-}
-
-async fn test_mysql_nullability_constraints(port: usize) {
-    let create_table_stmt = "
-        CREATE TABLE nullability_table (
-            id INT NOT NULL,
-            name VARCHAR(50) NOT NULL,
-            age INT,
-            email VARCHAR(100),
-            score DECIMAL(5, 2) NOT NULL
-        );
-    ";
-    let insert_table_stmt = "
-        INSERT INTO nullability_table (id, name, age, email, score)
-        VALUES
-        (1, 'Alice', 30, 'alice@example.com', 95.50),
-        (2, 'Bob', NULL, NULL, 87.25),
-        (3, 'Charlie', 25, 'charlie@example.com', 92.00);
-    ";
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("name", DataType::Utf8, false),
-        Field::new("age", DataType::Int32, true),
-        Field::new("email", DataType::Utf8, true),
-        Field::new("score", DataType::Decimal128(5, 2), false),
-    ]));
-
-    let expected_record = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
-            Arc::new(Int32Array::from(vec![Some(30), None, Some(25)])),
-            Arc::new(StringArray::from(vec![
-                Some("alice@example.com"),
-                None,
-                Some("charlie@example.com"),
-            ])),
-            Arc::new(
-                Decimal128Array::from(vec![i128::from(9550), i128::from(8725), i128::from(9200)])
-                    .with_precision_and_scale(5, 2)
-                    .unwrap(),
-            ),
-        ],
-    )
-    .expect("Failed to create expected arrow record batch");
-
-    arrow_mysql_one_way(
-        port,
-        "nullability_table",
-        create_table_stmt,
-        insert_table_stmt,
-        expected_record,
-        None,
     )
     .await;
 }
@@ -749,15 +615,13 @@ async fn arrow_mysql_one_way(
     create_table_stmt: &str,
     insert_table_stmt: &str,
     expected_record: RecordBatch,
-    test_query_tz: Option<&str>,
 ) -> Vec<RecordBatch> {
     tracing::debug!("Running tests on {table_name}");
 
     let ctx = SessionContext::new();
-    // For dataset initialization we always use UTC (default) timezone
-    let pool = common::get_mysql_connection_pool(port, None)
+    let pool = common::get_mysql_connection_pool(port)
         .await
-        .expect("MySQL connection pool for test table creation should be created");
+        .expect("MySQL connection pool should be created");
 
     let db_conn = pool
         .connect_direct()
@@ -773,12 +637,6 @@ async fn arrow_mysql_one_way(
         .await
         .expect("SQL mode should be adjusted");
 
-    // Drop table if already exists
-    let _ = db_conn
-        .execute(format!("DROP TABLE IF EXISTS {table_name}").as_str(), &[])
-        .await
-        .expect("MySQL table should be dropped if exists");
-
     // Create table and insert data into mysql test_table
     let _ = db_conn
         .execute(create_table_stmt, &[])
@@ -790,11 +648,6 @@ async fn arrow_mysql_one_way(
         .await
         .expect("MySQL table data should be inserted");
 
-    // For the test query, use a new connection pool with optional time zone override
-    let pool = common::get_mysql_connection_pool(port, test_query_tz)
-        .await
-        .expect("MySQL connection pool for test query should be created");
-
     // Register datafusion table, test mysql row -> arrow conversion
     let sqltable_pool: Arc<
         dyn DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)>
@@ -802,7 +655,7 @@ async fn arrow_mysql_one_way(
             + Sync
             + 'static,
     > = Arc::new(pool);
-    let table = SqlTable::new("mysql", &sqltable_pool, table_name, None)
+    let table = SqlTable::new("mysql", &sqltable_pool, table_name)
         .await
         .expect("Table should be created");
 
@@ -847,7 +700,7 @@ async fn arrow_mysql_round_trip(
         definition: None,
         order_exprs: vec![],
         unbounded: false,
-        options: common::get_mysql_params(port, None)
+        options: common::get_mysql_params(port)
             .into_iter()
             .map(|(k, v)| (k, v.expose_secret().to_string()))
             .collect(),
@@ -968,6 +821,175 @@ async fn test_arrow_mysql_roundtrip(
     .await;
 }
 
+/// When SqlTable is created with new_with_schema, the projected schema may
+/// differ from MySQL's physical column order and may contain fewer columns.
+/// rows_to_arrow must reorder and filter the result columns to match the
+/// projected schema. This covers both the reordering fix (c26c407) and the
+/// column count mismatch fix (43ec55a) that caused BatchCoalescer to panic.
+async fn test_mysql_projected_schema_column_reorder(port: usize) {
+    let create_table_stmt = "
+CREATE TABLE reorder_table (
+    a INT,
+    b VARCHAR(50),
+    c DOUBLE,
+    d BOOLEAN
+);
+        ";
+    let insert_table_stmt = "
+INSERT INTO reorder_table (a, b, c, d) VALUES (1, 'hello', 3.14, true);
+        ";
+
+    // Projected schema has fewer columns than MySQL, in a different order
+    let reordered_schema = Arc::new(Schema::new(vec![
+        Field::new("c", DataType::Float64, true),
+        Field::new("b", DataType::Utf8, true),
+        Field::new("a", DataType::Int32, true),
+    ]));
+
+    let ctx = SessionContext::new();
+    let pool = common::get_mysql_connection_pool(port)
+        .await
+        .expect("MySQL connection pool should be created");
+
+    let db_conn = pool
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+
+    let _ = db_conn
+        .execute(create_table_stmt, &[])
+        .await
+        .expect("MySQL table should be created");
+
+    let _ = db_conn
+        .execute(insert_table_stmt, &[])
+        .await
+        .expect("MySQL table data should be inserted");
+
+    let sqltable_pool: Arc<
+        dyn DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)>
+            + Send
+            + Sync
+            + 'static,
+    > = Arc::new(pool);
+
+    let table = SqlTable::new_with_schema(
+        "mysql",
+        &sqltable_pool,
+        reordered_schema.clone(),
+        "reorder_table",
+    );
+
+    ctx.register_table("reorder_table", Arc::new(table))
+        .expect("Table should be registered");
+
+    let df = ctx
+        .sql("SELECT * FROM reorder_table")
+        .await
+        .expect("DataFrame should be created from query");
+
+    let record_batch = df.collect().await.expect("RecordBatch should be collected");
+    assert_eq!(record_batch.len(), 1);
+
+    let batch = &record_batch[0];
+    // Verify only projected columns are present, in the projected order (c, b, a)
+    assert_eq!(batch.num_columns(), 3);
+    assert_eq!(batch.schema().field(0).name(), "c");
+    assert_eq!(batch.schema().field(1).name(), "b");
+    assert_eq!(batch.schema().field(2).name(), "a");
+}
+
+async fn test_mysql_sort_limit(port: usize) {
+    let ctx = SessionContext::new();
+    let pool = common::get_mysql_connection_pool(port, None)
+        .await
+        .expect("MySQL connection pool should be created");
+
+    let db_conn = pool
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+
+    // Prepare table: 20 rows with id = 1..=20.
+    let _ = db_conn
+        .execute("DROP TABLE IF EXISTS sort_limit_test", &[])
+        .await
+        .expect("table should be droppable");
+    let _ = db_conn
+        .execute(
+            "CREATE TABLE sort_limit_test (id INT NOT NULL, label VARCHAR(32) NOT NULL)",
+            &[],
+        )
+        .await
+        .expect("CREATE TABLE should succeed");
+    let values: Vec<String> = (1..=20).map(|i| format!("({i}, 'row-{i:02}')")).collect();
+    let insert_stmt = format!(
+        "INSERT INTO sort_limit_test (id, label) VALUES {}",
+        values.join(",")
+    );
+    let _ = db_conn
+        .execute(&insert_stmt, &[])
+        .await
+        .expect("INSERT should succeed");
+
+    let sqltable_pool: Arc<
+        dyn DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)>
+            + Send
+            + Sync
+            + 'static,
+    > = Arc::new(
+        common::get_mysql_connection_pool(port, None)
+            .await
+            .expect("pool"),
+    );
+    let table = SqlTable::new("mysql", &sqltable_pool, "sort_limit_test", None)
+        .await
+        .expect("Table should be created");
+    ctx.register_table("sort_limit_test", Arc::new(table))
+        .expect("Table should be registered");
+
+    // 1. ORDER BY DESC + LIMIT 5 must return exactly 5 rows, top-down.
+    let df = ctx
+        .sql("SELECT id FROM sort_limit_test ORDER BY id DESC LIMIT 5")
+        .await
+        .expect("SQL should parse");
+    let batches = df.collect().await.expect("query should succeed");
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 5, "LIMIT 5 must return exactly 5 rows");
+    let col = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("id column is Int32");
+    let got: Vec<i32> = (0..col.len()).map(|i| col.value(i)).collect();
+    assert_eq!(got, vec![20, 19, 18, 17, 16]);
+
+    // 2. ORDER BY + LIMIT with WHERE.
+    let df = ctx
+        .sql("SELECT id FROM sort_limit_test WHERE id > 10 ORDER BY id ASC LIMIT 3")
+        .await
+        .expect("SQL should parse");
+    let batches = df.collect().await.expect("query should succeed");
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3);
+    let col = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let got: Vec<i32> = (0..col.len()).map(|i| col.value(i)).collect();
+    assert_eq!(got, vec![11, 12, 13]);
+
+    // 3. Bare LIMIT (no ORDER BY) must still cap rows.
+    let df = ctx
+        .sql("SELECT id FROM sort_limit_test LIMIT 7")
+        .await
+        .expect("SQL should parse");
+    let batches = df.collect().await.expect("query should succeed");
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 7);
+}
+
 #[rstest]
 #[test_log::test(tokio::test)]
 async fn test_mysql_arrow_oneway() {
@@ -975,7 +997,6 @@ async fn test_mysql_arrow_oneway() {
     let mysql_container = start_mysql_container(port).await;
 
     test_mysql_timestamp_types(port).await;
-    test_mysql_timestamp_tz_override(port).await;
     test_mysql_datetime_types(port).await;
     test_mysql_time_types(port).await;
     test_mysql_enum_types(port).await;
@@ -984,7 +1005,8 @@ async fn test_mysql_arrow_oneway() {
     test_mysql_decimal_types_to_decimal128(port).await;
     test_mysql_decimal_types_to_decimal256(port).await;
     test_mysql_zero_date_type(port).await;
-    test_mysql_nullability_constraints(port).await;
+    test_mysql_projected_schema_column_reorder(port).await;
+    test_mysql_sort_limit(port).await;
 
     mysql_container.remove().await.expect("container to stop");
 }

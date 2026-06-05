@@ -145,9 +145,8 @@ impl DataSink for MySQLDataSink {
             num_rows += batch_num_rows as u64;
 
             constraints::validate_batch_with_constraints(
-                vec![batch.clone()],
+                std::slice::from_ref(&batch),
                 self.mysql.constraints(),
-                &crate::util::constraints::UpsertOptions::default(),
             )
             .await
             .context(super::ConstraintViolationSnafu)

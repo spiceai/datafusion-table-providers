@@ -16,6 +16,8 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -24,6 +26,9 @@ jobs:
         uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
       - run: cargo clippy --all-features -- -D warnings
 
@@ -42,6 +47,7 @@ jobs:
           - 'mysql'
           - 'flight'
           - 'adbc'
+          - 'mongodb'
 
     steps:
       - uses: actions/checkout@v6
@@ -65,7 +71,7 @@ jobs:
 
     env:
       PG_DOCKER_IMAGE: ghcr.io/cloudnative-pg/postgresql:16-bookworm
-      MYSQL_DOCKER_IMAGE: public.ecr.aws/ubuntu/mysql:8.0-22.04_beta
+      MYSQL_DOCKER_IMAGE: mysql:8.0
 
     steps:
       - uses: actions/checkout@v6
@@ -75,10 +81,27 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Pull the Postgres/MySQL images
+      - name: Cache Docker images
+        id: docker-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/docker-images
+          key: docker-images-${{ env.PG_DOCKER_IMAGE }}-${{ env.MYSQL_DOCKER_IMAGE }}
+
+      - name: Load or pull Docker images
         run: |
-          docker pull ${{ env.PG_DOCKER_IMAGE }}
-          docker pull ${{ env.MYSQL_DOCKER_IMAGE }}
+          if [ -f /tmp/docker-images/postgres.tar ] && [ -f /tmp/docker-images/mysql.tar ]; then
+            echo "Loading cached Docker images..."
+            docker load -i /tmp/docker-images/postgres.tar
+            docker load -i /tmp/docker-images/mysql.tar
+          else
+            echo "Pulling Docker images..."
+            docker pull ${{ env.PG_DOCKER_IMAGE }}
+            docker pull ${{ env.MYSQL_DOCKER_IMAGE }}
+            mkdir -p /tmp/docker-images
+            docker save -o /tmp/docker-images/postgres.tar ${{ env.PG_DOCKER_IMAGE }}
+            docker save -o /tmp/docker-images/mysql.tar ${{ env.MYSQL_DOCKER_IMAGE }}
+          fi
 
       - name: Free Disk Space
         run: |
@@ -88,7 +111,8 @@ jobs:
             /usr/local/share/powershell /usr/share/swift /usr/local/.ghcup \
             /usr/lib/jvm || true
           echo "some directories deleted"
-          sudo apt install aptitude -y >/dev/null 2>&1
+          sudo apt-get update >/dev/null 2>&1
+          sudo apt install aptitude -y >/dev/null 2>&1 || true
           sudo aptitude purge aria2 ansible azure-cli shellcheck rpm xorriso zsync \
             esl-erlang firefox gfortran-8 gfortran-9 google-chrome-stable \
             google-cloud-sdk imagemagick \
@@ -98,14 +122,14 @@ jobs:
             libfreetype6 libfreetype6-dev libfontconfig1 libfontconfig1-dev \
             snmp pollinate libpq-dev postgresql-client powershell ruby-full \
             sphinxsearch subversion mongodb-org azure-cli microsoft-edge-stable \
-            -y -f >/dev/null 2>&1
-          sudo aptitude purge google-cloud-sdk -f -y >/dev/null 2>&1
+            -y -f >/dev/null 2>&1 || true
+          sudo aptitude purge google-cloud-sdk -f -y >/dev/null 2>&1 || true
           sudo aptitude purge microsoft-edge-stable -f -y >/dev/null 2>&1 || true
           sudo apt purge microsoft-edge-stable -f -y >/dev/null 2>&1 || true
-          sudo aptitude purge '~n ^php' -f -y >/dev/null 2>&1
-          sudo aptitude purge '~n ^dotnet' -f -y >/dev/null 2>&1
-          sudo apt-get autoremove -y >/dev/null 2>&1
-          sudo apt-get autoclean -y >/dev/null 2>&1
+          sudo aptitude purge '~n ^php' -f -y >/dev/null 2>&1 || true
+          sudo aptitude purge '~n ^dotnet' -f -y >/dev/null 2>&1 || true
+          sudo apt-get autoremove -y >/dev/null 2>&1 || true
+          sudo apt-get autoclean -y >/dev/null 2>&1 || true
           echo "some packages purged"
           df -h
 
@@ -148,7 +172,7 @@ jobs:
         run: |
           sudo apt-get install -y unixodbc-dev libsqliteodbc
           sudo apt-get install -y libsqlite3-dev
-          cargo install --locked --git https://github.com/roapi/roapi --branch main --bins roapi
+          RUSTUP_TOOLCHAIN=stable cargo install --git https://github.com/roapi/roapi --branch main --bins roapi
 
       - name: Build Python package and run tests
         run: |

@@ -18,9 +18,7 @@ use futures::StreamExt;
 use snafu::prelude::*;
 
 use crate::util::{
-    constraints::{self},
-    on_conflict::OnConflict,
-    retriable_error::check_and_mark_retriable_error,
+    constraints, on_conflict::OnConflict, retriable_error::check_and_mark_retriable_error,
 };
 
 use crate::postgres::Postgres;
@@ -206,9 +204,8 @@ impl DataSink for PostgresDataSink {
             num_rows += batch_num_rows as u64;
 
             constraints::validate_batch_with_constraints(
-                vec![batch.clone()],
+                std::slice::from_ref(&batch),
                 self.postgres.constraints(),
-                &crate::util::constraints::UpsertOptions::default(),
             )
             .await
             .context(super::ConstraintViolationSnafu)
