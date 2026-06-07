@@ -1509,6 +1509,25 @@ mod tests {
     }
 
     #[test]
+    fn test_sqlite_decimal_column_type() {
+        // SQLite Decimal columns must be emitted as `decimal(p, s)` (NUMERIC
+        // affinity), not sea-query's default `real(p, s)` (REAL affinity), so
+        // decimal values are stored losslessly and read back consistently.
+        // High-precision (> 16 digit) decimals must NOT panic.
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Decimal128(10, 2), true),
+            Field::new("b", DataType::Decimal256(40, 4), true),
+            Field::new("c", DataType::Decimal64(18, 6), false),
+        ]);
+        let sql = CreateTableBuilder::new(SchemaRef::new(schema), "amounts").build_sqlite();
+
+        assert_eq!(
+            sql,
+            "CREATE TABLE IF NOT EXISTS \"amounts\" ( \"a\" decimal(10, 2), \"b\" decimal(40, 4), \"c\" decimal(18, 6) NOT NULL )"
+        );
+    }
+
+    #[test]
     fn test_table_insertion() {
         let schema1 = Schema::new(vec![
             Field::new("id", DataType::Int32, false),
