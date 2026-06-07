@@ -108,6 +108,27 @@ impl CreateTableBuilder {
                 return ColumnType::JsonBinary;
             }
 
+            // SQLite-specific Decimal handling.
+            //
+            // sea-query's `SqliteQueryBuilder` renders `ColumnType::Decimal` as
+            // `real(p, s)` (REAL type affinity) and additionally `panic!`s when
+            // the precision exceeds 16 digits. REAL affinity coerces inserted
+            // decimal text to a 64-bit float, which silently loses precision for
+            // wide decimals and produces an inconsistent storage class across a
+            // column. Emit `decimal(p, s)` instead (NUMERIC affinity): values are
+            // stored in their native storage class, decimal text is preserved
+            // losslessly, and the >16-digit precision panic is avoided. This also
+            // matches the column type the row-to-Arrow reader expects.
+            match f.data_type() {
+                DataType::Decimal32(p, s)
+                | DataType::Decimal64(p, s)
+                | DataType::Decimal128(p, s)
+                | DataType::Decimal256(p, s) => {
+                    return ColumnType::custom(format!("decimal({p}, {s})"));
+                }
+                _ => {}
+            }
+
             map_data_type_to_column_type(f.data_type())
         })
     }
