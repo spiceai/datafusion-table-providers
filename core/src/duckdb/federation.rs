@@ -1,10 +1,11 @@
 use crate::sql::db_connection_pool::dbconnection::{get_schema, Error as DbError};
 use crate::sql::sql_provider_datafusion::{get_stream, to_execution_error};
+use crate::util::supported_functions::unfederate_plan_with_unsupported_functions;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion_federation::sql::{
-    RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
+    LogicalOptimizer, RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
 };
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
 use futures::TryStreamExt;
@@ -59,6 +60,19 @@ impl<T, P> SQLExecutor for DuckDBTable<T, P> {
 
     fn dialect(&self) -> Arc<dyn Dialect> {
         self.base_table.dialect()
+    }
+
+    /// When a function deny/allow-list is installed via
+    /// [`DuckDBTable::with_function_support`], un-federate any plan that
+    /// references unsupported functions so `DataFusion` evaluates those
+    /// expressions locally instead of pushing them down to `DuckDB` (which would
+    /// fail with an "unknown function" error). When no list is installed this is
+    /// a no-op and the plan federates normally.
+    fn logical_optimizer(&self) -> Option<LogicalOptimizer> {
+        let function_support = self.function_support.clone()?;
+        Some(Box::new(move |plan| {
+            unfederate_plan_with_unsupported_functions(plan, &function_support)
+        }))
     }
 
     fn execute(

@@ -1,4 +1,5 @@
 use crate::sql::db_connection_pool::DbConnectionPool;
+use crate::util::supported_functions::FunctionSupport;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::sql::unparser::dialect::Dialect;
@@ -32,6 +33,12 @@ pub struct DuckDBTable<T: 'static, P: 'static> {
 
     /// A mapping of table/view names to `DuckDB` functions that can instantiate a table (e.g. "`read_parquet`('`my_file.parquet`')").
     pub(crate) table_functions: Option<HashMap<String, String>>,
+
+    /// Optional federation function deny/allow-list. When set, plans that
+    /// reference unsupported functions are un-federated (executed locally) via
+    /// the federation `SQLExecutor::logical_optimizer` hook instead of being
+    /// pushed down to `DuckDB`. See [`crate::util::supported_functions`].
+    pub(crate) function_support: Option<FunctionSupport>,
 }
 
 impl<T, P> std::fmt::Debug for DuckDBTable<T, P> {
@@ -56,7 +63,20 @@ impl<T, P> DuckDBTable<T, P> {
         Self {
             base_table,
             table_functions,
+            function_support: None,
         }
+    }
+
+    /// Install the federation function deny/allow-list (see [`FunctionSupport`]).
+    ///
+    /// When present, the federated provider's `SQLExecutor::logical_optimizer`
+    /// un-federates any plan that references unsupported functions, so
+    /// `DataFusion` evaluates those expressions locally instead of pushing them
+    /// down to `DuckDB` (which would fail with an "unknown function" error).
+    #[must_use]
+    pub fn with_function_support(mut self, function_support: Option<FunctionSupport>) -> Self {
+        self.function_support = function_support;
+        self
     }
 
     fn create_physical_plan(

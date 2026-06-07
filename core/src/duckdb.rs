@@ -5,6 +5,7 @@ use crate::util::{
     constraints,
     indexes::IndexType,
     on_conflict::{self, OnConflict},
+    supported_functions::FunctionSupport,
 };
 use crate::{
     sql::db_connection_pool::{
@@ -546,6 +547,7 @@ fn remove_option(options: &mut HashMap<String, String>, key: &str) -> Option<Str
 pub struct DuckDBTableFactory {
     pool: Arc<DuckDbConnectionPool>,
     dialect: Arc<dyn Dialect>,
+    function_support: Option<FunctionSupport>,
 }
 
 impl DuckDBTableFactory {
@@ -554,12 +556,27 @@ impl DuckDBTableFactory {
         Self {
             pool,
             dialect: Arc::new(DuckDBDialect::new()),
+            function_support: None,
         }
     }
 
     #[must_use]
     pub fn with_dialect(mut self, dialect: Arc<dyn Dialect + Send + Sync>) -> Self {
         self.dialect = dialect;
+        self
+    }
+
+    /// Install the federation function deny/allow-list applied to the federated
+    /// table providers this factory builds (see [`FunctionSupport`]).
+    ///
+    /// Without a deny-list, federation pushes engine-specific UDFs (e.g. Spice's
+    /// `json_get_str` or embedding/distance UDFs) into the SQL sent to `DuckDB`,
+    /// where those functions don't exist — the query then fails with an "unknown
+    /// function" error. Installing the deny-list un-federates such plans so
+    /// `DataFusion` evaluates the affected expressions locally instead.
+    #[must_use]
+    pub fn with_function_support(mut self, function_support: FunctionSupport) -> Self {
+        self.function_support = Some(function_support);
         self
     }
 
@@ -585,13 +602,10 @@ impl DuckDBTableFactory {
             (table_reference.clone(), None)
         };
 
-        let table_provider = Arc::new(DuckDBTable::new_with_schema(
-            &dyn_pool,
-            schema,
-            tbl_ref,
-            cte,
-            Some(self.dialect.clone()),
-        ));
+        let table_provider = Arc::new(
+            DuckDBTable::new_with_schema(&dyn_pool, schema, tbl_ref, cte, Some(self.dialect.clone()))
+                .with_function_support(self.function_support.clone()),
+        );
 
         #[cfg(feature = "duckdb-federation")]
         let table_provider: Arc<dyn TableProvider> =
