@@ -28,12 +28,19 @@ use datafusion::{
 
 pub struct SQLiteTable<T: 'static, P: 'static> {
     pub(crate) base_table: SqlTable<T, P>,
+
+    /// When `true`, the federation AST analyzer rewrites `BETWEEN` expressions
+    /// that contain numeric bounds into arbitrary-precision `decimal_cmp`
+    /// comparisons, avoiding `SQLite` floating-point precision errors. See
+    /// [`crate::sqlite::between`].
+    pub(crate) decimal_between: bool,
 }
 
 impl<T, P> std::fmt::Debug for SQLiteTable<T, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SQLiteTable")
             .field("base_table", &self.base_table)
+            .field("decimal_between", &self.decimal_between)
             .finish()
     }
 }
@@ -47,7 +54,19 @@ impl<T, P> SQLiteTable<T, P> {
         let base_table = SqlTable::new_with_schema("sqlite", pool, schema, table_reference)
             .with_dialect(Arc::new(SqliteDialect {}));
 
-        Self { base_table }
+        Self {
+            base_table,
+            decimal_between: false,
+        }
+    }
+
+    /// Enable rewriting numeric `BETWEEN` bounds into arbitrary-precision
+    /// `decimal_cmp` comparisons in the federation AST analyzer (see
+    /// [`crate::sqlite::between`]).
+    #[must_use]
+    pub fn with_decimal_between(mut self, decimal_between: bool) -> Self {
+        self.decimal_between = decimal_between;
+        self
     }
 
     fn create_physical_plan(
