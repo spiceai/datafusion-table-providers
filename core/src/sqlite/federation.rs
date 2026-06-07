@@ -13,6 +13,7 @@ use futures::TryStreamExt;
 use snafu::ResultExt;
 use std::sync::Arc;
 
+use super::between::SQLiteBetweenVisitor;
 use super::sql_table::SQLiteTable;
 use super::sqlite_interval::SQLiteIntervalVisitor;
 use datafusion::{
@@ -49,7 +50,10 @@ impl<T, P> SQLiteTable<T, P> {
 }
 
 #[allow(clippy::unnecessary_wraps)]
-fn sqlite_ast_analyzer(ast: ast::Statement) -> Result<ast::Statement, DataFusionError> {
+fn sqlite_ast_analyzer(
+    ast: ast::Statement,
+    decimal_between: bool,
+) -> Result<ast::Statement, DataFusionError> {
     match ast {
         ast::Statement::Query(query) => {
             let mut new_query = query.clone();
@@ -58,6 +62,13 @@ fn sqlite_ast_analyzer(ast: ast::Statement) -> Result<ast::Statement, DataFusion
             // find the column they target, and replace the INTERVAL and column with e.g. datetime(column, '+1 day')
             let mut interval_visitor = SQLiteIntervalVisitor::default();
             let _ = new_query.visit(&mut interval_visitor);
+
+            // optionally rewrite numeric BETWEEN bounds into arbitrary-precision
+            // decimal_cmp comparisons to avoid SQLite floating-point precision errors
+            if decimal_between {
+                let mut between_visitor = SQLiteBetweenVisitor::default();
+                let _ = new_query.visit(&mut between_visitor);
+            }
 
             Ok(ast::Statement::Query(new_query))
         }
@@ -80,7 +91,8 @@ impl<T, P> SQLExecutor for SQLiteTable<T, P> {
     }
 
     fn ast_analyzer(&self) -> Option<AstAnalyzer> {
-        Some(Box::new(sqlite_ast_analyzer))
+        let decimal_between = self.decimal_between;
+        Some(Box::new(move |ast| sqlite_ast_analyzer(ast, decimal_between)))
     }
 
     fn execute(

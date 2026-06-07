@@ -47,6 +47,6 @@ datafusion-physical-expr = { version = "53.0" }
 datafusion-physical-plan = { version = "53.0" }
 datafusion-python = { version = "53.0" }
 datafusion-table-providers = { path = "core" }
-duckdb = { version = "=1.4.4", package = "spiceai_duckdb_fork" } # Forked to add support for duckdb_scan_arrow, pending: https://github.com/duckdb/duckdb-rs/pull/488
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "eb4b02bf310474639d2bbb1b2337519cfa5748b9" } # branch: lukim/spiceai-58-arrow58 (DuckDB 1.5.2 + arrow 58), matches spiceai/spiceai
 adbc_core = { version = "0.23" }
 adbc_driver_manager = { version = "0.23" }

@@ -49,6 +49,9 @@ pub mod federation;
 #[cfg(feature = "sqlite-federation")]
 pub mod sqlite_interval;
 
+#[cfg(feature = "sqlite-federation")]
+pub mod between;
+
 pub mod sql_table;
 pub mod write;
 
@@ -124,6 +127,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct SqliteTableProviderFactory {
     instances: Arc<Mutex<HashMap<DbInstanceKey, SqliteConnectionPool>>>,
     batch_insert_use_prepared_statements: bool,
+    decimal_between: bool,
 }
 
 const SQLITE_DB_PATH_PARAM: &str = "file";
@@ -137,6 +141,7 @@ impl SqliteTableProviderFactory {
         Self {
             instances: Arc::new(Mutex::new(HashMap::new())),
             batch_insert_use_prepared_statements: false,
+            decimal_between: false,
         }
     }
 
@@ -149,6 +154,15 @@ impl SqliteTableProviderFactory {
     #[must_use]
     pub fn with_batch_insert_use_prepared_statements(mut self, use_prepared: bool) -> Self {
         self.batch_insert_use_prepared_statements = use_prepared;
+        self
+    }
+
+    /// Enable rewriting numeric `BETWEEN` bounds into arbitrary-precision
+    /// `decimal_cmp` comparisons in the federation AST analyzer, avoiding
+    /// `SQLite` floating-point precision errors (see [`crate::sqlite::between`]).
+    #[must_use]
+    pub fn with_decimal_between(mut self, decimal_between: bool) -> Self {
+        self.decimal_between = decimal_between;
         self
     }
 
@@ -374,11 +388,10 @@ impl TableProviderFactory for SqliteTableProviderFactory {
 
         let dyn_pool: Arc<DynSqliteConnectionPool> = read_pool;
 
-        let read_provider = Arc::new(SQLiteTable::new_with_schema(
-            &dyn_pool,
-            Arc::clone(&schema),
-            name,
-        ));
+        let read_provider = Arc::new(
+            SQLiteTable::new_with_schema(&dyn_pool, Arc::clone(&schema), name)
+                .with_decimal_between(self.decimal_between),
+        );
 
         let sqlite = Arc::into_inner(sqlite)
             .context(DanglingReferenceToSqliteSnafu)
