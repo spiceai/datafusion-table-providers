@@ -47,6 +47,9 @@ pub enum Error {
 
     #[snafu(display("Failed to extract column name: {source}"))]
     FailedToExtractColumnName { source: rusqlite::Error },
+
+    #[snafu(display("Failed to decode TEXT value as UTF-8: {source}"))]
+    InvalidUtf8Text { source: std::str::Utf8Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -277,7 +280,7 @@ fn add_row_to_builders(
                     rusqlite::types::ValueRef::Integer(v) => builder.append_value(v.to_string()),
                     rusqlite::types::ValueRef::Real(v) => builder.append_value(v.to_string()),
                     rusqlite::types::ValueRef::Text(v) => builder.append_value(
-                        std::str::from_utf8(v).expect("SQLite TEXT is always UTF-8"),
+                        std::str::from_utf8(v).context(InvalidUtf8TextSnafu)?,
                     ),
                     rusqlite::types::ValueRef::Blob(_) => builder.append_null(),
                 }
@@ -295,7 +298,7 @@ fn add_row_to_builders(
                     rusqlite::types::ValueRef::Integer(v) => builder.append_value(v.to_string()),
                     rusqlite::types::ValueRef::Real(v) => builder.append_value(v.to_string()),
                     rusqlite::types::ValueRef::Text(v) => builder.append_value(
-                        std::str::from_utf8(v).expect("SQLite TEXT is always UTF-8"),
+                        std::str::from_utf8(v).context(InvalidUtf8TextSnafu)?,
                     ),
                     rusqlite::types::ValueRef::Blob(_) => builder.append_null(),
                 }
