@@ -91,13 +91,13 @@ pub fn rows_to_arrow(
             // `INTEGER` to float: casts using `as` operator. Never fails.
             // `REAL` to float: casts using `as` operator. Never fails.
 
+            // Decimal columns use Utf8 decoding regardless of the first row's
+            // storage class (see `to_sqlite_decoding_type`), so skip the
+            // Integer→Real promotion for them — it's only needed for float targets.
             if column_type == Type::Integer {
                 if let Some(projected_schema) = projected_schema.as_ref() {
                     match projected_schema.fields[i].data_type() {
-                        DataType::Decimal128(..)
-                        | DataType::Float16
-                        | DataType::Float32
-                        | DataType::Float64 => {
+                        DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                             column_type = Type::Real;
                         }
                         _ => {}
@@ -126,10 +126,26 @@ pub fn rows_to_arrow(
         row_count += 1;
     }
 
-    let columns = arrow_columns_builders
+    let mut columns = arrow_columns_builders
         .into_iter()
         .map(|mut b| b.finish())
         .collect::<Vec<ArrayRef>>();
+
+    // Cast columns whose decode type differs from the projected schema type
+    // (e.g. Utf8 → Decimal128 for decimal columns read as text).
+    if let Some(ref projected_schema) = projected_schema {
+        for (i, target_field) in projected_schema.fields().iter().enumerate() {
+            if arrow_fields[i].data_type() != target_field.data_type() {
+                columns[i] = arrow::compute::cast(&columns[i], target_field.data_type())
+                    .context(FailedToBuildRecordBatchSnafu)?;
+                arrow_fields[i] = Field::new(
+                    arrow_fields[i].name().clone(),
+                    target_field.data_type().clone(),
+                    arrow_fields[i].is_nullable(),
+                );
+            }
+        }
+    }
 
     let options = &RecordBatchOptions::new().with_row_count(Some(row_count));
     match RecordBatch::try_new_with_options(Arc::new(Schema::new(arrow_fields)), columns, options) {
@@ -162,7 +178,10 @@ fn to_sqlite_decoding_type(data_type: &DataType, sqlite_type: &Type) -> DataType
         DataType::Utf8 => DataType::Utf8,
         DataType::LargeUtf8 => DataType::LargeUtf8,
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => DataType::Binary,
-        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => DataType::Float64,
+        // Decode decimals as Utf8 so that every SQLite storage class
+        // (INTEGER, REAL, TEXT) is accepted — `sqlite3_column_text()` handles
+        // them all.  The caller casts Utf8 → Decimal after all rows are read.
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => DataType::Utf8,
         DataType::Duration(_) => DataType::Int64,
 
         // Timestamp, Date32, Date64, Time32, Time64, List, Struct, Union, Dictionary, Map
