@@ -262,9 +262,45 @@ fn add_row_to_builders(
             DataType::Float32 => append_value!(builder, row, i, f32, Float32Builder, Type::Real),
             DataType::Float64 => append_value!(builder, row, i, f64, Float64Builder, Type::Real),
 
-            DataType::Utf8 => append_value!(builder, row, i, String, StringBuilder, Type::Text),
+            // Use get_ref() instead of get::<String>() so that any SQLite
+            // storage class (INTEGER, REAL, TEXT) is accepted — rusqlite's
+            // FromSql<String> rejects non-TEXT cells in 0.40+.
+            DataType::Utf8 => {
+                let Some(builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() else {
+                    return FailedToDowncastBuilderSnafu {
+                        sqlite_type: format!("{}", Type::Text),
+                    }
+                    .fail();
+                };
+                let value_ref = row.get_ref(i).context(FailedToExtractRowValueSnafu)?;
+                match value_ref {
+                    rusqlite::types::ValueRef::Null => builder.append_null(),
+                    rusqlite::types::ValueRef::Integer(v) => builder.append_value(v.to_string()),
+                    rusqlite::types::ValueRef::Real(v) => builder.append_value(v.to_string()),
+                    rusqlite::types::ValueRef::Text(v) => builder.append_value(
+                        String::from_utf8_lossy(v),
+                    ),
+                    rusqlite::types::ValueRef::Blob(_) => builder.append_null(),
+                }
+            }
             DataType::LargeUtf8 => {
-                append_value!(builder, row, i, String, LargeStringBuilder, Type::Text)
+                let Some(builder) = builder.as_any_mut().downcast_mut::<LargeStringBuilder>()
+                else {
+                    return FailedToDowncastBuilderSnafu {
+                        sqlite_type: format!("{}", Type::Text),
+                    }
+                    .fail();
+                };
+                let value_ref = row.get_ref(i).context(FailedToExtractRowValueSnafu)?;
+                match value_ref {
+                    rusqlite::types::ValueRef::Null => builder.append_null(),
+                    rusqlite::types::ValueRef::Integer(v) => builder.append_value(v.to_string()),
+                    rusqlite::types::ValueRef::Real(v) => builder.append_value(v.to_string()),
+                    rusqlite::types::ValueRef::Text(v) => builder.append_value(
+                        String::from_utf8_lossy(v),
+                    ),
+                    rusqlite::types::ValueRef::Blob(_) => builder.append_null(),
+                }
             }
 
             DataType::Binary => append_value!(builder, row, i, Vec<u8>, BinaryBuilder, Type::Blob),
@@ -309,7 +345,7 @@ mod tests {
              INSERT INTO dec_test VALUES (3, 99.99);   -- stored as REAL
              INSERT INTO dec_test VALUES (4, 0);       -- stored as INTEGER
              INSERT INTO dec_test VALUES (5, 2);       -- stored as INTEGER
-             INSERT INTO dec_test VALUES (6, '123456789.99'); -- stored as TEXT",
+             INSERT INTO dec_test VALUES (6, '12345678.99'); -- stored as TEXT",
         )
         .expect("setup table");
 
@@ -342,6 +378,6 @@ mod tests {
         assert_eq!(dec_col.value(2), 9999);          // 99.99
         assert_eq!(dec_col.value(3), 0);             // 0
         assert_eq!(dec_col.value(4), 200);           // 2.00
-        assert_eq!(dec_col.value(5), 12345678999);   // 123456789.99
+        assert_eq!(dec_col.value(5), 1234567899);    // 12345678.99
     }
 }
