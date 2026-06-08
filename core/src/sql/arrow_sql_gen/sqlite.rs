@@ -47,9 +47,6 @@ pub enum Error {
 
     #[snafu(display("Failed to extract column name: {source}"))]
     FailedToExtractColumnName { source: rusqlite::Error },
-
-    #[snafu(display("Failed to decode TEXT value as UTF-8: {source}"))]
-    InvalidUtf8Text { source: std::str::Utf8Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -199,9 +196,11 @@ fn to_sqlite_decoding_type(data_type: &DataType, sqlite_type: &Type) -> DataType
         DataType::Utf8 => DataType::Utf8,
         DataType::LargeUtf8 => DataType::LargeUtf8,
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => DataType::Binary,
-        // Decode decimals as Utf8 so that every SQLite storage class
-        // (INTEGER, REAL, TEXT) is accepted — `sqlite3_column_text()` handles
-        // them all.  The caller casts Utf8 → Decimal after all rows are read.
+        // Decimals are stored in a `decimal(p, s)` (NUMERIC affinity) column, so
+        // a single column can hold a mix of INTEGER, REAL and TEXT storage
+        // classes across rows depending on the value. Decode the column as Utf8
+        // and let the downstream cast turn the text into the target Decimal type;
+        // the Utf8 reader below tolerates whichever storage class each cell uses.
         DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => DataType::Utf8,
         DataType::Duration(_) => DataType::Int64,
 
@@ -222,6 +221,34 @@ macro_rules! append_value {
         match value {
             Some(value) => builder.append_value(value),
             None => builder.append_null(),
+        }
+    }};
+}
+
+/// Append a value to a string builder, tolerating whichever SQLite storage class
+/// the cell actually uses.
+///
+/// SQLite is dynamically typed, so a single column can hold a mix of TEXT, REAL,
+/// INTEGER and BLOB values across rows (notably `decimal(p, s)` columns, whose
+/// NUMERIC affinity stores `0.00` as INTEGER, `1.11` as REAL and high-precision
+/// values as TEXT). Reading such a column strictly as `String` fails with
+/// `InvalidColumnType` the moment a non-TEXT cell is encountered, so render every
+/// storage class to its textual form instead.
+macro_rules! append_text_value {
+    ($builder:expr, $row:expr, $index:expr, $builder_type:ty) => {{
+        let Some(builder) = $builder.as_any_mut().downcast_mut::<$builder_type>() else {
+            FailedToDowncastBuilderSnafu {
+                sqlite_type: format!("{}", Type::Text),
+            }
+            .fail()?
+        };
+        let value_ref = $row.get_ref($index).context(FailedToExtractRowValueSnafu)?;
+        match value_ref {
+            rusqlite::types::ValueRef::Null => builder.append_null(),
+            rusqlite::types::ValueRef::Text(t) => builder.append_value(String::from_utf8_lossy(t)),
+            rusqlite::types::ValueRef::Integer(i) => builder.append_value(i.to_string()),
+            rusqlite::types::ValueRef::Real(f) => builder.append_value(f.to_string()),
+            rusqlite::types::ValueRef::Blob(b) => builder.append_value(String::from_utf8_lossy(b)),
         }
     }};
 }
@@ -283,43 +310,9 @@ fn add_row_to_builders(
             DataType::Float32 => append_value!(builder, row, i, f32, Float32Builder, Type::Real),
             DataType::Float64 => append_value!(builder, row, i, f64, Float64Builder, Type::Real),
 
-            // Use get_ref() instead of get::<String>() so that any SQLite
-            // storage class (INTEGER, REAL, TEXT) is accepted — rusqlite's
-            // FromSql<String> rejects non-TEXT cells in 0.40+.
-            DataType::Utf8 => {
-                let Some(builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() else {
-                    return FailedToDowncastBuilderSnafu {
-                        sqlite_type: Type::Text.to_string(),
-                    }
-                    .fail();
-                };
-                match row.get_ref(i).context(FailedToExtractRowValueSnafu)? {
-                    rusqlite::types::ValueRef::Null => builder.append_null(),
-                    rusqlite::types::ValueRef::Integer(v) => builder.append_value(v.to_string()),
-                    rusqlite::types::ValueRef::Real(v) => builder.append_value(v.to_string()),
-                    rusqlite::types::ValueRef::Text(v) => {
-                        builder.append_value(std::str::from_utf8(v).context(InvalidUtf8TextSnafu)?)
-                    }
-                    rusqlite::types::ValueRef::Blob(_) => builder.append_null(),
-                }
-            }
+            DataType::Utf8 => append_text_value!(builder, row, i, StringBuilder),
             DataType::LargeUtf8 => {
-                let Some(builder) = builder.as_any_mut().downcast_mut::<LargeStringBuilder>()
-                else {
-                    return FailedToDowncastBuilderSnafu {
-                        sqlite_type: Type::Text.to_string(),
-                    }
-                    .fail();
-                };
-                match row.get_ref(i).context(FailedToExtractRowValueSnafu)? {
-                    rusqlite::types::ValueRef::Null => builder.append_null(),
-                    rusqlite::types::ValueRef::Integer(v) => builder.append_value(v.to_string()),
-                    rusqlite::types::ValueRef::Real(v) => builder.append_value(v.to_string()),
-                    rusqlite::types::ValueRef::Text(v) => {
-                        builder.append_value(std::str::from_utf8(v).context(InvalidUtf8TextSnafu)?)
-                    }
-                    rusqlite::types::ValueRef::Blob(_) => builder.append_null(),
-                }
+                append_text_value!(builder, row, i, LargeStringBuilder)
             }
 
             DataType::Binary => append_value!(builder, row, i, Vec<u8>, BinaryBuilder, Type::Blob),
