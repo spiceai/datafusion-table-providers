@@ -213,7 +213,21 @@ fn add_row_to_builders(
             DataType::UInt8 => append_value!(builder, row, i, u8, UInt8Builder, Type::Integer),
             DataType::UInt16 => append_value!(builder, row, i, u16, UInt16Builder, Type::Integer),
             DataType::UInt32 => append_value!(builder, row, i, u32, UInt32Builder, Type::Integer),
-            DataType::UInt64 => append_value!(builder, row, i, u64, UInt64Builder, Type::Integer),
+            DataType::UInt64 => {
+                // rusqlite 0.40 dropped the `u64` `FromSql` impl (SQLite integers are
+                // i64); read as i64 and reinterpret the bits as u64.
+                let Some(builder) = builder.as_any_mut().downcast_mut::<UInt64Builder>() else {
+                    return FailedToDowncastBuilderSnafu {
+                        sqlite_type: format!("{}", Type::Integer),
+                    }
+                    .fail();
+                };
+                let value: Option<i64> = row.get(i).context(FailedToExtractRowValueSnafu)?;
+                match value {
+                    Some(value) => builder.append_value(value as u64),
+                    None => builder.append_null(),
+                }
+            }
 
             DataType::Boolean => {
                 append_value!(builder, row, i, bool, BooleanBuilder, Type::Integer)
