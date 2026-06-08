@@ -222,9 +222,16 @@ fn add_row_to_builders(
                     }
                     .fail();
                 };
+                // rusqlite 0.40 removed FromSql for u64 (SQLite INTEGER is signed 64-bit).
+                // Read as i64 and convert; negative values are out of range for u64.
                 let value: Option<i64> = row.get(i).context(FailedToExtractRowValueSnafu)?;
                 match value {
-                    Some(value) => builder.append_value(value as u64),
+                    Some(v) => {
+                        let u = u64::try_from(v)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(i, v))
+                            .context(FailedToExtractRowValueSnafu)?;
+                        builder.append_value(u);
+                    }
                     None => builder.append_null(),
                 }
             }
