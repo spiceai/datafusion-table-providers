@@ -138,6 +138,13 @@ pub fn rows_to_arrow(
     // (e.g. Utf8 → Decimal128 for decimal columns read as text).
     if let Some(ref projected_schema) = projected_schema {
         for (i, target_field) in projected_schema.fields().iter().enumerate() {
+            // The decoded result can have fewer columns than the projected schema
+            // (e.g. a `SELECT MAX(ts)` refresh probe carries the full table schema),
+            // so only cast indices that actually exist in the decoded batch instead
+            // of panicking with an out-of-bounds index.
+            if i >= arrow_fields.len() {
+                break;
+            }
             if arrow_fields[i].data_type() != target_field.data_type() {
                 columns[i] = arrow::compute::cast(&columns[i], target_field.data_type())
                     .context(FailedToBuildRecordBatchSnafu)?;
