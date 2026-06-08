@@ -47,6 +47,9 @@ pub enum Error {
 
     #[snafu(display("Failed to extract column name: {source}"))]
     FailedToExtractColumnName { source: rusqlite::Error },
+
+    #[snafu(display("Failed to decode TEXT value as UTF-8: {source}"))]
+    InvalidUtf8Text { source: std::str::Utf8Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -91,13 +94,13 @@ pub fn rows_to_arrow(
             // `INTEGER` to float: casts using `as` operator. Never fails.
             // `REAL` to float: casts using `as` operator. Never fails.
 
+            // Decimal columns use Utf8 decoding regardless of the first row's
+            // storage class (see `to_sqlite_decoding_type`), so skip the
+            // Integer→Real promotion for them — it's only needed for float targets.
             if column_type == Type::Integer {
                 if let Some(projected_schema) = projected_schema.as_ref() {
                     match projected_schema.fields[i].data_type() {
-                        DataType::Decimal128(..)
-                        | DataType::Float16
-                        | DataType::Float32
-                        | DataType::Float64 => {
+                        DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                             column_type = Type::Real;
                         }
                         _ => {}
@@ -126,10 +129,26 @@ pub fn rows_to_arrow(
         row_count += 1;
     }
 
-    let columns = arrow_columns_builders
+    let mut columns = arrow_columns_builders
         .into_iter()
         .map(|mut b| b.finish())
         .collect::<Vec<ArrayRef>>();
+
+    // Cast columns whose decode type differs from the projected schema type
+    // (e.g. Utf8 → Decimal128 for decimal columns read as text).
+    if let Some(ref projected_schema) = projected_schema {
+        for (i, target_field) in projected_schema.fields().iter().enumerate() {
+            if arrow_fields[i].data_type() != target_field.data_type() {
+                columns[i] = arrow::compute::cast(&columns[i], target_field.data_type())
+                    .context(FailedToBuildRecordBatchSnafu)?;
+                arrow_fields[i] = Field::new(
+                    arrow_fields[i].name().clone(),
+                    target_field.data_type().clone(),
+                    arrow_fields[i].is_nullable(),
+                );
+            }
+        }
+    }
 
     let options = &RecordBatchOptions::new().with_row_count(Some(row_count));
     match RecordBatch::try_new_with_options(Arc::new(Schema::new(arrow_fields)), columns, options) {
@@ -162,7 +181,10 @@ fn to_sqlite_decoding_type(data_type: &DataType, sqlite_type: &Type) -> DataType
         DataType::Utf8 => DataType::Utf8,
         DataType::LargeUtf8 => DataType::LargeUtf8,
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => DataType::Binary,
-        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => DataType::Float64,
+        // Decode decimals as Utf8 so that every SQLite storage class
+        // (INTEGER, REAL, TEXT) is accepted — `sqlite3_column_text()` handles
+        // them all.  The caller casts Utf8 → Decimal after all rows are read.
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => DataType::Utf8,
         DataType::Duration(_) => DataType::Int64,
 
         // Timestamp, Date32, Date64, Time32, Time64, List, Struct, Union, Dictionary, Map
@@ -243,9 +265,43 @@ fn add_row_to_builders(
             DataType::Float32 => append_value!(builder, row, i, f32, Float32Builder, Type::Real),
             DataType::Float64 => append_value!(builder, row, i, f64, Float64Builder, Type::Real),
 
-            DataType::Utf8 => append_value!(builder, row, i, String, StringBuilder, Type::Text),
+            // Use get_ref() instead of get::<String>() so that any SQLite
+            // storage class (INTEGER, REAL, TEXT) is accepted — rusqlite's
+            // FromSql<String> rejects non-TEXT cells in 0.40+.
+            DataType::Utf8 => {
+                let Some(builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() else {
+                    return FailedToDowncastBuilderSnafu {
+                        sqlite_type: Type::Text.to_string(),
+                    }
+                    .fail();
+                };
+                match row.get_ref(i).context(FailedToExtractRowValueSnafu)? {
+                    rusqlite::types::ValueRef::Null => builder.append_null(),
+                    rusqlite::types::ValueRef::Integer(v) => builder.append_value(v.to_string()),
+                    rusqlite::types::ValueRef::Real(v) => builder.append_value(v.to_string()),
+                    rusqlite::types::ValueRef::Text(v) => builder.append_value(
+                        std::str::from_utf8(v).context(InvalidUtf8TextSnafu)?,
+                    ),
+                    rusqlite::types::ValueRef::Blob(_) => builder.append_null(),
+                }
+            }
             DataType::LargeUtf8 => {
-                append_value!(builder, row, i, String, LargeStringBuilder, Type::Text)
+                let Some(builder) = builder.as_any_mut().downcast_mut::<LargeStringBuilder>()
+                else {
+                    return FailedToDowncastBuilderSnafu {
+                        sqlite_type: Type::Text.to_string(),
+                    }
+                    .fail();
+                };
+                match row.get_ref(i).context(FailedToExtractRowValueSnafu)? {
+                    rusqlite::types::ValueRef::Null => builder.append_null(),
+                    rusqlite::types::ValueRef::Integer(v) => builder.append_value(v.to_string()),
+                    rusqlite::types::ValueRef::Real(v) => builder.append_value(v.to_string()),
+                    rusqlite::types::ValueRef::Text(v) => builder.append_value(
+                        std::str::from_utf8(v).context(InvalidUtf8TextSnafu)?,
+                    ),
+                    rusqlite::types::ValueRef::Blob(_) => builder.append_null(),
+                }
             }
 
             DataType::Binary => append_value!(builder, row, i, Vec<u8>, BinaryBuilder, Type::Blob),
@@ -265,5 +321,64 @@ fn map_column_type_to_data_type(column_type: Type) -> DataType {
         Type::Real => DataType::Float64,
         Type::Text => DataType::Utf8,
         Type::Blob => DataType::Binary,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, AsArray, Decimal128Array};
+    use rusqlite::Connection;
+
+    /// SQLite NUMERIC affinity stores values with per-cell storage classes:
+    /// integer-valued decimals as INTEGER, fractional ones as REAL, and
+    /// high-precision values as TEXT.  `rows_to_arrow` must handle all three
+    /// in the same column without "Invalid column type Text" errors.
+    #[test]
+    fn test_decimal_mixed_storage_classes() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+
+        // decimal(10,2) gets NUMERIC affinity — SQLite picks storage class per cell.
+        conn.execute_batch(
+            "CREATE TABLE dec_test (id INTEGER PRIMARY KEY, val decimal(10,2));
+             INSERT INTO dec_test VALUES (1, 1.11);   -- stored as REAL
+             INSERT INTO dec_test VALUES (2, NULL);    -- NULL
+             INSERT INTO dec_test VALUES (3, 99.99);   -- stored as REAL
+             INSERT INTO dec_test VALUES (4, 0);       -- stored as INTEGER
+             INSERT INTO dec_test VALUES (5, 2);       -- stored as INTEGER
+             INSERT INTO dec_test VALUES (6, '12345678.99'); -- stored as TEXT",
+        )
+        .expect("setup table");
+
+        let projected_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Decimal128(10, 2), true),
+        ]));
+
+        let mut stmt = conn
+            .prepare("SELECT id, val FROM dec_test ORDER BY id")
+            .expect("prepare");
+        let column_count = stmt.column_count();
+        let rows = stmt.query([]).expect("query");
+
+        let batch =
+            rows_to_arrow(rows, column_count, Some(projected_schema)).expect("rows_to_arrow");
+
+        assert_eq!(batch.num_rows(), 6);
+
+        let dec_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("should be Decimal128Array");
+
+        assert_eq!(dec_col.precision(), 10);
+        assert_eq!(dec_col.scale(), 2);
+        assert_eq!(dec_col.value(0), 111); // 1.11
+        assert!(dec_col.is_null(1)); // NULL
+        assert_eq!(dec_col.value(2), 9999); // 99.99
+        assert_eq!(dec_col.value(3), 0); // 0
+        assert_eq!(dec_col.value(4), 200); // 2.00
+        assert_eq!(dec_col.value(5), 1234567899); // 12345678.99
     }
 }
