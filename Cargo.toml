@@ -50,3 +50,6 @@ datafusion-table-providers = { path = "core" }
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "eb4b02bf310474639d2bbb1b2337519cfa5748b9" } # branch: lukim/spiceai-58-arrow58 (DuckDB 1.5.2 + arrow 58), matches spiceai/spiceai
 adbc_core = { version = "0.23" }
 adbc_driver_manager = { version = "0.23" }
+
+[patch.crates-io]
+tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e" }
