@@ -214,6 +214,8 @@ fn add_row_to_builders(
             DataType::UInt16 => append_value!(builder, row, i, u16, UInt16Builder, Type::Integer),
             DataType::UInt32 => append_value!(builder, row, i, u32, UInt32Builder, Type::Integer),
             DataType::UInt64 => {
+                // rusqlite 0.40 dropped the `u64` `FromSql` impl (SQLite integers are
+                // i64); read as i64 and reinterpret the bits as u64.
                 let Some(builder) = builder.as_any_mut().downcast_mut::<UInt64Builder>() else {
                     return FailedToDowncastBuilderSnafu {
                         sqlite_type: format!("{}", Type::Integer),
