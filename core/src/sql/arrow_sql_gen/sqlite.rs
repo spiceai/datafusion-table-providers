@@ -134,9 +134,20 @@ pub fn rows_to_arrow(
         .map(|mut b| b.finish())
         .collect::<Vec<ArrayRef>>();
 
-    // Cast columns whose decode type differs from the projected schema type
-    // (e.g. Utf8 → Decimal128 for decimal columns read as text).
-    if let Some(ref projected_schema) = projected_schema {
+    // `arrow_fields` / `columns` are only populated when at least one row is
+    // read. For an empty result set, build them from `projected_schema` so
+    // callers that use `RecordBatch::schema()` see the expected schema rather
+    // than an empty one.
+    if arrow_fields.is_empty() {
+        if let Some(ref projected_schema) = projected_schema {
+            for field in projected_schema.fields() {
+                arrow_fields.push(field.as_ref().clone());
+                columns.push(arrow::array::new_empty_array(field.data_type()));
+            }
+        }
+    } else if let Some(ref projected_schema) = projected_schema {
+        // Cast columns whose decode type differs from the projected schema
+        // type (e.g. Utf8 → Decimal128 for decimal columns read as text).
         for (i, target_field) in projected_schema.fields().iter().enumerate() {
             // The decoded result can have fewer columns than the projected schema
             // (e.g. a `SELECT MAX(ts)` refresh probe carries the full table schema),
@@ -286,9 +297,9 @@ fn add_row_to_builders(
                     rusqlite::types::ValueRef::Null => builder.append_null(),
                     rusqlite::types::ValueRef::Integer(v) => builder.append_value(v.to_string()),
                     rusqlite::types::ValueRef::Real(v) => builder.append_value(v.to_string()),
-                    rusqlite::types::ValueRef::Text(v) => builder.append_value(
-                        std::str::from_utf8(v).context(InvalidUtf8TextSnafu)?,
-                    ),
+                    rusqlite::types::ValueRef::Text(v) => {
+                        builder.append_value(std::str::from_utf8(v).context(InvalidUtf8TextSnafu)?)
+                    }
                     rusqlite::types::ValueRef::Blob(_) => builder.append_null(),
                 }
             }
@@ -304,9 +315,9 @@ fn add_row_to_builders(
                     rusqlite::types::ValueRef::Null => builder.append_null(),
                     rusqlite::types::ValueRef::Integer(v) => builder.append_value(v.to_string()),
                     rusqlite::types::ValueRef::Real(v) => builder.append_value(v.to_string()),
-                    rusqlite::types::ValueRef::Text(v) => builder.append_value(
-                        std::str::from_utf8(v).context(InvalidUtf8TextSnafu)?,
-                    ),
+                    rusqlite::types::ValueRef::Text(v) => {
+                        builder.append_value(std::str::from_utf8(v).context(InvalidUtf8TextSnafu)?)
+                    }
                     rusqlite::types::ValueRef::Blob(_) => builder.append_null(),
                 }
             }
@@ -334,7 +345,7 @@ fn map_column_type_to_data_type(column_type: Type) -> DataType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, AsArray, Decimal128Array};
+    use arrow::array::{Array, Decimal128Array};
     use rusqlite::Connection;
 
     /// SQLite NUMERIC affinity stores values with per-cell storage classes:
@@ -387,5 +398,34 @@ mod tests {
         assert_eq!(dec_col.value(3), 0); // 0
         assert_eq!(dec_col.value(4), 200); // 2.00
         assert_eq!(dec_col.value(5), 1234567899); // 12345678.99
+    }
+
+    /// An empty result set (no rows) with a non-empty `projected_schema` must not panic.
+    #[test]
+    fn test_empty_result_with_projected_schema() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+
+        // Decimal column ensures the decode type (Utf8) differs from the
+        // projected type (Decimal128), exercising the cast branch.
+        conn.execute_batch("CREATE TABLE empty_test (id INTEGER PRIMARY KEY, val decimal(10,2));")
+            .expect("setup table");
+
+        let projected_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Decimal128(10, 2), true),
+        ]));
+
+        let mut stmt = conn
+            .prepare("SELECT id, val FROM empty_test")
+            .expect("prepare");
+        let column_count = stmt.column_count();
+        let rows = stmt.query([]).expect("query");
+
+        let batch = rows_to_arrow(rows, column_count, Some(Arc::clone(&projected_schema)))
+            .expect("rows_to_arrow on empty result");
+
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(batch.schema(), projected_schema);
     }
 }
