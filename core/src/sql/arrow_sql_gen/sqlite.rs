@@ -286,3 +286,62 @@ fn map_column_type_to_data_type(column_type: Type) -> DataType {
         Type::Blob => DataType::Binary,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, AsArray, Decimal128Array};
+    use rusqlite::Connection;
+
+    /// SQLite NUMERIC affinity stores values with per-cell storage classes:
+    /// integer-valued decimals as INTEGER, fractional ones as REAL, and
+    /// high-precision values as TEXT.  `rows_to_arrow` must handle all three
+    /// in the same column without "Invalid column type Text" errors.
+    #[test]
+    fn test_decimal_mixed_storage_classes() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+
+        // decimal(10,2) gets NUMERIC affinity — SQLite picks storage class per cell.
+        conn.execute_batch(
+            "CREATE TABLE dec_test (id INTEGER PRIMARY KEY, val decimal(10,2));
+             INSERT INTO dec_test VALUES (1, 1.11);   -- stored as REAL
+             INSERT INTO dec_test VALUES (2, NULL);    -- NULL
+             INSERT INTO dec_test VALUES (3, 99.99);   -- stored as REAL
+             INSERT INTO dec_test VALUES (4, 0);       -- stored as INTEGER
+             INSERT INTO dec_test VALUES (5, 2);       -- stored as INTEGER
+             INSERT INTO dec_test VALUES (6, '123456789.99'); -- stored as TEXT",
+        )
+        .expect("setup table");
+
+        let projected_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Decimal128(10, 2), true),
+        ]));
+
+        let mut stmt = conn
+            .prepare("SELECT id, val FROM dec_test ORDER BY id")
+            .expect("prepare");
+        let column_count = stmt.column_count();
+        let rows = stmt.query([]).expect("query");
+
+        let batch =
+            rows_to_arrow(rows, column_count, Some(projected_schema)).expect("rows_to_arrow");
+
+        assert_eq!(batch.num_rows(), 6);
+
+        let dec_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("should be Decimal128Array");
+
+        assert_eq!(dec_col.precision(), 10);
+        assert_eq!(dec_col.scale(), 2);
+        assert_eq!(dec_col.value(0), 111);          // 1.11
+        assert!(dec_col.is_null(1));                  // NULL
+        assert_eq!(dec_col.value(2), 9999);          // 99.99
+        assert_eq!(dec_col.value(3), 0);             // 0
+        assert_eq!(dec_col.value(4), 200);           // 2.00
+        assert_eq!(dec_col.value(5), 12345678999);   // 123456789.99
+    }
+}
