@@ -268,17 +268,16 @@ fn add_row_to_builders(
             DataType::Utf8 => {
                 let Some(builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() else {
                     return FailedToDowncastBuilderSnafu {
-                        sqlite_type: format!("{}", Type::Text),
+                        sqlite_type: Type::Text.to_string(),
                     }
                     .fail();
                 };
-                let value_ref = row.get_ref(i).context(FailedToExtractRowValueSnafu)?;
-                match value_ref {
+                match row.get_ref(i).context(FailedToExtractRowValueSnafu)? {
                     rusqlite::types::ValueRef::Null => builder.append_null(),
                     rusqlite::types::ValueRef::Integer(v) => builder.append_value(v.to_string()),
                     rusqlite::types::ValueRef::Real(v) => builder.append_value(v.to_string()),
                     rusqlite::types::ValueRef::Text(v) => builder.append_value(
-                        String::from_utf8_lossy(v),
+                        std::str::from_utf8(v).expect("SQLite TEXT is always UTF-8"),
                     ),
                     rusqlite::types::ValueRef::Blob(_) => builder.append_null(),
                 }
@@ -287,17 +286,16 @@ fn add_row_to_builders(
                 let Some(builder) = builder.as_any_mut().downcast_mut::<LargeStringBuilder>()
                 else {
                     return FailedToDowncastBuilderSnafu {
-                        sqlite_type: format!("{}", Type::Text),
+                        sqlite_type: Type::Text.to_string(),
                     }
                     .fail();
                 };
-                let value_ref = row.get_ref(i).context(FailedToExtractRowValueSnafu)?;
-                match value_ref {
+                match row.get_ref(i).context(FailedToExtractRowValueSnafu)? {
                     rusqlite::types::ValueRef::Null => builder.append_null(),
                     rusqlite::types::ValueRef::Integer(v) => builder.append_value(v.to_string()),
                     rusqlite::types::ValueRef::Real(v) => builder.append_value(v.to_string()),
                     rusqlite::types::ValueRef::Text(v) => builder.append_value(
-                        String::from_utf8_lossy(v),
+                        std::str::from_utf8(v).expect("SQLite TEXT is always UTF-8"),
                     ),
                     rusqlite::types::ValueRef::Blob(_) => builder.append_null(),
                 }
@@ -373,11 +371,11 @@ mod tests {
 
         assert_eq!(dec_col.precision(), 10);
         assert_eq!(dec_col.scale(), 2);
-        assert_eq!(dec_col.value(0), 111);          // 1.11
-        assert!(dec_col.is_null(1));                  // NULL
-        assert_eq!(dec_col.value(2), 9999);          // 99.99
-        assert_eq!(dec_col.value(3), 0);             // 0
-        assert_eq!(dec_col.value(4), 200);           // 2.00
-        assert_eq!(dec_col.value(5), 1234567899);    // 12345678.99
+        assert_eq!(dec_col.value(0), 111); // 1.11
+        assert!(dec_col.is_null(1)); // NULL
+        assert_eq!(dec_col.value(2), 9999); // 99.99
+        assert_eq!(dec_col.value(3), 0); // 0
+        assert_eq!(dec_col.value(4), 200); // 2.00
+        assert_eq!(dec_col.value(5), 1234567899); // 12345678.99
     }
 }
