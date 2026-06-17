@@ -8,7 +8,7 @@ use datafusion::sql::unparser::dialect::{Dialect, MySqlDialect};
 use futures::TryStreamExt;
 use mysql_async::prelude::ToValue;
 use std::fmt::Display;
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use crate::sql::sql_provider_datafusion::{
     self, get_stream, to_execution_error, Result as SqlResult, SqlExec, SqlTable,
@@ -89,10 +89,6 @@ impl MySQLTable {
 
 #[async_trait]
 impl TableProvider for MySQLTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.base_table.schema()
     }
@@ -170,10 +166,6 @@ impl ExecutionPlan for MySQLSQLExec {
         "MySQLSQLExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.base_exec.schema()
     }
@@ -200,7 +192,6 @@ impl ExecutionPlan for MySQLSQLExec {
         match self.base_exec.try_pushdown_sort(order)? {
             SortOrderPushdownResult::Exact { inner } => {
                 let base_exec = inner
-                    .as_any()
                     .downcast_ref::<SqlExec<mysql_async::Conn, &'static (dyn ToValue + Sync)>>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(
@@ -214,7 +205,6 @@ impl ExecutionPlan for MySQLSQLExec {
             }
             SortOrderPushdownResult::Inexact { inner } => {
                 let base_exec = inner
-                    .as_any()
                     .downcast_ref::<SqlExec<mysql_async::Conn, &'static (dyn ToValue + Sync)>>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(
@@ -242,7 +232,6 @@ impl ExecutionPlan for MySQLSQLExec {
         let base_exec = self
             .base_exec
             .with_fetch(limit)?
-            .as_any()
             .downcast_ref::<SqlExec<mysql_async::Conn, &'static (dyn ToValue + Sync)>>()?
             .clone();
         Some(Arc::new(MySQLSQLExec { base_exec }))
@@ -261,7 +250,6 @@ impl ExecutionPlan for MySQLSQLExec {
             .updated_node
             .map(|node| {
                 let base_exec = node
-                    .as_any()
                     .downcast_ref::<SqlExec<mysql_async::Conn, &'static (dyn ToValue + Sync)>>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(

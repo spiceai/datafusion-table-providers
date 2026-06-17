@@ -1,4 +1,4 @@
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -85,10 +85,6 @@ impl DisplayAs for CountExec {
 impl ExecutionPlan for CountExec {
     fn name(&self) -> &'static str {
         "CountExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

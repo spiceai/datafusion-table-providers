@@ -5,7 +5,7 @@ use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::unparser::Unparser;
 use std::fmt::Display;
 use std::sync::Arc;
-use std::{any::Any, fmt};
+use std::fmt;
 
 use datafusion::{
     arrow::datatypes::SchemaRef,
@@ -68,10 +68,6 @@ impl ClickHouseTable {
 
 #[async_trait]
 impl TableProvider for ClickHouseTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

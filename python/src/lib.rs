@@ -10,7 +10,7 @@ use pyo3::{prelude::*, types::PyCapsule};
 
 #[pyclass(module = "datafusion_table_providers._internal")]
 struct RawTableProvider {
-    pub(crate) table: Arc<dyn TableProvider + Send>,
+    pub(crate) table: Arc<dyn TableProvider>,
     pub(crate) supports_pushdown_filters: bool,
 }
 
@@ -64,7 +64,8 @@ fn extract_task_ctx_provider(
             let capsule = session
                 .getattr("__datafusion_task_context_provider__")?
                 .call0()?;
-            let capsule = capsule.downcast::<PyCapsule>()?;
+            let capsule = capsule.cast::<PyCapsule>()?;
+            #[allow(deprecated)]
             let provider = unsafe { capsule.reference::<FFI_TaskContextProvider>() };
             return Ok(provider.clone());
         }

@@ -879,7 +879,6 @@ pub(crate) mod tests {
             .expect("table provider created");
 
         let writer = table_provider
-            .as_any()
             .downcast_ref::<DuckDBTableWriter>()
             .expect("cast to DuckDBTableWriter");
 
@@ -941,7 +940,6 @@ pub(crate) mod tests {
             .expect("table provider created");
 
         let writer = table_provider
-            .as_any()
             .downcast_ref::<DuckDBTableWriter>()
             .expect("cast to DuckDBTableWriter");
 
@@ -999,7 +997,6 @@ pub(crate) mod tests {
             .expect("table provider created");
 
         let writer = table_provider
-            .as_any()
             .downcast_ref::<DuckDBTableWriter>()
             .expect("cast to DuckDBTableWriter");
 
@@ -1055,7 +1052,6 @@ pub(crate) mod tests {
             .expect("table provider created");
 
         let writer = table_provider
-            .as_any()
             .downcast_ref::<DuckDBTableWriter>()
             .expect("cast to DuckDBTableWriter");
 

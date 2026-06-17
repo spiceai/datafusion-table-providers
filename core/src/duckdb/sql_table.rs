@@ -13,7 +13,7 @@ use datafusion::sql::unparser::dialect::Dialect;
 use futures::TryStreamExt;
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use datafusion::{
     arrow::datatypes::SchemaRef,
@@ -109,10 +109,6 @@ impl<T, P> DuckDBTable<T, P> {
 
 #[async_trait]
 impl<T, P> TableProvider for DuckDBTable<T, P> {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.base_table.schema()
     }
@@ -263,10 +259,6 @@ impl<T: 'static, P: 'static> ExecutionPlan for DuckSqlExec<T, P> {
         "DuckSqlExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.optimized_sql_schema
             .as_ref()
@@ -298,7 +290,6 @@ impl<T: 'static, P: 'static> ExecutionPlan for DuckSqlExec<T, P> {
         match self.base_exec.try_pushdown_sort(order)? {
             SortOrderPushdownResult::Exact { inner } => {
                 let base_exec = inner
-                    .as_any()
                     .downcast_ref::<SqlExec<T, P>>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(
@@ -319,7 +310,6 @@ impl<T: 'static, P: 'static> ExecutionPlan for DuckSqlExec<T, P> {
             }
             SortOrderPushdownResult::Inexact { inner } => {
                 let base_exec = inner
-                    .as_any()
                     .downcast_ref::<SqlExec<T, P>>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(
@@ -354,7 +344,6 @@ impl<T: 'static, P: 'static> ExecutionPlan for DuckSqlExec<T, P> {
         let base_exec = self
             .base_exec
             .with_fetch(limit)?
-            .as_any()
             .downcast_ref::<SqlExec<T, P>>()?
             .clone();
         Some(Arc::new(DuckSqlExec {
@@ -380,7 +369,6 @@ impl<T: 'static, P: 'static> ExecutionPlan for DuckSqlExec<T, P> {
             .updated_node
             .map(|node| {
                 let base_exec = node
-                    .as_any()
                     .downcast_ref::<SqlExec<T, P>>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(

@@ -1,4 +1,4 @@
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
@@ -86,10 +86,6 @@ impl ExecutionPlan for DeletionExec {
         "DeletionExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -165,10 +161,6 @@ impl DisplayAs for UpdateExec {
 impl ExecutionPlan for UpdateExec {
     fn name(&self) -> &'static str {
         "UpdateExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

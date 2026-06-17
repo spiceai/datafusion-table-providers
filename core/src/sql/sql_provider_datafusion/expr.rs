@@ -237,7 +237,7 @@ pub fn to_sql(expr: &Expr) -> Result<String> {
 }
 
 fn handle_cast(cast: &Cast, engine: Option<Engine>, expr: &Expr) -> Result<String> {
-    match cast.data_type {
+    match cast.field.data_type() {
         arrow::datatypes::DataType::Timestamp(_, Some(_) | None) => match engine {
             Some(Engine::ODBC) => Ok(format!(
                 "CAST({} AS TIMESTAMP)",
@@ -292,7 +292,7 @@ pub(super) fn expr_contains_subquery_or_outer_ref(expr: &Expr) -> datafusion::er
 
 #[cfg(test)]
 mod tests {
-    use std::{any::Any, sync::Arc};
+    use std::sync::Arc;
 
     use super::*;
     use arrow::datatypes::DataType;
@@ -495,9 +495,6 @@ mod tests {
             signature: Signature,
         }
         impl ScalarUDFImpl for TestScalarUDF {
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
             fn name(&self) -> &str {
                 "substring"
             }

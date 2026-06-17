@@ -20,7 +20,6 @@ use futures::TryStreamExt;
 use crate::sql::sql_provider_datafusion::{
     get_stream, to_execution_error, Result as SqlResult, SqlExec, SqlTable,
 };
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::catalog::Session;
@@ -93,10 +92,6 @@ impl<T, P> AdbcDBTable<T, P> {
 
 #[async_trait]
 impl<T, P> TableProvider for AdbcDBTable<T, P> {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.base_table.schema()
     }
@@ -179,10 +174,6 @@ impl<T: 'static, P: 'static> ExecutionPlan for AdbcSqlExec<T, P> {
         "AdbcSqlExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.base_exec.schema()
     }
@@ -209,7 +200,6 @@ impl<T: 'static, P: 'static> ExecutionPlan for AdbcSqlExec<T, P> {
         match self.base_exec.try_pushdown_sort(order)? {
             SortOrderPushdownResult::Exact { inner } => {
                 let base_exec = inner
-                    .as_any()
                     .downcast_ref::<SqlExec<T, P>>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(
@@ -223,7 +213,6 @@ impl<T: 'static, P: 'static> ExecutionPlan for AdbcSqlExec<T, P> {
             }
             SortOrderPushdownResult::Inexact { inner } => {
                 let base_exec = inner
-                    .as_any()
                     .downcast_ref::<SqlExec<T, P>>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(
@@ -251,7 +240,6 @@ impl<T: 'static, P: 'static> ExecutionPlan for AdbcSqlExec<T, P> {
         let base_exec = self
             .base_exec
             .with_fetch(limit)?
-            .as_any()
             .downcast_ref::<SqlExec<T, P>>()?
             .clone();
         Some(Arc::new(AdbcSqlExec { base_exec }))
@@ -270,7 +258,6 @@ impl<T: 'static, P: 'static> ExecutionPlan for AdbcSqlExec<T, P> {
             .updated_node
             .map(|node| {
                 let base_exec = node
-                    .as_any()
                     .downcast_ref::<SqlExec<T, P>>()
                     .ok_or_else(|| {
                         DataFusionError::Internal(

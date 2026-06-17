@@ -1640,7 +1640,6 @@ pub(crate) mod tests {
             .expect("table should be created");
 
         let sqlite = table
-            .as_any()
             .downcast_ref::<SqliteTableWriter>()
             .expect("downcast to SqliteTableWriter")
             .sqlite();
