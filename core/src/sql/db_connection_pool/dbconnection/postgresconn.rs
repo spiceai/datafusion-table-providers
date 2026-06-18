@@ -514,6 +514,13 @@ impl PostgresConnection {
                 }
             })?;
 
+        if rows.is_empty() {
+            tracing::warn!(
+                "Schema inference from table data rows returned no rows. The schema for table '{table_reference}' is empty.",
+            );
+            return Ok(Arc::new(Schema::empty()));
+        }
+
         let rec =
             rows_to_arrow(rows.as_slice(), &None).map_err(|e| super::Error::UnableToGetSchema {
                 source: Box::new(PostgresError::ConversionError { source: e }),
