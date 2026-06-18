@@ -306,7 +306,7 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
         // catalog views we query. Fall back to inferring the schema from a sample row.
         if rows.is_empty() {
             tracing::warn!(
-                "Native PostgreSQL schema inference returned no rows. Inferring schema from table data rows."
+                "Native PostgreSQL schema inference returned no data. Inferring schema from table data rows."
             );
             return self.infer_schema_from_data(table_reference).await;
         }
