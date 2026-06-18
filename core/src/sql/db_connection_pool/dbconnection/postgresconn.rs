@@ -111,31 +111,31 @@ WHERE ns.nspname = $1
 ORDER BY a.attnum;
 ";
 
+// Redshift does not materialize datashare objects into the local `pg_catalog`
+// (pg_class/pg_attribute return zero rows for tables consumed from a datashare),
+// so we read column metadata from `svv_redshift_columns`, which covers both local
+// and datashare tables. The view exposes no type OIDs, so the array/enum/composite
+// `type_details` path is unavailable — that is acceptable because Redshift has no
+// PostgreSQL arrays/enums/composites (semi-structured data uses SUPER).
+//
+// Notes:
+// - `data_type` is already a formatted type string (e.g. `character varying(256)`,
+//   `numeric(10,2)`), matching what `format_type` produced before.
+// - `is_nullable` is normalized to the literal `YES`/`NO` expected by `get_schema`.
+// - `database_name = current_database()` scopes to the connected database (which is
+//   the datashare consumer DB) so a schema/table that exists in multiple accessible
+//   databases doesn't yield duplicated columns.
 const REDSHIFT_SCHEMA_QUERY: &str = r#"
 SELECT
-    a.attname AS column_name,
-    CASE
-        WHEN t.typelem != 0 AND et.typname IS NOT NULL THEN 'array'
-        ELSE pg_catalog.format_type(a.atttypid, a.atttypmod)
-    END AS data_type,
-    CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable,
-    CASE
-        WHEN t.typelem != 0 AND et.typname IS NOT NULL THEN
-            -- JSON_PARSE returns a super type tokio-postgres does not understand, so cast to text
-            JSON_PARSE('{"type": "array", "element_type": "' || et.typname || '"}')::text
-        ELSE NULL
-    END AS type_details
-FROM pg_class cls
-JOIN pg_namespace ns ON cls.relnamespace = ns.oid
-JOIN pg_attribute a ON a.attrelid = cls.oid
-LEFT JOIN pg_type t ON t.oid = a.atttypid
-LEFT JOIN pg_type et ON t.typelem = et.oid
-WHERE ns.nspname = $1
-    AND cls.relname = $2
-    AND cls.relkind IN ('r','v','m','p')  -- 'p' unused by Redshift today, included for parity with standard PG query and future support
-    AND a.attnum > 0
-    AND NOT a.attisdropped
-ORDER BY a.attnum;
+    column_name,
+    data_type,
+    CASE WHEN lower(is_nullable) IN ('yes', 'true') THEN 'YES' ELSE 'NO' END AS is_nullable,
+    CAST(NULL AS VARCHAR) AS type_details
+FROM svv_redshift_columns
+WHERE schema_name = $1
+    AND table_name = $2
+    AND database_name = current_database()
+ORDER BY ordinal_position;
 "#;
 
 pub enum PostgresVariant {
@@ -154,6 +154,26 @@ const TABLES_QUERY: &str = "
 SELECT tablename
 FROM pg_tables
 WHERE schemaname = $1;
+";
+
+// Like `REDSHIFT_SCHEMA_QUERY`, these read from the `svv_redshift_*` system views so
+// that schemas/tables consumed from a datashare (absent from the local `pg_catalog`)
+// are listed alongside the connected database's own schemas/tables. `current_database()`
+// scopes results to the connected (datashare consumer) database.
+const REDSHIFT_SCHEMAS_QUERY: &str = "
+SELECT schema_name
+FROM svv_redshift_schemas
+WHERE database_name = current_database()
+  AND schema_name NOT IN ('pg_catalog', 'information_schema')
+  AND schema_name NOT LIKE 'pg_temp_%'
+  AND schema_name NOT LIKE 'pg_toast%';
+";
+
+const REDSHIFT_TABLES_QUERY: &str = "
+SELECT table_name
+FROM svv_redshift_tables
+WHERE database_name = current_database()
+  AND schema_name = $1;
 ";
 
 #[derive(Debug, Snafu)]
@@ -244,9 +264,14 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
     }
 
     async fn tables(&self, schema: &str) -> Result<Vec<String>, super::Error> {
+        let query = match self.get_variant().await? {
+            PostgresVariant::Default => TABLES_QUERY,
+            PostgresVariant::Redshift => REDSHIFT_TABLES_QUERY,
+        };
+
         let rows = self
             .conn
-            .query(TABLES_QUERY, &[&schema])
+            .query(query, &[&schema])
             .await
             .map_err(|e| super::Error::UnableToGetTables {
                 source: Box::new(e),
@@ -256,11 +281,18 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
     }
 
     async fn schemas(&self) -> Result<Vec<String>, super::Error> {
-        let rows = self.conn.query(SCHEMAS_QUERY, &[]).await.map_err(|e| {
-            super::Error::UnableToGetSchemas {
-                source: Box::new(e),
-            }
-        })?;
+        let query = match self.get_variant().await? {
+            PostgresVariant::Default => SCHEMAS_QUERY,
+            PostgresVariant::Redshift => REDSHIFT_SCHEMAS_QUERY,
+        };
+
+        let rows =
+            self.conn
+                .query(query, &[])
+                .await
+                .map_err(|e| super::Error::UnableToGetSchemas {
+                    source: Box::new(e),
+                })?;
 
         Ok(rows.iter().map(|r| r.get::<usize, String>(0)).collect())
     }
