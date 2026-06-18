@@ -269,13 +269,11 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
             PostgresVariant::Redshift => REDSHIFT_TABLES_QUERY,
         };
 
-        let rows = self
-            .conn
-            .query(query, &[&schema])
-            .await
-            .map_err(|e| super::Error::UnableToGetTables {
+        let rows = self.conn.query(query, &[&schema]).await.map_err(|e| {
+            super::Error::UnableToGetTables {
                 source: Box::new(e),
-            })?;
+            }
+        })?;
 
         Ok(rows.iter().map(|r| r.get::<usize, String>(0)).collect())
     }
@@ -302,6 +300,16 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
         table_reference: &TableReference,
     ) -> Result<SchemaRef, super::Error> {
         let (variant, rows) = self.query_variant_and_schema(table_reference).await?;
+
+        // Native inference can return zero rows even though the table exists and is
+        // queryable — e.g. Redshift datashare objects that aren't represented in the
+        // catalog views we query. Fall back to inferring the schema from a sample row.
+        if rows.is_empty() {
+            tracing::warn!(
+                "Native PostgreSQL schema inference returned no rows. Inferring schema from table data rows."
+            );
+            return self.infer_schema_from_data(table_reference).await;
+        }
 
         let mut fields = Vec::new();
         for row in rows {
@@ -472,5 +480,45 @@ impl PostgresConnection {
             });
 
         Ok((variant, rows?))
+    }
+
+    /// Fallback schema inference used when native (catalog-based) inference returns no
+    /// rows for a table that is nonetheless queryable. Reads a single row and derives the
+    /// Arrow schema from its column metadata via `rows_to_arrow`.
+    ///
+    /// Note: an empty table yields an empty schema, since `rows_to_arrow` reads column
+    /// types from the first returned row.
+    async fn infer_schema_from_data(
+        &self,
+        table_reference: &TableReference,
+    ) -> Result<SchemaRef, super::Error> {
+        let rows = self
+            .conn
+            .query(&format!("SELECT * FROM {table_reference} LIMIT 1"), &[])
+            .await
+            .map_err(|e| {
+                if let Some(error_source) = e.source() {
+                    if let Some(pg_error) =
+                        error_source.downcast_ref::<tokio_postgres::error::DbError>()
+                    {
+                        if pg_error.code() == &tokio_postgres::error::SqlState::UNDEFINED_TABLE {
+                            return super::Error::UndefinedTable {
+                                source: Box::new(pg_error.clone()),
+                                table_name: table_reference.to_string(),
+                            };
+                        }
+                    }
+                }
+                super::Error::UnableToGetSchema {
+                    source: Box::new(e),
+                }
+            })?;
+
+        let rec =
+            rows_to_arrow(rows.as_slice(), &None).map_err(|e| super::Error::UnableToGetSchema {
+                source: Box::new(PostgresError::ConversionError { source: e }),
+            })?;
+
+        Ok(rec.schema())
     }
 }
