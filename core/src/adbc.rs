@@ -20,10 +20,10 @@ use crate::{
     },
 };
 
-use adbc_core::{Connection, Database};
-use arrow::array::RecordBatch;
 #[cfg(feature = "adbc-federation")]
 use crate::util::supported_functions::FunctionSupport;
+use adbc_core::{Connection, Database};
+use arrow::array::RecordBatch;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::{
     catalog::Session,
