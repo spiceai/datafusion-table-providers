@@ -118,26 +118,62 @@ ORDER BY a.attnum;
 // `type_details` path is unavailable — that is acceptable because Redshift has no
 // PostgreSQL arrays/enums/composites (semi-structured data uses SUPER).
 //
+// `svv_redshift_columns` does not cover `CREATE EXTERNAL TABLE` objects (Redshift
+// Spectrum tables backed by external catalogs such as AWS Glue / Hive Metastore),
+// so we UNION ALL its rows with `svv_external_columns`, which exposes external
+// table columns. The two sources are disjoint (external tables live in external
+// schemas absent from `svv_redshift_columns`), so the union does not duplicate
+// columns. External `external_type` values come from the backing catalog and may
+// use simplified Hive type names (e.g. `string`, `int`, `double`) — these are
+// resolved leniently by `pg_data_type_to_arrow_type` when the variant is Redshift.
+//
 // Notes:
 // - `data_type` is already a formatted type string (e.g. `character varying(256)`,
-//   `numeric(10,2)`), matching what `format_type` produced before.
+//   `numeric(10,2)`), matching what `format_type` produced before. For external
+//   columns this is the catalog-reported `external_type`.
 // - `is_nullable` is normalized to the literal `YES`/`NO` expected by `get_schema`.
-// - `database_name = current_database()` scopes to the connected database (which is
-//   the datashare consumer DB) so a schema/table that exists in multiple accessible
-//   databases doesn't yield duplicated columns.
+//   `svv_external_columns.is_nullable` can be an empty string ("no information"),
+//   which we treat as nullable (only an explicit `no`/`false` maps to `NO`).
+// - `database_name`/`redshift_database_name = current_database()` scopes to the
+//   connected database (the datashare consumer DB) so a schema/table that exists in
+//   multiple accessible databases doesn't yield duplicated columns.
+// - Ordering is applied on the unified result via the inner `ordinal_position`
+//   (`columnnum` for external columns) so column order is preserved per source.
 const REDSHIFT_SCHEMA_QUERY: &str = r#"
 SELECT
     column_name,
     data_type,
-    CASE WHEN lower(is_nullable) IN ('yes', 'true') THEN 'YES' ELSE 'NO' END AS is_nullable,
-    CAST(NULL AS VARCHAR) AS type_details
-FROM svv_redshift_columns
-WHERE schema_name = $1
-    AND table_name = $2
-    AND database_name = current_database()
+    is_nullable,
+    type_details
+FROM (
+    SELECT
+        column_name,
+        data_type,
+        CASE WHEN lower(is_nullable) IN ('yes', 'true') THEN 'YES' ELSE 'NO' END AS is_nullable,
+        CAST(NULL AS VARCHAR) AS type_details,
+        ordinal_position
+    FROM svv_redshift_columns
+    WHERE schema_name = $1
+        AND table_name = $2
+        AND database_name = current_database()
+
+    UNION ALL
+
+    SELECT
+        columnname AS column_name,
+        external_type AS data_type,
+        CASE WHEN lower(is_nullable) IN ('no', 'false') THEN 'NO' ELSE 'YES' END AS is_nullable,
+        CAST(NULL AS VARCHAR) AS type_details,
+        columnnum AS ordinal_position
+    FROM svv_external_columns
+    WHERE schemaname = $1
+        AND tablename = $2
+        AND redshift_database_name = current_database()
+) AS cols
 ORDER BY ordinal_position;
 "#;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostgresVariant {
     Default,
     Redshift,
@@ -334,7 +370,8 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
                 context = context.with_type_details(type_details);
             };
 
-            let Ok(arrow_type) = pg_data_type_to_arrow_type(&pg_type, &context) else {
+            let Ok(arrow_type) = pg_data_type_to_arrow_type(&pg_type, &context, Some(variant))
+            else {
                 handle_unsupported_type_error(
                     self.unsupported_type_action,
                     super::Error::UnsupportedDataType {
