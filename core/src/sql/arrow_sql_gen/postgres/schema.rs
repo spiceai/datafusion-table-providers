@@ -164,7 +164,7 @@ fn redshift_external_type_to_arrow_type(external_type: &str) -> Result<DataType,
         "date" => Ok(DataType::Date32),
         "timestamp" => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
         _ => Err(ArrowError::ParseError(format!(
-            "Unsupported Redshift external type: {external_type}"
+            "Unsupported Redshift type: {external_type}"
         ))),
     }
 }
