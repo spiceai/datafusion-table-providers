@@ -304,11 +304,13 @@ mod tests {
         let context = ParseContext::new();
         // Test basic types
         assert_eq!(
-            pg_data_type_to_arrow_type("smallint", &context, None).expect("Failed to convert smallint"),
+            pg_data_type_to_arrow_type("smallint", &context, None)
+                .expect("Failed to convert smallint"),
             DataType::Int16
         );
         assert_eq!(
-            pg_data_type_to_arrow_type("integer", &context, None).expect("Failed to convert integer"),
+            pg_data_type_to_arrow_type("integer", &context, None)
+                .expect("Failed to convert integer"),
             DataType::Int32
         );
         assert_eq!(
@@ -325,7 +327,8 @@ mod tests {
             DataType::Float64
         );
         assert_eq!(
-            pg_data_type_to_arrow_type("boolean", &context, None).expect("Failed to convert boolean"),
+            pg_data_type_to_arrow_type("boolean", &context, None)
+                .expect("Failed to convert boolean"),
             DataType::Boolean
         );
         assert_eq!(
@@ -336,7 +339,8 @@ mod tests {
 
         // Test string types
         assert_eq!(
-            pg_data_type_to_arrow_type("character", &context, None).expect("Failed to convert character"),
+            pg_data_type_to_arrow_type("character", &context, None)
+                .expect("Failed to convert character"),
             DataType::Utf8
         );
         assert_eq!(
@@ -374,17 +378,20 @@ mod tests {
             DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
         );
         assert_eq!(
-            pg_data_type_to_arrow_type("interval", &context, None).expect("Failed to convert interval"),
+            pg_data_type_to_arrow_type("interval", &context, None)
+                .expect("Failed to convert interval"),
             DataType::Interval(IntervalUnit::MonthDayNano)
         );
 
         // Test numeric types
         assert_eq!(
-            pg_data_type_to_arrow_type("numeric", &context, None).expect("Failed to convert numeric"),
+            pg_data_type_to_arrow_type("numeric", &context, None)
+                .expect("Failed to convert numeric"),
             DataType::Decimal128(38, 20)
         );
         assert_eq!(
-            pg_data_type_to_arrow_type("numeric()", &context, None).expect("Failed to convert numeric()"),
+            pg_data_type_to_arrow_type("numeric()", &context, None)
+                .expect("Failed to convert numeric()"),
             DataType::Decimal128(38, 20)
         );
         assert_eq!(
@@ -538,7 +545,8 @@ mod tests {
             "values": ["small", "medium", "large"]
         }));
         assert_eq!(
-            pg_data_type_to_arrow_type("enum", &enum_type_details, None).expect("Failed to convert enum"),
+            pg_data_type_to_arrow_type("enum", &enum_type_details, None)
+                .expect("Failed to convert enum"),
             DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8))
         );
 
@@ -564,7 +572,8 @@ mod tests {
 
         // Test range types
         assert_eq!(
-            pg_data_type_to_arrow_type("int4range", &context, None).expect("Failed to convert int4range"),
+            pg_data_type_to_arrow_type("int4range", &context, None)
+                .expect("Failed to convert int4range"),
             DataType::Struct(Fields::from(vec![
                 Field::new("lower", DataType::Int32, true),
                 Field::new("upper", DataType::Int32, true),
@@ -581,7 +590,8 @@ mod tests {
             .clone()
             .with_unsupported_type_action(UnsupportedTypeAction::String);
         assert_eq!(
-            pg_data_type_to_arrow_type("jsonb", &jsonb_context, None).expect("Failed to convert jsonb"),
+            pg_data_type_to_arrow_type("jsonb", &jsonb_context, None)
+                .expect("Failed to convert jsonb"),
             DataType::Utf8
         );
 
@@ -593,11 +603,13 @@ mod tests {
 
         // Test text search types
         assert_eq!(
-            pg_data_type_to_arrow_type("tsvector", &context, None).expect("Failed to convert tsvector"),
+            pg_data_type_to_arrow_type("tsvector", &context, None)
+                .expect("Failed to convert tsvector"),
             DataType::LargeUtf8
         );
         assert_eq!(
-            pg_data_type_to_arrow_type("tsquery", &context, None).expect("Failed to convert tsquery"),
+            pg_data_type_to_arrow_type("tsquery", &context, None)
+                .expect("Failed to convert tsquery"),
             DataType::LargeUtf8
         );
 
@@ -623,7 +635,8 @@ mod tests {
             "element_type": "integer",
         }));
         assert_eq!(
-            parse_array_type(&single_dim_array, None).expect("Failed to parse single dimension array"),
+            parse_array_type(&single_dim_array, None)
+                .expect("Failed to parse single dimension array"),
             DataType::List(Arc::new(Field::new("item", DataType::Int32, true)))
         );
 
@@ -632,7 +645,8 @@ mod tests {
             "element_type": "text[]",
         }));
         assert_eq!(
-            parse_array_type(&multi_dim_array, None).expect("Failed to parse multi-dimension array"),
+            parse_array_type(&multi_dim_array, None)
+                .expect("Failed to parse multi-dimension array"),
             DataType::List(Arc::new(Field::new(
                 "item",
                 DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
@@ -656,7 +670,8 @@ mod tests {
             ]
         }));
         assert_eq!(
-            parse_composite_type(&simple_composite, None).expect("Failed to parse simple composite type"),
+            parse_composite_type(&simple_composite, None)
+                .expect("Failed to parse simple composite type"),
             DataType::Struct(Fields::from(vec![
                 Field::new("id", DataType::Int32, true),
                 Field::new("name", DataType::Utf8, true),
@@ -675,7 +690,8 @@ mod tests {
             ]
         }));
         assert_eq!(
-            parse_composite_type(&nested_composite, None).expect("Failed to parse nested composite type"),
+            parse_composite_type(&nested_composite, None)
+                .expect("Failed to parse nested composite type"),
             DataType::Struct(Fields::from(vec![
                 Field::new("id", DataType::Int32, true),
                 Field::new(
@@ -743,7 +759,10 @@ mod tests {
         // Hive `string` and the length-qualified character types all collapse to Utf8.
         assert_eq!(redshift("string").expect("string"), DataType::Utf8);
         assert_eq!(redshift("varchar").expect("varchar"), DataType::Utf8);
-        assert_eq!(redshift("varchar(256)").expect("varchar(256)"), DataType::Utf8);
+        assert_eq!(
+            redshift("varchar(256)").expect("varchar(256)"),
+            DataType::Utf8
+        );
         assert_eq!(redshift("char(10)").expect("char(10)"), DataType::Utf8);
     }
 
