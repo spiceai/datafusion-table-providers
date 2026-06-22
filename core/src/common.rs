@@ -1,4 +1,4 @@
-use std::{sync::Arc};
+use std::sync::Arc;
 
 use crate::sql::db_connection_pool::dbconnection::{get_schemas, get_tables};
 use crate::sql::db_connection_pool::DbConnectionPool;

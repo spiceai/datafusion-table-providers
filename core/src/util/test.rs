@@ -1,4 +1,4 @@
-use std::{sync::Arc};
+use std::sync::Arc;
 
 use datafusion::arrow::{array::RecordBatch, datatypes::SchemaRef};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};

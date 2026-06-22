@@ -3,9 +3,9 @@ use datafusion::catalog::Session;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::unparser::Unparser;
+use std::fmt;
 use std::fmt::Display;
 use std::sync::Arc;
-use std::fmt;
 
 use datafusion::{
     arrow::datatypes::SchemaRef,
