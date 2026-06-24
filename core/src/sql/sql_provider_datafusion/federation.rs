@@ -89,8 +89,12 @@ impl<T, P> SQLExecutor for SqlTable<T, P> {
         // configured and the plan contains an unsupported function; otherwise
         // allow federation. Functions that can't be federated are left for
         // DataFusion to execute locally instead of being unparsed into remote SQL.
+        //
+        // Fail safe: if the support check itself errors, treat the plan as
+        // containing unsupported functions (i.e. do not federate) so we never
+        // unparse a plan the remote can't handle.
         self.function_support.as_ref().is_none_or(|func_supp| {
-            !contains_unsupported_functions(plan, func_supp).unwrap_or(false)
+            !contains_unsupported_functions(plan, func_supp).unwrap_or(true)
         })
     }
 
