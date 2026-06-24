@@ -32,6 +32,7 @@ use tokio_postgres::{types::Type, Row};
 
 pub mod builder;
 pub mod composite;
+pub mod hive_schema;
 pub mod schema;
 
 #[derive(Debug, Snafu)]
@@ -208,15 +209,15 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
     let mut postgres_types: Vec<Type> = Vec::new();
     let mut postgres_numeric_scales: Vec<Option<u32>> = Vec::new();
     let mut column_names: Vec<String> = Vec::new();
-    let mut projected_json_list_struct_fields: Vec<Option<Arc<Field>>> = Vec::new();
+    let mut projected_json_complex_fields: Vec<Option<Arc<Field>>> = Vec::new();
 
     if !rows.is_empty() {
         let row = &rows[0];
         for column in row.columns() {
             let column_name = column.name();
             let column_type = column.type_();
-            let projected_json_list_struct_field =
-                projected_list_struct_field(projected_schema, column_name, column_type);
+            let projected_json_complex_field =
+                projected_json_complex_field(projected_schema, column_name, column_type);
 
             let projected_field = projected_schema
                 .as_ref()
@@ -260,9 +261,9 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                 .map(|field| field.is_nullable())
                 .unwrap_or(true);
 
-            if projected_json_list_struct_field.is_some() {
-                // Keep JSON/JSONB collection in a temporary Utf8 builder and
-                // decode into typed List<Struct> after row collection.
+            if projected_json_complex_field.is_some() {
+                // Collect the JSON text in a temporary Utf8 builder and decode it into
+                // the projected complex Arrow type after row collection.
                 data_type = Some(DataType::Utf8);
             }
 
@@ -277,7 +278,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                 .push(map_data_type_to_array_builder_optional(data_type.as_ref()));
             postgres_types.push(column_type.clone());
             column_names.push(column_name.to_string());
-            projected_json_list_struct_fields.push(projected_json_list_struct_field);
+            projected_json_complex_fields.push(projected_json_complex_field);
         }
     }
 
@@ -964,7 +965,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
             return NoArrowFieldForIndexSnafu { index: i }.fail();
         };
 
-        if let Some(projected_field) = projected_json_list_struct_fields.get(i).cloned().flatten() {
+        if let Some(projected_field) = projected_json_complex_fields.get(i).cloned().flatten() {
             let Some(string_array) = array.as_any().downcast_ref::<StringArray>() else {
                 return InvalidJsonListStructIntermediateArraySnafu {
                     column_name: projected_field.name().to_string(),
@@ -972,18 +973,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                 .fail();
             };
 
-            let list_item_field = match projected_field.data_type() {
-                DataType::List(list_item_field) => list_item_field.as_ref(),
-                _ => {
-                    return UnsupportedDataTypeSnafu {
-                        data_type: projected_field.data_type().to_string(),
-                        field_name: projected_field.name().to_string(),
-                    }
-                    .fail();
-                }
-            };
-
-            array = decode_json_list_of_struct(string_array, list_item_field).context(
+            array = decode_json_complex_column(string_array, projected_field.as_ref()).context(
                 FailedToDecodeJsonListStructSnafu {
                     column_name: projected_field.name().to_string(),
                 },
@@ -1006,52 +996,69 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
     }
 }
 
-fn projected_list_struct_field(
+/// Identifies columns whose values arrive as a JSON text serialization of a complex
+/// Arrow type and should be decoded post-collection rather than read as a scalar.
+///
+/// Two sources produce these:
+/// - PostgreSQL `JSON`/`JSONB` columns projected as a complex Arrow type.
+/// - Redshift Spectrum external `ARRAY`/`STRUCT`/`MAP` columns, which Redshift serializes
+///   to `VARCHAR(65535)` JSON text over the wire (see `json_serialization_enable`).
+///
+/// Returns the projected field when the wire column is text-like *and* the projected
+/// Arrow type is a complex type (`List`/`LargeList`/`Struct`/`Map`). Such a pairing only
+/// occurs for these JSON-text cases — ordinary text columns project as `Utf8`, and native
+/// composite/array columns carry their own wire OIDs handled elsewhere — so this is safe
+/// to apply regardless of the source database variant.
+fn projected_json_complex_field(
     projected_schema: &Option<SchemaRef>,
     column_name: &str,
     column_type: &Type,
 ) -> Option<Arc<Field>> {
-    if !matches!(*column_type, Type::JSON | Type::JSONB) {
+    // Only text-bearing wire types can carry a JSON serialization. These all have a
+    // string-producing row arm above, so forcing the collection builder to `Utf8` is safe.
+    let is_text_like = matches!(
+        *column_type,
+        Type::JSON | Type::JSONB | Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME
+    );
+    if !is_text_like {
         return None;
     }
 
     let schema = projected_schema.as_ref()?;
     let field = Arc::new(schema.field_with_name(column_name).ok()?.clone());
     match field.data_type() {
-        DataType::List(item_field) if matches!(item_field.data_type(), DataType::Struct(_)) => {
+        DataType::List(_) | DataType::LargeList(_) | DataType::Struct(_) | DataType::Map(_, _) => {
             Some(field)
         }
         _ => None,
     }
 }
 
-/// Decodes a `StringArray` of JSON list-of-struct values into a typed
-/// `List<Struct>` Arrow array using a single batch NDJSON decode.
+/// Decodes a `StringArray` of JSON values into a typed complex Arrow array (`List`,
+/// `Struct`, `Map`, …) using a single batch NDJSON decode against `field`'s data type.
 ///
-/// Null entries in `string_array` are emitted as the JSON literal `null` in the
-/// NDJSON buffer, which the `arrow_json` decoder interprets as a null list
-/// element — no post-hoc `take` reindexing required.
-fn decode_json_list_of_struct(
+/// `arrow_json`'s field decoder treats each JSON line as a value of `field.data_type()`
+/// (arrays decode `[...]`, structs/maps decode `{...}`), producing a single-column batch
+/// whose `column(0)` is the decoded array. Null entries in `string_array` are emitted as
+/// the JSON literal `null`, which the decoder interprets as a null element — no post-hoc
+/// `take` reindexing required.
+fn decode_json_complex_column(
     string_array: &StringArray,
-    list_item_field: &Field,
+    field: &Field,
 ) -> std::result::Result<ArrayRef, arrow::error::ArrowError> {
-    // The list field name is unused — the caller overwrites the field from the
+    // The field name is unused for decoding — the caller overwrites the field from the
     // projected schema.  We only need the data type for the decoder.
-    let list_field = Arc::new(Field::new_list(
-        "_",
-        Arc::new(list_item_field.clone()),
-        true,
-    ));
+    let decode_field = Arc::new(field.clone());
 
     if string_array.is_empty() {
-        return Ok(new_null_array(list_field.data_type(), 0));
+        return Ok(new_null_array(decode_field.data_type(), 0));
     }
 
     if string_array.null_count() == string_array.len() {
-        return Ok(new_null_array(list_field.data_type(), string_array.len()));
+        return Ok(new_null_array(decode_field.data_type(), string_array.len()));
     }
 
-    let mut decoder = ReaderBuilder::new_with_field(list_field)
+    let mut decoder = ReaderBuilder::new_with_field(decode_field)
         .with_batch_size(string_array.len())
         .build_decoder()
         .map_err(|e| {
@@ -1573,7 +1580,10 @@ mod tests {
         ));
 
         let array =
-            decode_json_list_of_struct(&string_array, &list_item_field).expect("cast succeeds");
+            decode_json_complex_column(
+            &string_array,
+            &Field::new_list("item", Arc::clone(&list_item_field), true),
+        ).expect("cast succeeds");
         let list = array
             .as_any()
             .downcast_ref::<ListArray>()
@@ -1616,7 +1626,10 @@ mod tests {
         ));
 
         let array =
-            decode_json_list_of_struct(&string_array, &list_item_field).expect("cast succeeds");
+            decode_json_complex_column(
+            &string_array,
+            &Field::new_list("item", Arc::clone(&list_item_field), true),
+        ).expect("cast succeeds");
         let list = array
             .as_any()
             .downcast_ref::<ListArray>()
@@ -1646,7 +1659,10 @@ mod tests {
             true,
         ));
 
-        let error = decode_json_list_of_struct(&string_array, &list_item_field)
+        let error = decode_json_complex_column(
+            &string_array,
+            &Field::new_list("item", Arc::clone(&list_item_field), true),
+        )
             .expect_err("malformed json should error");
         assert!(error.to_string().contains("Failed to decode value"));
     }
@@ -1662,7 +1678,10 @@ mod tests {
         ));
 
         let array =
-            decode_json_list_of_struct(&string_array, &list_item_field).expect("cast succeeds");
+            decode_json_complex_column(
+            &string_array,
+            &Field::new_list("item", Arc::clone(&list_item_field), true),
+        ).expect("cast succeeds");
         let list = array
             .as_any()
             .downcast_ref::<ListArray>()
@@ -1701,7 +1720,10 @@ mod tests {
         ));
 
         let array =
-            decode_json_list_of_struct(&string_array, &list_item_field).expect("decode succeeds");
+            decode_json_complex_column(
+            &string_array,
+            &Field::new_list("item", Arc::clone(&list_item_field), true),
+        ).expect("decode succeeds");
         let list = array
             .as_any()
             .downcast_ref::<ListArray>()
@@ -1744,8 +1766,153 @@ mod tests {
         assert_eq!(floats.value(0), 2.0);
     }
 
+    /// Redshift Spectrum serializes a top-level STRUCT column to a JSON object
+    /// (`{"given":"John","family":"Smith"}`); the row path must decode it into a
+    /// `StructArray`, not flatten it into separate columns.
     #[test]
-    fn test_projected_list_struct_field_matches_by_name() {
+    fn test_decode_json_complex_column_struct() {
+        let string_array = StringArray::from(vec![
+            Some(r#"{"given":"John","family":"Smith"}"#),
+            None,
+            Some(r#"{"given":"Ada","family":"Lovelace"}"#),
+        ]);
+
+        let struct_field = Field::new(
+            "name",
+            DataType::Struct(
+                vec![
+                    Field::new("given", DataType::Utf8, true),
+                    Field::new("family", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            true,
+        );
+
+        let array =
+            decode_json_complex_column(&string_array, &struct_field).expect("struct decode");
+        let structs = array
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("array should be StructArray");
+
+        assert_eq!(structs.len(), 3);
+        assert!(structs.is_null(1));
+        let given = structs
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("given should be Utf8");
+        assert_eq!(given.value(0), "John");
+        assert_eq!(given.value(2), "Ada");
+    }
+
+    /// Redshift Spectrum serializes a MAP column to a JSON object with string keys;
+    /// the row path must decode it into a `MapArray`.
+    #[test]
+    fn test_decode_json_complex_column_map() {
+        let string_array = StringArray::from(vec![Some(r#"{"a":1,"b":2}"#), Some("{}")]);
+
+        let entries = Arc::new(Field::new_struct(
+            "entries",
+            vec![
+                Arc::new(Field::new("key", DataType::Utf8, false)),
+                Arc::new(Field::new("value", DataType::Int32, true)),
+            ],
+            false,
+        ));
+        let map_field = Field::new("attrs", DataType::Map(entries, false), true);
+
+        let array = decode_json_complex_column(&string_array, &map_field).expect("map decode");
+        let map = array
+            .as_any()
+            .downcast_ref::<arrow::array::MapArray>()
+            .expect("array should be MapArray");
+
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.value_length(0), 2);
+        assert_eq!(map.value_length(1), 0);
+    }
+
+    /// The headline case: an array of structs (`[{...},{...}]`) decodes into
+    /// `List<Struct>`, mirroring how Spectrum serializes collection columns.
+    #[test]
+    fn test_decode_json_complex_column_array_of_struct() {
+        let string_array = StringArray::from(vec![Some(
+            r#"[{"shipdate":"2018-03-01","price":100.5},{"shipdate":"2018-03-02","price":7.0}]"#,
+        )]);
+
+        let list_field = Field::new_list(
+            "lines",
+            Field::new(
+                "item",
+                DataType::Struct(
+                    vec![
+                        Field::new("shipdate", DataType::Utf8, true),
+                        Field::new("price", DataType::Float64, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+            true,
+        );
+
+        let array =
+            decode_json_complex_column(&string_array, &list_field).expect("array<struct> decode");
+        let list = array
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("array should be ListArray");
+        assert_eq!(list.value_length(0), 2);
+
+        let structs = list
+            .value(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("list values should be StructArray")
+            .clone();
+        let prices = structs
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .expect("price should be Float64");
+        assert_eq!(prices.value(0), 100.5);
+        assert_eq!(prices.value(1), 7.0);
+    }
+
+    /// A text-like wire column (Redshift serializes Spectrum complex types to
+    /// `VARCHAR`) projected as a complex Arrow type must be routed through the JSON
+    /// decode path, not read as a scalar string.
+    #[test]
+    fn test_projected_json_complex_field_triggers_for_varchar_struct() {
+        let payload_field = Field::new(
+            "payload",
+            DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into()),
+            true,
+        );
+        let schema = Arc::new(Schema::new(vec![payload_field]));
+        let projected_schema = Some(schema);
+
+        assert!(
+            projected_json_complex_field(&projected_schema, "payload", &Type::VARCHAR).is_some(),
+            "VARCHAR column projected as Struct should decode as JSON"
+        );
+
+        // A plain scalar projection over the same wire column is left as a scalar.
+        let scalar_schema = Some(Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8,
+            true,
+        )])));
+        assert!(
+            projected_json_complex_field(&scalar_schema, "payload", &Type::VARCHAR).is_none(),
+            "VARCHAR column projected as Utf8 must stay a scalar string"
+        );
+    }
+
+    #[test]
+    fn test_projected_json_complex_field_matches_by_name() {
         let other_field = Field::new("other", DataType::Int32, true);
         let payload_field = Field::new(
             "payload",
@@ -1761,7 +1928,7 @@ mod tests {
         let projected_schema = Some(schema);
 
         // Name match succeeds regardless of positional index.
-        let resolved = projected_list_struct_field(&projected_schema, "payload", &Type::JSONB)
+        let resolved = projected_json_complex_field(&projected_schema, "payload", &Type::JSONB)
             .expect("field should resolve from projected schema");
         assert_eq!(resolved.name(), "payload");
 
@@ -1775,7 +1942,7 @@ mod tests {
 
         // Name miss returns None — no positional fallback.
         assert!(
-            projected_list_struct_field(&projected_schema, "no_such_column", &Type::JSONB)
+            projected_json_complex_field(&projected_schema, "no_such_column", &Type::JSONB)
                 .is_none()
         );
     }
