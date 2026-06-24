@@ -16,7 +16,9 @@ limitations under the License.
 
 use crate::sql::db_connection_pool::dbconnection::odbcconn::ODBCConnection;
 use crate::sql::db_connection_pool::dbconnection::odbcconn::{ODBCDbConnection, ODBCParameter};
-use crate::sql::db_connection_pool::{DbConnectionPool, JoinPushDown};
+use crate::sql::db_connection_pool::{
+    runtime::run_async_with_tokio, DbConnectionPool, JoinPushDown,
+};
 use arrow_odbc::odbc_api::{
     sys::AttrConnectionPooling, Connection, ConnectionOptions, Environment,
 };
@@ -109,17 +111,33 @@ where
     async fn connect(
         &self,
     ) -> Result<Box<ODBCDbConnection<'a>>, Box<dyn std::error::Error + Send + Sync>> {
-        let cxn = self.pool.connect_with_connection_string(
-            &self.connection_string,
-            ConnectionOptions::default(),
-        )?;
+        // `connect_with_connection_string` performs a synchronous network connect
+        // and driver handshake. Run it on the blocking pool so concurrent
+        // `connect().await` callers yield instead of pinning runtime workers.
+        // `run_async_with_tokio` keeps this usable from non-Tokio executors/FFI.
+        let pool: &'static Environment = self.pool;
+        let connection_string = self.connection_string.clone();
+        let params = Arc::clone(&self.params);
 
-        let odbc_cxn = ODBCConnection {
-            conn: Arc::new(cxn.into()),
-            params: Arc::clone(&self.params),
+        let connect = async move || -> Result<
+            Box<ODBCDbConnection<'a>>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            let cxn = tokio::task::spawn_blocking(move || {
+                pool.connect_with_connection_string(
+                    &connection_string,
+                    ConnectionOptions::default(),
+                )
+            })
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)??;
+
+            Ok(Box::new(ODBCConnection {
+                conn: Arc::new(cxn.into()),
+                params,
+            }) as Box<ODBCDbConnection<'a>>)
         };
-
-        Ok(Box::new(odbc_cxn))
+        run_async_with_tokio(connect).await
     }
 
     fn join_push_down(&self) -> JoinPushDown {
