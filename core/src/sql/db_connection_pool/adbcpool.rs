@@ -24,7 +24,7 @@ use crate::sql::db_connection_pool::dbconnection::{
     adbcconn::AdbcDbConnection, DbConnection, SyncDbConnection,
 };
 
-use super::{DbConnectionPool, JoinPushDown, Result};
+use super::{runtime::run_async_with_tokio, DbConnectionPool, JoinPushDown, Result};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -204,14 +204,27 @@ where
         // free or a new one is opened. Run it on the blocking pool so awaiting
         // `connect()` yields instead of stalling Tokio workers (and unrelated
         // async work such as health checks) under concurrent initialization.
+        // `run_async_with_tokio` keeps this usable from non-Tokio executors/FFI.
         let pool = Arc::clone(&self.pool);
-        let conn: r2d2::PooledConnection<AdbcConnectionManager<D>> =
-            tokio::task::spawn_blocking(move || pool.get())
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
-                .context(ConnectionPoolSnafu)?;
 
-        Ok(Box::new(AdbcDbConnection::new(conn)))
+        let connect = async move || -> Result<
+            Box<dyn DbConnection<r2d2::PooledConnection<AdbcConnectionManager<D>>, RecordBatch>>,
+        > {
+            let conn: r2d2::PooledConnection<AdbcConnectionManager<D>> =
+                tokio::task::spawn_blocking(move || pool.get())
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                    .context(ConnectionPoolSnafu)?;
+
+            Ok(Box::new(AdbcDbConnection::new(conn))
+                as Box<
+                    dyn DbConnection<
+                        r2d2::PooledConnection<AdbcConnectionManager<D>>,
+                        RecordBatch,
+                    >,
+                >)
+        };
+        run_async_with_tokio(connect).await
     }
 
     fn join_push_down(&self) -> JoinPushDown {

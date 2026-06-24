@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use super::{
     dbconnection::duckdbconn::{DuckDBAttachments, DuckDBParameter},
+    runtime::run_async_with_tokio,
     DbConnectionPool, Mode, Result,
 };
 use crate::{
@@ -361,29 +362,44 @@ impl DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
         // `r2d2::Pool::get()` (blocking checkout, up to the pool timeout) and the
         // per-connection setup queries are synchronous DuckDB calls. Run them on
         // the blocking pool so awaiting `connect()` doesn't pin a runtime worker.
+        // `run_async_with_tokio` keeps this usable from non-Tokio executors/FFI.
         let pool = Arc::clone(&self.pool);
         let setup_queries = self.connection_setup_queries.clone();
+        let setup_queries_for_conn = self.connection_setup_queries.clone();
+        let attachments = self.attached_databases.get().cloned();
+        let unsupported_type_action = self.unsupported_type_action;
 
-        let conn: r2d2::PooledConnection<DuckdbConnectionManager> =
-            tokio::task::spawn_blocking(move || -> Result<_> {
-                let conn = pool.get().context(ConnectionPoolSnafu)?;
+        let connect = async move || -> Result<
+            Box<dyn DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBParameter>>,
+        > {
+            let conn: r2d2::PooledConnection<DuckdbConnectionManager> =
+                tokio::task::spawn_blocking(move || -> Result<_> {
+                    let conn = pool.get().context(ConnectionPoolSnafu)?;
 
-                for query in setup_queries.iter() {
-                    tracing::debug!("DuckDB connection setup: {}", query);
-                    conn.execute(query, []).context(DuckDBConnectionSnafu)?;
-                }
+                    for query in setup_queries.iter() {
+                        tracing::debug!("DuckDB connection setup: {}", query);
+                        conn.execute(query, []).context(DuckDBConnectionSnafu)?;
+                    }
 
-                Ok(conn)
-            })
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)??;
+                    Ok(conn)
+                })
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)??;
 
-        Ok(Box::new(
-            DuckDbConnection::new(conn)
-                .with_attachments(self.attached_databases.get().cloned())
-                .with_connection_setup_queries(self.connection_setup_queries.clone())
-                .with_unsupported_type_action(self.unsupported_type_action),
-        ))
+            Ok(Box::new(
+                DuckDbConnection::new(conn)
+                    .with_attachments(attachments)
+                    .with_connection_setup_queries(setup_queries_for_conn)
+                    .with_unsupported_type_action(unsupported_type_action),
+            )
+                as Box<
+                    dyn DbConnection<
+                        r2d2::PooledConnection<DuckdbConnectionManager>,
+                        DuckDBParameter,
+                    >,
+                >)
+        };
+        run_async_with_tokio(connect).await
     }
 
     fn join_push_down(&self) -> JoinPushDown {

@@ -152,29 +152,32 @@ where
             table_reference.to_quoted_string()
         );
 
-        let join_handle = tokio::task::spawn_blocking(move || {
-            let handle = Handle::current();
-            let cxn = handle.block_on(async { conn.lock().await });
+        let get_schema = async || -> Result<SchemaRef, dbconnection::Error> {
+            let join_handle = tokio::task::spawn_blocking(move || {
+                let handle = Handle::current();
+                let cxn = handle.block_on(async { conn.lock().await });
 
-            let mut prepared = cxn
-                .prepare(&sql)
-                .boxed()
-                .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
-
-            let schema = Arc::new(
-                arrow_schema_from(&mut prepared, None, false)
+                let mut prepared = cxn
+                    .prepare(&sql)
                     .boxed()
-                    .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?,
-            );
+                    .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
 
-            Ok::<SchemaRef, dbconnection::Error>(schema)
-        });
+                let schema = Arc::new(
+                    arrow_schema_from(&mut prepared, None, false)
+                        .boxed()
+                        .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?,
+                );
 
-        join_handle
-            .await
-            .map_err(|e| dbconnection::Error::UnableToGetSchema {
-                source: Box::new(e),
-            })?
+                Ok::<SchemaRef, dbconnection::Error>(schema)
+            });
+
+            join_handle
+                .await
+                .map_err(|e| dbconnection::Error::UnableToGetSchema {
+                    source: Box::new(e),
+                })?
+        };
+        run_async_with_tokio(get_schema).await
     }
 
     async fn query_arrow(

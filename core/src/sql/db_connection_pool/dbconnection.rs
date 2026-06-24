@@ -5,6 +5,8 @@ use datafusion::{
 };
 use snafu::prelude::*;
 
+use crate::sql::db_connection_pool::runtime::run_async_with_tokio;
+
 #[cfg(feature = "adbc")]
 pub mod adbcconn;
 #[cfg(feature = "clickhouse")]
@@ -169,16 +171,20 @@ pub async fn get_tables<T: 'static, P: 'static>(
     if conn.as_sync().is_some() {
         // Synchronous drivers (DuckDB, ADBC) do blocking FFI work here; run it on
         // the blocking pool so the async runtime thread isn't stalled.
+        // `run_async_with_tokio` keeps this usable from non-Tokio executors/FFI.
         let schema = schema.to_string();
-        tokio::task::spawn_blocking(move || {
-            conn.as_sync()
-                .expect("as_sync() returned Some above")
-                .tables(&schema)
-        })
-        .await
-        .map_err(|e| Error::UnableToGetTables {
-            source: Box::new(e),
-        })?
+        let offload = async move || -> Result<Vec<String>, Error> {
+            tokio::task::spawn_blocking(move || {
+                conn.as_sync()
+                    .expect("as_sync() returned Some above")
+                    .tables(&schema)
+            })
+            .await
+            .map_err(|e| Error::UnableToGetTables {
+                source: Box::new(e),
+            })?
+        };
+        run_async_with_tokio(offload).await
     } else if let Some(conn) = conn.as_async() {
         conn.tables(schema).await
     } else {
@@ -197,15 +203,19 @@ pub async fn get_schemas<T: 'static, P: 'static>(
     if conn.as_sync().is_some() {
         // Synchronous drivers (DuckDB, ADBC) do blocking FFI work here; run it on
         // the blocking pool so the async runtime thread isn't stalled.
-        tokio::task::spawn_blocking(move || {
-            conn.as_sync()
-                .expect("as_sync() returned Some above")
-                .schemas()
-        })
-        .await
-        .map_err(|e| Error::UnableToGetSchemas {
-            source: Box::new(e),
-        })?
+        // `run_async_with_tokio` keeps this usable from non-Tokio executors/FFI.
+        let offload = async move || -> Result<Vec<String>, Error> {
+            tokio::task::spawn_blocking(move || {
+                conn.as_sync()
+                    .expect("as_sync() returned Some above")
+                    .schemas()
+            })
+            .await
+            .map_err(|e| Error::UnableToGetSchemas {
+                source: Box::new(e),
+            })?
+        };
+        run_async_with_tokio(offload).await
     } else if let Some(conn) = conn.as_async() {
         conn.schemas().await
     } else {
@@ -230,16 +240,20 @@ pub async fn get_schema<T: 'static, P: 'static>(
     if conn.as_sync().is_some() {
         // Synchronous drivers (DuckDB, ADBC) do blocking FFI work here; run it on
         // the blocking pool so the async runtime thread isn't stalled.
+        // `run_async_with_tokio` keeps this usable from non-Tokio executors/FFI.
         let table_reference = table_reference.clone();
-        tokio::task::spawn_blocking(move || {
-            conn.as_sync()
-                .expect("as_sync() returned Some above")
-                .get_schema(&table_reference)
-        })
-        .await
-        .map_err(|e| Error::UnableToGetSchema {
-            source: Box::new(e),
-        })?
+        let offload = async move || -> Result<Arc<datafusion::arrow::datatypes::Schema>, Error> {
+            tokio::task::spawn_blocking(move || {
+                conn.as_sync()
+                    .expect("as_sync() returned Some above")
+                    .get_schema(&table_reference)
+            })
+            .await
+            .map_err(|e| Error::UnableToGetSchema {
+                source: Box::new(e),
+            })?
+        };
+        run_async_with_tokio(offload).await
     } else if let Some(conn) = conn.as_async() {
         conn.get_schema(table_reference).await
     } else {
