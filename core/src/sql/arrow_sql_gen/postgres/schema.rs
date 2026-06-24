@@ -137,11 +137,11 @@ pub(crate) fn pg_data_type_to_arrow_type(
 /// `VARCHAR(256)`). See
 /// <https://cwiki.apache.org/confluence/display/hive/languagemanual+types>.
 fn redshift_external_type_to_arrow_type(external_type: &str) -> Result<DataType, ArrowError> {
-    hive_schema::Parser::new(external_type).parse().map_err(|e| {
-        ArrowError::ParseError(format!(
-            "Unsupported Redshift type: {external_type} ({e})"
-        ))
-    })
+    hive_schema::Parser::new(external_type)
+        .parse()
+        .map_err(|e| {
+            ArrowError::ParseError(format!("Unsupported Redshift type: {external_type} ({e})"))
+        })
 }
 
 fn parse_array_type(
@@ -155,6 +155,19 @@ fn parse_array_type(
     let details = details
         .as_object()
         .ok_or_else(|| ArrowError::ParseError("Invalid array type details format".to_string()))?;
+    // When the array element is a composite type (`my_struct[]`), the schema query
+    // emits the element's attribute details so we can build a `Struct` here, rather
+    // than trying to resolve the bare composite type name.
+    if let Some(element_details) = details.get("element_details") {
+        if element_details.get("type").and_then(Value::as_str) == Some("composite") {
+            let inner_context = context.clone().with_type_details(element_details.clone());
+            let inner_type = parse_composite_type(&inner_context, variant)?;
+            return Ok(DataType::List(Arc::new(Field::new(
+                "item", inner_type, true,
+            ))));
+        }
+    }
+
     let element_type = details
         .get("element_type")
         .and_then(Value::as_str)
@@ -631,6 +644,64 @@ mod tests {
 
         let invalid_array = context.clone().with_type_details(json!({"type": "array"}));
         assert!(parse_array_type(&invalid_array, None).is_err());
+    }
+
+    #[test]
+    fn test_parse_array_of_composite_type() {
+        // An array whose element is a composite type carries `element_details`
+        // describing the struct fields; the array resolves to List<Struct>.
+        let context = ParseContext::new();
+        let composite_array = context.clone().with_type_details(json!({
+            "type": "array",
+            "element_type": "line_item",
+            "element_details": {
+                "type": "composite",
+                "attributes": [
+                    {"name": "sku", "type": "text"},
+                    {"name": "qty", "type": "integer"},
+                    {"name": "price", "type": "double precision"},
+                ]
+            }
+        }));
+
+        let expected = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Struct(Fields::from(vec![
+                Field::new("sku", DataType::Utf8, true),
+                Field::new("qty", DataType::Int32, true),
+                Field::new("price", DataType::Float64, true),
+            ])),
+            true,
+        )));
+
+        assert_eq!(
+            parse_array_type(&composite_array, None).expect("composite array parses"),
+            expected
+        );
+
+        // Resolving through the top-level entry point (data_type == "array") must
+        // yield the same List<Struct>.
+        assert_eq!(
+            pg_data_type_to_arrow_type("array", &composite_array, None)
+                .expect("array data_type resolves"),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_parse_array_with_null_element_details_falls_back() {
+        // Non-composite element arrays emit `element_details` as JSON null; resolution
+        // must fall through to the scalar `element_type` path.
+        let context = ParseContext::new();
+        let scalar_array = context.clone().with_type_details(json!({
+            "type": "array",
+            "element_type": "integer",
+            "element_details": serde_json::Value::Null,
+        }));
+        assert_eq!(
+            parse_array_type(&scalar_array, None).expect("scalar array parses"),
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true)))
+        );
     }
 
     #[test]

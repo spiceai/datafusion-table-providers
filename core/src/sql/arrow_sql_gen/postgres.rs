@@ -196,6 +196,46 @@ macro_rules! handle_composite_types {
     }
 }
 
+/// Appends every field of a `CompositeType` value into `$struct_builder`'s field builders
+/// (a single struct row). The caller is responsible for the matching
+/// `$struct_builder.append(...)` validity call. Shared by the top-level composite column
+/// path and the composite-array (`List<Struct>`) element path.
+macro_rules! append_composite_fields_to_struct {
+    ($composite_type:expr, $struct_builder:expr) => {{
+        let fields = $composite_type.fields();
+        for (idx, field) in fields.iter().enumerate() {
+            let field_name = field.name();
+            let Some(field_type) = map_column_type_to_data_type(field.type_(), field_name)? else {
+                return FailedToDowncastBuilderSnafu {
+                    postgres_type: format!("{}", field.type_()),
+                }
+                .fail();
+            };
+
+            handle_composite_types!(
+                field_type,
+                field.type_(),
+                $composite_type,
+                $struct_builder,
+                idx,
+                field_name,
+                Boolean => (BooleanBuilder, bool),
+                Int8 => (Int8Builder, i8),
+                Int16 => (Int16Builder, i16),
+                Int32 => (Int32Builder, i32),
+                Int64 => (Int64Builder, i64),
+                UInt32 => (UInt32Builder, u32),
+                Float32 => (Float32Builder, f32),
+                Float64 => (Float64Builder, f64),
+                Binary => (BinaryBuilder, Vec<u8>),
+                LargeBinary => (LargeBinaryBuilder, Vec<u8>),
+                Utf8 => (StringBuilder, String),
+                LargeUtf8 => (LargeStringBuilder, String)
+            );
+        }
+    }};
+}
+
 /// Converts Postgres `Row`s to an Arrow `RecordBatch`. Assumes that all rows have the same schema and
 /// sets the schema based on the first row.
 ///
@@ -883,6 +923,42 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                     }
                 }
                 _ => match *postgres_type.kind() {
+                    // Array of a composite type (`my_struct[]`) → List<Struct>. Each array
+                    // element is a `CompositeType`; append it as a struct row in the list.
+                    Kind::Array(ref element_type)
+                        if matches!(*element_type.kind(), Kind::Composite(_)) =>
+                    {
+                        let Some(builder) = builder else {
+                            return NoBuilderForIndexSnafu { index: i }.fail();
+                        };
+                        let Some(list_builder) = builder
+                            .as_any_mut()
+                            .downcast_mut::<ListBuilder<StructBuilder>>()
+                        else {
+                            return FailedToDowncastBuilderSnafu {
+                                postgres_type: format!("{postgres_type}"),
+                            }
+                            .fail();
+                        };
+
+                        let v = row
+                            .try_get::<usize, Option<Vec<CompositeType>>>(i)
+                            .context(FailedToGetRowValueSnafu {
+                                pg_type: postgres_type.clone(),
+                            })?;
+
+                        let Some(composites) = v else {
+                            list_builder.append_null();
+                            continue;
+                        };
+
+                        let struct_builder = list_builder.values();
+                        for composite_type in &composites {
+                            append_composite_fields_to_struct!(composite_type, struct_builder);
+                            struct_builder.append(true);
+                        }
+                        list_builder.append(true);
+                    }
                     Kind::Composite(_) => {
                         let Some(builder) = builder else {
                             return NoBuilderForIndexSnafu { index: i }.fail();
@@ -908,39 +984,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
 
                         builder.append(true);
 
-                        let fields = composite_type.fields();
-                        for (idx, field) in fields.iter().enumerate() {
-                            let field_name = field.name();
-                            let Some(field_type) =
-                                map_column_type_to_data_type(field.type_(), field_name)?
-                            else {
-                                return FailedToDowncastBuilderSnafu {
-                                    postgres_type: format!("{}", field.type_()),
-                                }
-                                .fail();
-                            };
-
-                            handle_composite_types!(
-                                field_type,
-                                field.type_(),
-                                composite_type,
-                                builder,
-                                idx,
-                                field_name,
-                                Boolean => (BooleanBuilder, bool),
-                                Int8 => (Int8Builder, i8),
-                                Int16 => (Int16Builder, i16),
-                                Int32 => (Int32Builder, i32),
-                                Int64 => (Int64Builder, i64),
-                                UInt32 => (UInt32Builder, u32),
-                                Float32 => (Float32Builder, f32),
-                                Float64 => (Float64Builder, f64),
-                                Binary => (BinaryBuilder, Vec<u8>),
-                                LargeBinary => (LargeBinaryBuilder, Vec<u8>),
-                                Utf8 => (StringBuilder, String),
-                                LargeUtf8 => (LargeStringBuilder, String)
-                            );
-                        }
+                        append_composite_fields_to_struct!(composite_type, builder);
                     }
                     Kind::Enum(_) => {
                         let Some(builder) = builder else {
@@ -1240,6 +1284,21 @@ fn map_column_type_to_data_type(column_type: &Type, field_name: &str) -> Result<
                 Box::new(DataType::Int8),
                 Box::new(DataType::Utf8),
             ))),
+            // Array of a composite type (e.g. `my_struct[]`) → List<Struct>. The common
+            // scalar arrays (`int[]`, `text[]`, …) are matched by their explicit
+            // `Type::*_ARRAY` arms above; this catches user-defined composite arrays.
+            Kind::Array(ref element_type) if matches!(*element_type.kind(), Kind::Composite(_)) => {
+                let Some(element) = map_column_type_to_data_type(element_type, field_name)? else {
+                    return UnsupportedDataTypeSnafu {
+                        data_type: element_type.to_string(),
+                        field_name: field_name.to_string(),
+                    }
+                    .fail();
+                };
+                Ok(Some(DataType::List(Arc::new(Field::new(
+                    "item", element, true,
+                )))))
+            }
             _ => UnsupportedDataTypeSnafu {
                 data_type: column_type.to_string(),
                 field_name: field_name.to_string(),
@@ -1634,11 +1693,11 @@ mod tests {
             true,
         ));
 
-        let array =
-            decode_json_complex_column(
+        let array = decode_json_complex_column(
             &string_array,
             &Field::new_list("item", Arc::clone(&list_item_field), true),
-        ).expect("cast succeeds");
+        )
+        .expect("cast succeeds");
         let list = array
             .as_any()
             .downcast_ref::<ListArray>()
@@ -1680,11 +1739,11 @@ mod tests {
             true,
         ));
 
-        let array =
-            decode_json_complex_column(
+        let array = decode_json_complex_column(
             &string_array,
             &Field::new_list("item", Arc::clone(&list_item_field), true),
-        ).expect("cast succeeds");
+        )
+        .expect("cast succeeds");
         let list = array
             .as_any()
             .downcast_ref::<ListArray>()
@@ -1718,7 +1777,7 @@ mod tests {
             &string_array,
             &Field::new_list("item", Arc::clone(&list_item_field), true),
         )
-            .expect_err("malformed json should error");
+        .expect_err("malformed json should error");
         assert!(error.to_string().contains("Failed to decode value"));
     }
 
@@ -1732,11 +1791,11 @@ mod tests {
             true,
         ));
 
-        let array =
-            decode_json_complex_column(
+        let array = decode_json_complex_column(
             &string_array,
             &Field::new_list("item", Arc::clone(&list_item_field), true),
-        ).expect("cast succeeds");
+        )
+        .expect("cast succeeds");
         let list = array
             .as_any()
             .downcast_ref::<ListArray>()
@@ -1774,11 +1833,11 @@ mod tests {
             true,
         ));
 
-        let array =
-            decode_json_complex_column(
+        let array = decode_json_complex_column(
             &string_array,
             &Field::new_list("item", Arc::clone(&list_item_field), true),
-        ).expect("decode succeeds");
+        )
+        .expect("decode succeeds");
         let list = array
             .as_any()
             .downcast_ref::<ListArray>()
@@ -1970,7 +2029,12 @@ mod tests {
     /// external columns) is matched by type name and routed through the JSON decode path.
     #[test]
     fn test_super_type_routes_through_json_decode() {
-        let super_type = Type::new("super".to_owned(), 4000, Kind::Simple, "pg_catalog".to_owned());
+        let super_type = Type::new(
+            "super".to_owned(),
+            4000,
+            Kind::Simple,
+            "pg_catalog".to_owned(),
+        );
 
         // Without a projected schema it resolves to a plain Utf8 JSON string column.
         assert_eq!(
@@ -1994,9 +2058,64 @@ mod tests {
         );
     }
 
+    /// A native PostgreSQL array-of-composite wire type (`composite[]`) maps to
+    /// `List<Struct>`, and that Arrow type produces a `ListBuilder<StructBuilder>`.
+    #[test]
+    fn test_composite_array_maps_to_list_struct() {
+        use tokio_postgres::types::Field as PgField;
+
+        let composite = Type::new(
+            "line_item".to_owned(),
+            20_000,
+            Kind::Composite(vec![
+                PgField::new("sku".to_owned(), Type::TEXT),
+                PgField::new("qty".to_owned(), Type::INT4),
+                PgField::new("price".to_owned(), Type::FLOAT8),
+            ]),
+            "public".to_owned(),
+        );
+        let array_type = Type::new(
+            "_line_item".to_owned(),
+            20_001,
+            Kind::Array(composite),
+            "public".to_owned(),
+        );
+
+        let dt = map_column_type_to_data_type(&array_type, "items")
+            .expect("maps")
+            .expect("some data type");
+        let expected_item = DataType::Struct(
+            vec![
+                Field::new("sku", DataType::Utf8, true),
+                Field::new("qty", DataType::Int32, true),
+                Field::new("price", DataType::Float64, true),
+            ]
+            .into(),
+        );
+        assert_eq!(
+            dt,
+            DataType::List(Arc::new(Field::new("item", expected_item, true)))
+        );
+
+        // The builder for this Arrow type must downcast to ListBuilder<StructBuilder>.
+        let mut builder = crate::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder(&dt);
+        assert!(
+            builder
+                .as_any_mut()
+                .downcast_mut::<ListBuilder<StructBuilder>>()
+                .is_some(),
+            "List<Struct> must build a ListBuilder<StructBuilder>"
+        );
+    }
+
     #[test]
     fn test_super_raw_string_reads_utf8() {
-        let super_type = Type::new("super".to_owned(), 4000, Kind::Simple, "pg_catalog".to_owned());
+        let super_type = Type::new(
+            "super".to_owned(),
+            4000,
+            Kind::Simple,
+            "pg_catalog".to_owned(),
+        );
         let raw = br#"[{"a":1},{"a":2}]"#;
         let parsed = SuperRawString::from_sql(&super_type, raw).expect("super decodes");
         assert_eq!(parsed.0, r#"[{"a":1},{"a":2}]"#);

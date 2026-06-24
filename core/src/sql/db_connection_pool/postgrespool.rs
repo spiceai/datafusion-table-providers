@@ -165,7 +165,10 @@ impl ConnectionManager {
 async fn configure_session(
     client: &tokio_postgres::Client,
 ) -> std::result::Result<(), ConnectionManagerError> {
-    let version: String = client.query_one("SELECT version()", &[]).await?.try_get(0)?;
+    let version: String = client
+        .query_one("SELECT version()", &[])
+        .await?
+        .try_get(0)?;
 
     if version.contains("Redshift") {
         client
