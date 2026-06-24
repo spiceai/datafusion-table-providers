@@ -200,9 +200,16 @@ where
         &self,
     ) -> Result<Box<dyn DbConnection<r2d2::PooledConnection<AdbcConnectionManager<D>>, RecordBatch>>>
     {
+        // `r2d2::Pool::get()` is synchronous and may block until a connection is
+        // free or a new one is opened. Run it on the blocking pool so awaiting
+        // `connect()` yields instead of stalling Tokio workers (and unrelated
+        // async work such as health checks) under concurrent initialization.
         let pool = Arc::clone(&self.pool);
         let conn: r2d2::PooledConnection<AdbcConnectionManager<D>> =
-            pool.get().context(ConnectionPoolSnafu)?;
+            tokio::task::spawn_blocking(move || pool.get())
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                .context(ConnectionPoolSnafu)?;
 
         Ok(Box::new(AdbcDbConnection::new(conn)))
     }

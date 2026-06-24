@@ -143,23 +143,38 @@ where
         &self,
         table_reference: &TableReference,
     ) -> Result<SchemaRef, dbconnection::Error> {
-        let cxn = self.conn.lock().await;
-
-        let mut prepared = cxn
-            .prepare(&format!(
-                "SELECT * FROM {} LIMIT 1",
-                table_reference.to_quoted_string()
-            ))
-            .boxed()
-            .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
-
-        let schema = Arc::new(
-            arrow_schema_from(&mut prepared, None, false)
-                .boxed()
-                .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?,
+        // `prepare` + `arrow_schema_from` are synchronous ODBC FFI calls that
+        // perform a blocking network round-trip. Run them on the blocking pool
+        // so the async runtime thread isn't stalled (mirrors `query_arrow`).
+        let conn = Arc::clone(&self.conn);
+        let sql = format!(
+            "SELECT * FROM {} LIMIT 1",
+            table_reference.to_quoted_string()
         );
 
-        Ok(schema)
+        let join_handle = tokio::task::spawn_blocking(move || {
+            let handle = Handle::current();
+            let cxn = handle.block_on(async { conn.lock().await });
+
+            let mut prepared = cxn
+                .prepare(&sql)
+                .boxed()
+                .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
+
+            let schema = Arc::new(
+                arrow_schema_from(&mut prepared, None, false)
+                    .boxed()
+                    .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?,
+            );
+
+            Ok::<SchemaRef, dbconnection::Error>(schema)
+        });
+
+        join_handle
+            .await
+            .map_err(|e| dbconnection::Error::UnableToGetSchema {
+                source: Box::new(e),
+            })?
     }
 
     async fn query_arrow(
@@ -249,18 +264,39 @@ where
     }
 
     async fn execute(&self, query: &str, params: &[ODBCParameter]) -> Result<u64> {
-        let cxn = self.conn.lock().await;
-        let prepared = cxn.prepare(query)?;
-        let mut statement = prepared.into_handle();
+        // `prepare`/`execute`/`row_count` are synchronous ODBC FFI calls that
+        // block on driver/network I/O. Offload them to the blocking pool so the
+        // async runtime thread keeps making progress (mirrors `query_arrow`).
+        let conn = Arc::clone(&self.conn);
+        let query = query.to_string();
+        let params = params.iter().map(dyn_clone::clone).collect::<Vec<_>>();
 
-        bind_parameters(&mut statement, params)?;
+        let execute = async || -> Result<u64> {
+            let join_handle = tokio::task::spawn_blocking(move || {
+                let handle = Handle::current();
+                let cxn = handle.block_on(async { conn.lock().await });
 
-        let row_count = unsafe {
-            statement.execute().unwrap();
-            statement.row_count()
+                let prepared = cxn.prepare(&query)?;
+                let mut statement = prepared.into_handle();
+
+                bind_parameters(&mut statement, &params)?;
+
+                let row_count = unsafe {
+                    if let SqlResult::Error { function } = statement.execute() {
+                        return Err(Error::ODBCAPIErrorNoSource {
+                            message: function.to_string(),
+                        }
+                        .into());
+                    }
+                    statement.row_count()
+                };
+
+                Ok::<u64, GenericError>(row_count.unwrap().try_into().context(TryFromSnafu)?)
+            });
+
+            join_handle.await.map_err(|e| Box::new(e) as GenericError)?
         };
-
-        Ok(row_count.unwrap().try_into().context(TryFromSnafu)?)
+        run_async_with_tokio(execute).await
     }
 }
 

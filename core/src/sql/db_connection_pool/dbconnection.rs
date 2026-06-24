@@ -162,18 +162,28 @@ pub trait DbConnection<T, P>: Send {
     }
 }
 
-pub async fn get_tables<T, P>(
+pub async fn get_tables<T: 'static, P: 'static>(
     conn: Box<dyn DbConnection<T, P>>,
     schema: &str,
 ) -> Result<Vec<String>, Error> {
-    let schema = if let Some(conn) = conn.as_sync() {
-        conn.tables(schema)?
+    if conn.as_sync().is_some() {
+        // Synchronous drivers (DuckDB, ADBC) do blocking FFI work here; run it on
+        // the blocking pool so the async runtime thread isn't stalled.
+        let schema = schema.to_string();
+        tokio::task::spawn_blocking(move || {
+            conn.as_sync()
+                .expect("as_sync() returned Some above")
+                .tables(&schema)
+        })
+        .await
+        .map_err(|e| Error::UnableToGetTables {
+            source: Box::new(e),
+        })?
     } else if let Some(conn) = conn.as_async() {
-        conn.tables(schema).await?
+        conn.tables(schema).await
     } else {
-        return Err(Error::UnableToDowncastConnection {});
-    };
-    Ok(schema)
+        Err(Error::UnableToDowncastConnection {})
+    }
 }
 
 /// Get the schemas for the database.
@@ -181,15 +191,26 @@ pub async fn get_tables<T, P>(
 /// # Errors
 ///
 /// Returns an error if the schemas cannot be retrieved.
-pub async fn get_schemas<T, P>(conn: Box<dyn DbConnection<T, P>>) -> Result<Vec<String>, Error> {
-    let schema = if let Some(conn) = conn.as_sync() {
-        conn.schemas()?
+pub async fn get_schemas<T: 'static, P: 'static>(
+    conn: Box<dyn DbConnection<T, P>>,
+) -> Result<Vec<String>, Error> {
+    if conn.as_sync().is_some() {
+        // Synchronous drivers (DuckDB, ADBC) do blocking FFI work here; run it on
+        // the blocking pool so the async runtime thread isn't stalled.
+        tokio::task::spawn_blocking(move || {
+            conn.as_sync()
+                .expect("as_sync() returned Some above")
+                .schemas()
+        })
+        .await
+        .map_err(|e| Error::UnableToGetSchemas {
+            source: Box::new(e),
+        })?
     } else if let Some(conn) = conn.as_async() {
-        conn.schemas().await?
+        conn.schemas().await
     } else {
-        return Err(Error::UnableToDowncastConnection {});
-    };
-    Ok(schema)
+        Err(Error::UnableToDowncastConnection {})
+    }
 }
 
 /// Get the schema for a table reference.
@@ -202,18 +223,28 @@ pub async fn get_schemas<T, P>(conn: Box<dyn DbConnection<T, P>>) -> Result<Vec<
 /// # Errors
 ///
 /// Returns an error if the schema cannot be retrieved.
-pub async fn get_schema<T, P>(
+pub async fn get_schema<T: 'static, P: 'static>(
     conn: Box<dyn DbConnection<T, P>>,
     table_reference: &datafusion::sql::TableReference,
 ) -> Result<Arc<datafusion::arrow::datatypes::Schema>, Error> {
-    let schema = if let Some(conn) = conn.as_sync() {
-        conn.get_schema(table_reference)?
+    if conn.as_sync().is_some() {
+        // Synchronous drivers (DuckDB, ADBC) do blocking FFI work here; run it on
+        // the blocking pool so the async runtime thread isn't stalled.
+        let table_reference = table_reference.clone();
+        tokio::task::spawn_blocking(move || {
+            conn.as_sync()
+                .expect("as_sync() returned Some above")
+                .get_schema(&table_reference)
+        })
+        .await
+        .map_err(|e| Error::UnableToGetSchema {
+            source: Box::new(e),
+        })?
     } else if let Some(conn) = conn.as_async() {
-        conn.get_schema(table_reference).await?
+        conn.get_schema(table_reference).await
     } else {
-        return Err(Error::UnableToDowncastConnection {});
-    };
-    Ok(schema)
+        Err(Error::UnableToDowncastConnection {})
+    }
 }
 
 /// Query the database with the given SQL statement and parameters, returning a `Result` of `SendableRecordBatchStream`.

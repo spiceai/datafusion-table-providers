@@ -358,14 +358,25 @@ impl DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
     ) -> Result<
         Box<dyn DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBParameter>>,
     > {
+        // `r2d2::Pool::get()` (blocking checkout, up to the pool timeout) and the
+        // per-connection setup queries are synchronous DuckDB calls. Run them on
+        // the blocking pool so awaiting `connect()` doesn't pin a runtime worker.
         let pool = Arc::clone(&self.pool);
-        let conn: r2d2::PooledConnection<DuckdbConnectionManager> =
-            pool.get().context(ConnectionPoolSnafu)?;
+        let setup_queries = self.connection_setup_queries.clone();
 
-        for query in self.connection_setup_queries.iter() {
-            tracing::debug!("DuckDB connection setup: {}", query);
-            conn.execute(query, []).context(DuckDBConnectionSnafu)?;
-        }
+        let conn: r2d2::PooledConnection<DuckdbConnectionManager> =
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                let conn = pool.get().context(ConnectionPoolSnafu)?;
+
+                for query in setup_queries.iter() {
+                    tracing::debug!("DuckDB connection setup: {}", query);
+                    conn.execute(query, []).context(DuckDBConnectionSnafu)?;
+                }
+
+                Ok(conn)
+            })
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)??;
 
         Ok(Box::new(
             DuckDbConnection::new(conn)
