@@ -33,7 +33,6 @@ use datafusion::{
 pub struct MySQLTable {
     pool: Arc<MySQLConnectionPool>,
     pub(crate) base_table: SqlTable<mysql_async::Conn, &'static (dyn ToValue + Sync)>,
-    pub(crate) function_support: Option<FunctionSupport>,
 }
 
 impl std::fmt::Debug for MySQLTable {
@@ -60,12 +59,12 @@ impl MySQLTable {
         let base_table = SqlTable::new("mysql", &dyn_pool, table_reference, None)
             .await?
             .with_dialect(Arc::new(MySqlDialect {}))
-            .with_constraints_opt(constraints);
+            .with_constraints_opt(constraints)
+            .with_function_support(function_support);
 
         Ok(Self {
             pool: Arc::clone(pool),
             base_table,
-            function_support,
         })
     }
 

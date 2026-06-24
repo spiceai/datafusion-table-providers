@@ -32,7 +32,6 @@ use datafusion::{
 pub struct SQLiteTable<T: 'static, P: 'static> {
     pub(crate) base_table: SqlTable<T, P>,
     pub(crate) decimal_between: bool,
-    pub(crate) function_support: Option<FunctionSupport>,
 }
 
 impl<T, P> std::fmt::Debug for SQLiteTable<T, P> {
@@ -64,7 +63,6 @@ impl<T, P> SQLiteTable<T, P> {
         Self {
             base_table,
             decimal_between: false,
-            function_support: None,
         }
     }
 
@@ -76,7 +74,7 @@ impl<T, P> SQLiteTable<T, P> {
 
     #[must_use]
     pub fn with_function_support(mut self, function_support: Option<FunctionSupport>) -> Self {
-        self.function_support = function_support;
+        self.base_table = self.base_table.with_function_support(function_support);
         self
     }
 
