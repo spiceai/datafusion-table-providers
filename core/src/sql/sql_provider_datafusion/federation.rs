@@ -12,9 +12,11 @@ use std::sync::Arc;
 use crate::sql::sql_provider_datafusion::{
     get_stream, to_execution_error, SqlTable, UnableToGetSchemaSnafu,
 };
+use crate::util::supported_functions::contains_unsupported_functions;
 use datafusion::{
     arrow::datatypes::SchemaRef,
     error::{DataFusionError, Result as DataFusionResult},
+    logical_expr::LogicalPlan,
     physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream},
     sql::{
         unparser::dialect::{DefaultDialect, Dialect},
@@ -80,6 +82,16 @@ impl<T, P> SQLExecutor for SqlTable<T, P> {
             return Arc::new(DefaultDialect {});
         };
         Arc::clone(dialect) as Arc<_>
+    }
+
+    fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
+        // Default to not federating the plan if a [`FunctionSupport`] policy is
+        // configured and the plan contains an unsupported function; otherwise
+        // allow federation. Functions that can't be federated are left for
+        // DataFusion to execute locally instead of being unparsed into remote SQL.
+        self.function_support.as_ref().is_none_or(|func_supp| {
+            !contains_unsupported_functions(plan, func_supp).unwrap_or(false)
+        })
     }
 
     fn execute(

@@ -39,8 +39,6 @@ pub struct DuckDBTable<T: 'static, P: 'static> {
     /// A mapping of table/view names to `DuckDB` functions that can instantiate a table (e.g. "`read_parquet`('`my_file.parquet`')").
     pub(crate) table_functions: Option<HashMap<String, String>>,
 
-    pub(crate) function_support: Option<FunctionSupport>,
-
     /// A list of indexes as expressed by columns reference in their index expressions.
     pub(crate) indexes: Vec<(ColumnReference, IndexType)>,
 }
@@ -74,12 +72,11 @@ impl<T, P> DuckDBTable<T, P> {
         )
         .with_dialect(dialect.unwrap_or(Arc::new(DuckDBDialect::new())))
         .with_constraints_opt(constraints)
-        .with_function_support(function_support.clone());
+        .with_function_support(function_support);
 
         Self {
             base_table,
             table_functions,
-            function_support,
             indexes,
         }
     }

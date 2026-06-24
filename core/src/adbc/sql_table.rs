@@ -42,8 +42,6 @@ use datafusion::{
 
 pub struct AdbcDBTable<T: 'static, P: 'static> {
     pub(crate) base_table: SqlTable<T, P>,
-    #[cfg(feature = "adbc-federation")]
-    pub(crate) function_support: Option<FunctionSupport>,
 }
 
 impl<T, P> std::fmt::Debug for AdbcDBTable<T, P> {
@@ -67,11 +65,11 @@ impl<T, P> AdbcDBTable<T, P> {
         if let Some(d) = dialect {
             base_table = base_table.with_dialect(d);
         }
-        Self {
-            base_table,
-            #[cfg(feature = "adbc-federation")]
-            function_support,
-        }
+
+        #[cfg(feature = "adbc-federation")]
+        let base_table = base_table.with_function_support(function_support);
+
+        Self { base_table }
     }
 
     fn create_physical_plan(
@@ -106,7 +104,7 @@ impl<T, P> TableProvider for AdbcDBTable<T, P> {
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         let base_results = self.base_table.supports_filters_pushdown(filters)?;
         #[cfg(feature = "adbc-federation")]
-        if let Some(func_support) = &self.function_support {
+        if let Some(func_support) = &self.base_table.function_support {
             return Ok(filters
                 .iter()
                 .zip(base_results)
