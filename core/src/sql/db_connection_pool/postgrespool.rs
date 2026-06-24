@@ -156,27 +156,31 @@ impl ConnectionManager {
 /// selecting such a column errors server-side. `json_serialization_parse_nested_strings`
 /// additionally renders nested string fields that hold valid JSON inline (unescaped)
 /// rather than as escaped string literals, so the decoded values match their schema.
-/// We detect Redshift from its `version()` string (the same signal as
-/// [`PostgresConnection::get_variant`]) and enable both on every new pooled connection
-/// so those columns can be selected and decoded.
+///
+/// These parameters only exist on Redshift, so rather than spend a `SELECT version()`
+/// round-trip detecting the variant we apply them optimistically and treat vanilla
+/// PostgreSQL's "unrecognized configuration parameter" error (`SQLSTATE 42704`) as a
+/// no-op. The `SET`s run outside a transaction, so a failure leaves the connection
+/// usable.
 ///
 /// See <https://docs.aws.amazon.com/redshift/latest/dg/r_json_serialization_enable.html>
 /// and <https://docs.aws.amazon.com/redshift/latest/dg/r_json_serialization_parse_nested_strings.html>.
 async fn configure_session(
     client: &tokio_postgres::Client,
 ) -> std::result::Result<(), ConnectionManagerError> {
-    let version: String = client
-        .query_one("SELECT version()", &[])
-        .await?
-        .try_get(0)?;
-
-    if version.contains("Redshift") {
-        client
-            .batch_execute(
-                "SET json_serialization_enable TO true; \
-                 SET json_serialization_parse_nested_strings TO true;",
-            )
-            .await?;
+    if let Err(e) = client
+        .batch_execute(
+            "SET json_serialization_enable TO true; \
+             SET json_serialization_parse_nested_strings TO true;",
+        )
+        .await
+    {
+        // Vanilla PostgreSQL rejects these unknown parameters with `undefined_object`
+        // (42704); that just means "not Redshift", so ignore it. Anything else is real.
+        if e.code() == Some(&tokio_postgres::error::SqlState::UNDEFINED_OBJECT) {
+            return Ok(());
+        }
+        return Err(e.into());
     }
 
     Ok(())

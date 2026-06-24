@@ -107,9 +107,11 @@ pub fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuil
                 DataType::Utf8 => Box::new(ListBuilder::new(StringBuilder::new())),
                 DataType::Boolean => Box::new(ListBuilder::new(BooleanBuilder::new())),
                 DataType::Binary => Box::new(ListBuilder::new(BinaryBuilder::new())),
-                // List of struct (e.g. PostgreSQL composite arrays). Build the element
-                // `StructBuilder` directly — its field builders must be concrete, not
-                // boxed via `map_data_type_to_array_builder`, for downstream downcasts.
+                // List of struct (e.g. PostgreSQL composite arrays). The list values
+                // builder must be a concrete `StructBuilder` (not a boxed `dyn
+                // ArrayBuilder`) so callers can downcast to `ListBuilder<StructBuilder>`;
+                // its inner field builders are themselves boxed, which `StructBuilder`
+                // expects.
                 DataType::Struct(struct_fields) => {
                     let field_builders = struct_fields
                         .iter()

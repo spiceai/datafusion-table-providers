@@ -206,8 +206,9 @@ macro_rules! append_composite_fields_to_struct {
         for (idx, field) in fields.iter().enumerate() {
             let field_name = field.name();
             let Some(field_type) = map_column_type_to_data_type(field.type_(), field_name)? else {
-                return FailedToDowncastBuilderSnafu {
-                    postgres_type: format!("{}", field.type_()),
+                return UnsupportedDataTypeSnafu {
+                    data_type: field.type_().to_string(),
+                    field_name: field_name.to_string(),
                 }
                 .fail();
             };

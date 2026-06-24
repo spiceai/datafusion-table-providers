@@ -698,6 +698,20 @@ async fn test_postgres_composite_array_list_struct(port: usize) {
         .await
         .expect("Connection should be established");
 
+    // The container is shared across the module (`#[fixture] #[once]`), so make setup
+    // idempotent: drop any artifacts left by a prior run before recreating them. The
+    // table must go first — it depends on the composite type.
+    let _ = db_conn
+        .conn
+        .execute(&format!("DROP TABLE IF EXISTS {table_name};"), &[])
+        .await
+        .expect("Existing table should be dropped");
+    let _ = db_conn
+        .conn
+        .execute("DROP TYPE IF EXISTS line_item;", &[])
+        .await
+        .expect("Existing composite type should be dropped");
+
     let _ = db_conn
         .conn
         .execute(create_type_stmt, &[])
