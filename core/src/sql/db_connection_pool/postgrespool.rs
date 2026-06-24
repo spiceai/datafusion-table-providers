@@ -149,6 +149,36 @@ impl ConnectionManager {
     }
 }
 
+/// Applies per-connection session configuration after a connection is established.
+///
+/// Redshift surfaces Spectrum complex external columns (`ARRAY`/`STRUCT`/`MAP`) and
+/// `SUPER` values as JSON text only when `json_serialization_enable` is on; otherwise
+/// selecting such a column errors server-side. `json_serialization_parse_nested_strings`
+/// additionally renders nested string fields that hold valid JSON inline (unescaped)
+/// rather than as escaped string literals, so the decoded values match their schema.
+/// We detect Redshift from its `version()` string (the same signal as
+/// [`PostgresConnection::get_variant`]) and enable both on every new pooled connection
+/// so those columns can be selected and decoded.
+///
+/// See <https://docs.aws.amazon.com/redshift/latest/dg/r_json_serialization_enable.html>
+/// and <https://docs.aws.amazon.com/redshift/latest/dg/r_json_serialization_parse_nested_strings.html>.
+async fn configure_session(
+    client: &tokio_postgres::Client,
+) -> std::result::Result<(), ConnectionManagerError> {
+    let version: String = client.query_one("SELECT version()", &[]).await?.try_get(0)?;
+
+    if version.contains("Redshift") {
+        client
+            .batch_execute(
+                "SET json_serialization_enable TO true; \
+                 SET json_serialization_parse_nested_strings TO true;",
+            )
+            .await?;
+    }
+
+    Ok(())
+}
+
 impl bb8::ManageConnection for ConnectionManager {
     type Connection = tokio_postgres::Client;
     type Error = ConnectionManagerError;
@@ -170,6 +200,9 @@ impl bb8::ManageConnection for ConnectionManager {
                 tracing::debug!("postgres connection error: {e}");
             }
         });
+
+        configure_session(&client).await?;
+
         Ok(client)
     }
 

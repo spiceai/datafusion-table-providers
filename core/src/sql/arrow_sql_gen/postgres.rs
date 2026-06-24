@@ -856,6 +856,32 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         None => builder.append_null(),
                     }
                 }
+                // Redshift `SUPER` (and Spectrum `ARRAY`/`STRUCT`/`MAP` external columns
+                // surfaced as `SUPER`) arrive as JSON text. Collect that text into a
+                // `Utf8` builder; if the column is projected as a complex Arrow type it is
+                // decoded into that type after row collection (see
+                // `projected_json_complex_field`), otherwise it stays a JSON string.
+                _ if postgres_type.name() == "super" => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() else {
+                        return FailedToDowncastBuilderSnafu {
+                            postgres_type: format!("{postgres_type}"),
+                        }
+                        .fail();
+                    };
+                    let v = row.try_get::<usize, Option<SuperRawString>>(i).context(
+                        FailedToGetRowValueSnafu {
+                            pg_type: postgres_type.clone(),
+                        },
+                    )?;
+
+                    match v {
+                        Some(v) => builder.append_value(v.0),
+                        None => builder.append_null(),
+                    }
+                }
                 _ => match *postgres_type.kind() {
                     Kind::Composite(_) => {
                         let Some(builder) = builder else {
@@ -1016,10 +1042,12 @@ fn projected_json_complex_field(
 ) -> Option<Arc<Field>> {
     // Only text-bearing wire types can carry a JSON serialization. These all have a
     // string-producing row arm above, so forcing the collection builder to `Utf8` is safe.
+    // Redshift's `super` (matched by name — it has no stable built-in OID) is how Spectrum
+    // surfaces serialized `ARRAY`/`STRUCT`/`MAP` external columns.
     let is_text_like = matches!(
         *column_type,
         Type::JSON | Type::JSONB | Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME
-    );
+    ) || column_type.name() == "super";
     if !is_text_like {
         return None;
     }
@@ -1183,6 +1211,10 @@ fn map_column_type_to_data_type(column_type: &Type, field_name: &str) -> Result<
         _ if matches!(column_type.name(), "_geometry" | "_geography") => Ok(Some(DataType::List(
             Arc::new(Field::new("item", DataType::Binary, true)),
         ))),
+        // Redshift `SUPER` (and Spectrum complex external columns surfaced as `SUPER`)
+        // arrive as JSON text. Default to `Utf8`; a complex projected schema upgrades it
+        // to the decoded type via `projected_json_complex_field`.
+        _ if column_type.name() == "super" => Ok(Some(DataType::Utf8)),
         _ => match *column_type.kind() {
             Kind::Composite(ref fields) => {
                 let mut arrow_fields = Vec::new();
@@ -1259,6 +1291,29 @@ impl<'a> FromSql<'a> for JsonbRawString {
 
     fn accepts(ty: &Type) -> bool {
         matches!(*ty, Type::JSON | Type::JSONB)
+    }
+}
+
+/// Reads a Redshift `SUPER` value as its raw UTF-8 JSON text.
+///
+/// Redshift serializes `SUPER` — and the `ARRAY`/`STRUCT`/`MAP` columns of Spectrum
+/// external tables, which surface over the wire as `SUPER` — to a JSON text
+/// representation. `SUPER` has no stable built-in OID, so this matches by type name and
+/// interprets the value bytes as UTF-8. (Requires `json_serialization_enable` on the
+/// session for Spectrum complex columns to serialize rather than error server-side.)
+#[derive(Debug)]
+struct SuperRawString(String);
+
+impl<'a> FromSql<'a> for SuperRawString {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(SuperRawString(String::from_utf8(raw.to_vec())?))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        ty.name() == "super"
     }
 }
 
@@ -1909,6 +1964,44 @@ mod tests {
             projected_json_complex_field(&scalar_schema, "payload", &Type::VARCHAR).is_none(),
             "VARCHAR column projected as Utf8 must stay a scalar string"
         );
+    }
+
+    /// A Redshift `super` wire column (how Spectrum serializes `ARRAY`/`STRUCT`/`MAP`
+    /// external columns) is matched by type name and routed through the JSON decode path.
+    #[test]
+    fn test_super_type_routes_through_json_decode() {
+        let super_type = Type::new("super".to_owned(), 4000, Kind::Simple, "pg_catalog".to_owned());
+
+        // Without a projected schema it resolves to a plain Utf8 JSON string column.
+        assert_eq!(
+            map_column_type_to_data_type(&super_type, "c").expect("super maps"),
+            Some(DataType::Utf8)
+        );
+
+        // Projected as a complex type, it is picked up for JSON decoding.
+        let schema = Some(Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into()),
+                true,
+            ))),
+            true,
+        )])));
+        assert!(
+            projected_json_complex_field(&schema, "payload", &super_type).is_some(),
+            "super column projected as List<Struct> should decode as JSON"
+        );
+    }
+
+    #[test]
+    fn test_super_raw_string_reads_utf8() {
+        let super_type = Type::new("super".to_owned(), 4000, Kind::Simple, "pg_catalog".to_owned());
+        let raw = br#"[{"a":1},{"a":2}]"#;
+        let parsed = SuperRawString::from_sql(&super_type, raw).expect("super decodes");
+        assert_eq!(parsed.0, r#"[{"a":1},{"a":2}]"#);
+        assert!(SuperRawString::accepts(&super_type));
+        assert!(!SuperRawString::accepts(&Type::VARCHAR));
     }
 
     #[test]
