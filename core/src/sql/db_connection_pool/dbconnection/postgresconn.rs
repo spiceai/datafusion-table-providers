@@ -569,9 +569,7 @@ impl PostgresConnection {
                 // `SHOW COLUMNS` errors for tables it can't resolve (e.g. cross-database
                 // datashare objects). Return no columns so `get_schema` falls back to
                 // data-based inference, matching the catalog path's empty-result behavior.
-                tracing::debug!(
-                    "Redshift SHOW COLUMNS failed for {schema_name}.{table_name}: {e}"
-                );
+                tracing::debug!("Redshift SHOW COLUMNS failed for {schema_name}.{table_name}: {e}");
                 return Ok(Vec::new());
             }
         };
