@@ -190,14 +190,12 @@ fn map_schema_query_error(
     e: tokio_postgres::Error,
     table_reference: &TableReference,
 ) -> super::Error {
-    if let Some(error_source) = e.source() {
-        if let Some(pg_error) = error_source.downcast_ref::<tokio_postgres::error::DbError>() {
-            if pg_error.code() == &tokio_postgres::error::SqlState::UNDEFINED_TABLE {
-                return super::Error::UndefinedTable {
-                    source: Box::new(pg_error.clone()),
-                    table_name: table_reference.to_string(),
-                };
-            }
+    if let Some(db_error) = e.as_db_error() {
+        if db_error.code() == &tokio_postgres::error::SqlState::UNDEFINED_TABLE {
+            return super::Error::UndefinedTable {
+                source: Box::new(db_error.clone()),
+                table_name: table_reference.to_string(),
+            };
         }
     }
     super::Error::UnableToGetSchema {
@@ -525,7 +523,10 @@ impl PostgresConnection {
                     })
                     .collect()
             }
-            PostgresVariant::Redshift => self.redshift_columns(schema_name, table_name).await?,
+            PostgresVariant::Redshift => {
+                self.redshift_columns(table_reference.catalog(), schema_name, table_name)
+                    .await?
+            }
         };
 
         Ok((variant, columns))
@@ -538,23 +539,28 @@ impl PostgresConnection {
     /// normalization happen here in Rust rather than in SQL.
     async fn redshift_columns(
         &self,
+        catalog: Option<&str>,
         schema_name: &str,
         table_name: &str,
     ) -> Result<Vec<ColumnDef>, super::Error> {
-        // `SHOW COLUMNS` needs a fully-qualified 3-part name including the connected
-        // database, which scopes results the same way the previous `current_database()`
-        // filter did.
-        let database_name: String = self
-            .conn
-            .query_one("SELECT current_database()", &[])
-            .await
-            .map_err(|e| super::Error::UnableToGetSchema {
-                source: Box::new(e),
-            })?
-            .try_get(0)
-            .map_err(|e| super::Error::UnableToGetSchema {
-                source: Box::new(e),
-            })?;
+        // `SHOW COLUMNS` needs a fully-qualified 3-part name including the database. Use
+        // the catalog from the table reference when the caller fully-qualified it;
+        // otherwise scope to the connected database (matching the previous
+        // `current_database()` filter).
+        let database_name: String = match catalog {
+            Some(catalog) => catalog.to_string(),
+            None => self
+                .conn
+                .query_one("SELECT current_database()", &[])
+                .await
+                .map_err(|e| super::Error::UnableToGetSchema {
+                    source: Box::new(e),
+                })?
+                .try_get(0)
+                .map_err(|e| super::Error::UnableToGetSchema {
+                    source: Box::new(e),
+                })?,
+        };
 
         let sql = format!(
             "SHOW COLUMNS FROM TABLE {}.{}.{}",
@@ -565,12 +571,24 @@ impl PostgresConnection {
 
         let rows = match self.conn.query(&sql, &[]).await {
             Ok(rows) => rows,
-            Err(e) => {
-                // `SHOW COLUMNS` errors for tables it can't resolve (e.g. cross-database
-                // datashare objects). Return no columns so `get_schema` falls back to
-                // data-based inference, matching the catalog path's empty-result behavior.
-                tracing::debug!("Redshift SHOW COLUMNS failed for {schema_name}.{table_name}: {e}");
+            // `SHOW COLUMNS` raises `UNDEFINED_TABLE` for relations it can't resolve in the
+            // target database (e.g. cross-database datashare objects). Treat only that as a
+            // miss and fall back to data-based inference — matching the catalog path's
+            // empty-result behavior — while surfacing any other error (permissions, syntax,
+            // connectivity) instead of silently hiding it.
+            Err(e)
+                if e.as_db_error().map(tokio_postgres::error::DbError::code)
+                    == Some(&tokio_postgres::error::SqlState::UNDEFINED_TABLE) =>
+            {
+                tracing::debug!(
+                    "Redshift SHOW COLUMNS: {schema_name}.{table_name} not found in {database_name}; falling back to data inference"
+                );
                 return Ok(Vec::new());
+            }
+            Err(e) => {
+                return Err(super::Error::UnableToGetSchema {
+                    source: Box::new(e),
+                })
             }
         };
 
