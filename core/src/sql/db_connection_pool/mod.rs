@@ -112,3 +112,7 @@ impl DbInstanceKey {
         DbInstanceKey::File(path)
     }
 }
+
+pub(crate) fn maybe_source_err<T: std::error::Error>(err: &T) -> &dyn std::error::Error {
+    err.source().unwrap_or(err)
+}
