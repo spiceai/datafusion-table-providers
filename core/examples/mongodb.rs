@@ -63,7 +63,7 @@ async fn main() {
     ctx.register_table(
         "companies_v2",
         table_factory
-            .table_provider(TableReference::bare("companies"))
+            .table_provider(TableReference::bare("companies"), None, None)
             .await
             .expect("failed to register table provider"),
     )

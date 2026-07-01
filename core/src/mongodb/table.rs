@@ -1,6 +1,7 @@
 use crate::mongodb::connection_pool::MongoDBConnectionPool;
 use crate::mongodb::utils::expression::{combine_exprs_with_and, expr_to_mongo_filter};
 use crate::mongodb::Error;
+use crate::schema_projection::SchemaProjection;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
@@ -27,6 +28,7 @@ pub struct MongoDBTable {
     pool: Arc<MongoDBConnectionPool>,
     schema: SchemaRef,
     table_reference: Arc<TableReference>,
+    projection: Option<SchemaProjection>,
 }
 
 impl MongoDBTable {
@@ -34,6 +36,7 @@ impl MongoDBTable {
         pool: &Arc<MongoDBConnectionPool>,
         table_reference: impl Into<TableReference>,
         declared_schema: Option<SchemaRef>,
+        projection: Option<SchemaProjection>,
     ) -> Result<Self, Error> {
         let table_reference = table_reference.into();
         let schema = pool
@@ -42,10 +45,18 @@ impl MongoDBTable {
             .get_schema(&table_reference, declared_schema)
             .await?;
 
+        // When a JSON-nesting / declared-schema projection is configured, the
+        // exposed schema is the projected one (declared columns + catch-all).
+        let schema = match &projection {
+            Some(p) => p.project_schema(schema),
+            None => schema,
+        };
+
         Ok(Self {
             pool: Arc::clone(pool),
             schema,
             table_reference: Arc::new(table_reference),
+            projection,
         })
     }
 }
@@ -74,6 +85,7 @@ impl TableProvider for MongoDBTable {
             projection,
             filters,
             limit,
+            self.projection.clone(),
         )?))
     }
 
@@ -108,6 +120,7 @@ struct MongoDBExec {
     sort_doc: Document,
     limit: Option<i32>,
     properties: Arc<PlanProperties>,
+    schema_projection: Option<SchemaProjection>,
 }
 
 impl MongoDBExec {
@@ -118,6 +131,7 @@ impl MongoDBExec {
         projections: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
+        schema_projection: Option<SchemaProjection>,
     ) -> DataFusionResult<Self> {
         let mut projected_schema = project_schema(&schema, projections)?;
 
@@ -166,6 +180,7 @@ impl MongoDBExec {
                 EmissionType::Final,
                 Boundedness::Bounded,
             )),
+            schema_projection,
         })
     }
 }
@@ -249,6 +264,7 @@ impl ExecutionPlan for MongoDBExec {
             sort_doc,
             limit: self.limit,
             properties: self.properties.clone(),
+            schema_projection: self.schema_projection.clone(),
         };
 
         // Update equivalence properties to reflect the output ordering
@@ -277,6 +293,7 @@ impl ExecutionPlan for MongoDBExec {
         let filters_doc = self.filters_doc.clone();
         let sort_doc = self.sort_doc.clone();
         let limit = self.limit;
+        let schema_projection = self.schema_projection.clone();
 
         let stream = futures::stream::once(async move {
             let conn = pool.connect().await.map_err(to_execution_error)?;
@@ -287,6 +304,7 @@ impl ExecutionPlan for MongoDBExec {
                 &filters_doc,
                 limit,
                 &sort_doc,
+                schema_projection.as_ref(),
             )
             .await
             .map_err(to_execution_error)
@@ -413,7 +431,7 @@ mod tests {
     async fn test_display_no_filters_no_limit() {
         let schema = test_schema();
         let table_ref = Arc::new(TableReference::bare("users"));
-        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], None).unwrap();
+        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], None, None).unwrap();
 
         let display = format_exec(&exec);
         assert!(
@@ -435,8 +453,16 @@ mod tests {
     async fn test_display_with_projection() {
         let schema = test_schema();
         let table_ref = Arc::new(TableReference::bare("users"));
-        let exec =
-            MongoDBExec::new(table_ref, stub_pool(), schema, Some(&vec![1, 2]), &[], None).unwrap();
+        let exec = MongoDBExec::new(
+            table_ref,
+            stub_pool(),
+            schema,
+            Some(&vec![1, 2]),
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
 
         let display = format_exec(&exec);
         assert!(
@@ -450,7 +476,8 @@ mod tests {
         let schema = test_schema();
         let table_ref = Arc::new(TableReference::bare("users"));
         let filters = vec![col("age").gt(lit(21))];
-        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &filters, None).unwrap();
+        let exec =
+            MongoDBExec::new(table_ref, stub_pool(), schema, None, &filters, None, None).unwrap();
 
         let display = format_exec(&exec);
         assert!(
@@ -463,7 +490,8 @@ mod tests {
     async fn test_display_with_limit() {
         let schema = test_schema();
         let table_ref = Arc::new(TableReference::bare("users"));
-        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], Some(100)).unwrap();
+        let exec =
+            MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], Some(100), None).unwrap();
 
         let display = format_exec(&exec);
         assert!(
@@ -476,7 +504,8 @@ mod tests {
     async fn test_display_with_sort() {
         let schema = test_schema();
         let table_ref = Arc::new(TableReference::bare("users"));
-        let mut exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], None).unwrap();
+        let mut exec =
+            MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], None, None).unwrap();
         exec.sort_doc = doc! { "name": 1, "age": -1 };
 
         let display = format_exec(&exec);
@@ -506,6 +535,7 @@ mod tests {
             Some(&vec![1, 3]),
             &filters,
             Some(50),
+            None,
         )
         .unwrap();
         exec.sort_doc = doc! { "name": 1 };
@@ -525,7 +555,8 @@ mod tests {
         let schema = test_schema();
         let table_ref = Arc::new(TableReference::bare("users"));
         let filters = vec![col("age").gt(lit(18)).and(col("name").eq(lit("Alice")))];
-        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &filters, None).unwrap();
+        let exec =
+            MongoDBExec::new(table_ref, stub_pool(), schema, None, &filters, None, None).unwrap();
 
         let display = format_exec(&exec);
         assert!(
@@ -548,8 +579,16 @@ mod tests {
     async fn test_exec_empty_projection_falls_back_to_id() {
         let schema = test_schema();
         let table_ref = Arc::new(TableReference::bare("users"));
-        let exec =
-            MongoDBExec::new(table_ref, stub_pool(), schema, Some(&vec![]), &[], None).unwrap();
+        let exec = MongoDBExec::new(
+            table_ref,
+            stub_pool(),
+            schema,
+            Some(&vec![]),
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
 
         let display = format_exec(&exec);
         assert!(
@@ -562,7 +601,15 @@ mod tests {
     async fn test_exec_limit_too_large() {
         let schema = test_schema();
         let table_ref = Arc::new(TableReference::bare("users"));
-        let result = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], Some(usize::MAX));
+        let result = MongoDBExec::new(
+            table_ref,
+            stub_pool(),
+            schema,
+            None,
+            &[],
+            Some(usize::MAX),
+            None,
+        );
         assert!(result.is_err(), "Should fail for limit that exceeds i32");
     }
 
@@ -570,7 +617,7 @@ mod tests {
     async fn test_exec_no_filters_produces_empty_doc() {
         let schema = test_schema();
         let table_ref = Arc::new(TableReference::bare("users"));
-        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], None).unwrap();
+        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], None, None).unwrap();
 
         assert!(
             exec.filters_doc.is_empty(),
@@ -583,7 +630,8 @@ mod tests {
         let schema = test_schema();
         let table_ref = Arc::new(TableReference::bare("users"));
         let filters = vec![col("age").gt(lit(18)), col("active").eq(lit(true))];
-        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &filters, None).unwrap();
+        let exec =
+            MongoDBExec::new(table_ref, stub_pool(), schema, None, &filters, None, None).unwrap();
 
         assert!(
             exec.filters_doc.contains_key("$and"),
@@ -596,7 +644,7 @@ mod tests {
     async fn test_exec_properties() {
         let schema = test_schema();
         let table_ref = Arc::new(TableReference::bare("users"));
-        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], None).unwrap();
+        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], None, None).unwrap();
 
         assert_eq!(exec.name(), "MongoDBExec");
         assert_eq!(exec.children().len(), 0);
@@ -620,7 +668,7 @@ mod tests {
             op: Operator::Modulo,
             right: Box::new(lit(2)),
         })];
-        let result = MongoDBExec::new(table_ref, stub_pool(), schema, None, &filters, None);
+        let result = MongoDBExec::new(table_ref, stub_pool(), schema, None, &filters, None, None);
         assert!(
             result.is_err(),
             "Should error when combined filter can't be converted"
@@ -631,7 +679,7 @@ mod tests {
     async fn test_exec_with_new_children_returns_self() {
         let schema = test_schema();
         let table_ref = Arc::new(TableReference::bare("users"));
-        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], None).unwrap();
+        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], None, None).unwrap();
         let exec_arc: Arc<dyn ExecutionPlan> = Arc::new(exec);
         let result = exec_arc.clone().with_new_children(vec![]).unwrap();
         assert_eq!(result.name(), "MongoDBExec");
@@ -645,7 +693,7 @@ mod tests {
 
         let schema = test_schema();
         let table_ref = Arc::new(TableReference::bare("users"));
-        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], None).unwrap();
+        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], None, None).unwrap();
 
         let sort_exprs = vec![PhysicalSortExpr::new(
             Arc::new(PhysColumn::new("name", 1)),
@@ -676,7 +724,7 @@ mod tests {
 
         let schema = test_schema();
         let table_ref = Arc::new(TableReference::bare("users"));
-        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], None).unwrap();
+        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], None, None).unwrap();
 
         let sort_exprs = vec![PhysicalSortExpr::new(
             Arc::new(PhysColumn::new("age", 2)),
@@ -702,7 +750,7 @@ mod tests {
 
         let schema = test_schema();
         let table_ref = Arc::new(TableReference::bare("users"));
-        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], None).unwrap();
+        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], None, None).unwrap();
 
         let sort_exprs = vec![
             PhysicalSortExpr::new(
@@ -738,7 +786,7 @@ mod tests {
 
         let schema = test_schema();
         let table_ref = Arc::new(TableReference::bare("users"));
-        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], None).unwrap();
+        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], None, None).unwrap();
 
         let sort_exprs = vec![PhysicalSortExpr::new(
             Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
@@ -759,8 +807,16 @@ mod tests {
         let schema = test_schema();
         let table_ref = Arc::new(TableReference::bare("users"));
         let filters = vec![col("age").gt(lit(21))];
-        let exec =
-            MongoDBExec::new(table_ref, stub_pool(), schema, None, &filters, Some(10)).unwrap();
+        let exec = MongoDBExec::new(
+            table_ref,
+            stub_pool(),
+            schema,
+            None,
+            &filters,
+            Some(10),
+            None,
+        )
+        .unwrap();
 
         let sort_exprs = vec![PhysicalSortExpr::new(
             Arc::new(PhysColumn::new("name", 1)),
@@ -786,7 +842,7 @@ mod tests {
     async fn test_sort_pushdown_empty_order() {
         let schema = test_schema();
         let table_ref = Arc::new(TableReference::bare("users"));
-        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], None).unwrap();
+        let exec = MongoDBExec::new(table_ref, stub_pool(), schema, None, &[], None, None).unwrap();
 
         let result = exec.try_pushdown_sort(&[]).unwrap();
         match result {

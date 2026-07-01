@@ -1,5 +1,6 @@
 pub mod connection;
 pub mod connection_pool;
+pub mod projection;
 pub mod table;
 pub mod utils;
 
@@ -87,10 +88,11 @@ impl MongoDBTableFactory {
         &self,
         table_reference: TableReference,
         declared_schema: Option<SchemaRef>,
+        projection: Option<crate::schema_projection::SchemaProjection>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
         let table_provider = Arc::new(
-            MongoDBTable::new(&pool, table_reference, declared_schema)
+            MongoDBTable::new(&pool, table_reference, declared_schema, projection)
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
         );
