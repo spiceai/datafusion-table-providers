@@ -17,12 +17,8 @@ use async_stream::stream;
 use bb8_postgres::tokio_postgres::types::ToSql;
 
 fn maybe_db_source_err(err: tokio_postgres::Error) -> Box<dyn Error + Send + Sync> {
-    if err.as_db_error().is_some() {
-        // If the error has a source, use it; otherwise, create a generic error to avoid losing context.
-        err.into_source().unwrap_or(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "db error",
-        )))
+    if let Some(err) = err.as_db_error() {
+        Box::new(err.clone()) as Box<dyn Error + Send + Sync>
     } else {
         Box::new(err)
     }
