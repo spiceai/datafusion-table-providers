@@ -16,10 +16,6 @@
 //! [`RowShape`] impl for its native value type (`serde_json::Value`,
 //! `bson::Bson`, DynamoDB `AttributeValue`, …); a nested object is simply a
 //! value that is itself an object.
-//!
-//! This lives in `datafusion-table-providers` (rather than a downstream crate)
-//! so that table providers defined here — notably MongoDB — can reuse the same
-//! core on their scan path, while downstream crates depend on it the usual way.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
