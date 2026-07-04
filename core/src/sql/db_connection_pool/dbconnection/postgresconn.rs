@@ -16,6 +16,14 @@ use arrow_schema::DataType;
 use async_stream::stream;
 use bb8_postgres::tokio_postgres::types::ToSql;
 
+fn maybe_db_source_err(err: tokio_postgres::Error) -> Box<dyn Error + Send + Sync> {
+    if let Some(err) = err.as_db_error() {
+        Box::new(err.clone()) as Box<dyn Error + Send + Sync>
+    } else {
+        Box::new(err)
+    }
+}
+
 /// A pooled Postgres connection obtained from a [`PostgresConnectionPool`](crate::sql::db_connection_pool::postgrespool::PostgresConnectionPool).
 ///
 /// Dereferences to [`tokio_postgres::Client`](bb8_postgres::tokio_postgres::Client) for executing queries.
@@ -199,7 +207,7 @@ fn map_schema_query_error(
         }
     }
     super::Error::UnableToGetSchema {
-        source: Box::new(e),
+        source: maybe_db_source_err(e),
     }
 }
 
@@ -335,7 +343,7 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
 
         let rows = self.conn.query(query, &[&schema]).await.map_err(|e| {
             super::Error::UnableToGetTables {
-                source: Box::new(e),
+                source: maybe_db_source_err(e),
             }
         })?;
 
@@ -353,7 +361,7 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
                 .query(query, &[])
                 .await
                 .map_err(|e| super::Error::UnableToGetSchemas {
-                    source: Box::new(e),
+                    source: maybe_db_source_err(e),
                 })?;
 
         Ok(rows.iter().map(|r| r.get::<usize, String>(0)).collect())
@@ -477,13 +485,13 @@ impl PostgresConnection {
             .query_one("SELECT version()", &[])
             .await
             .map_err(|e| super::Error::UnableToGetSchema {
-                source: Box::new(e),
+                source: maybe_db_source_err(e),
             })?;
 
         let version: String = row
             .try_get(0)
             .map_err(|e| super::Error::UnableToGetSchema {
-                source: Box::new(e),
+                source: maybe_db_source_err(e),
             })?;
 
         let variant = if version.contains("Redshift") {
@@ -554,11 +562,11 @@ impl PostgresConnection {
                 .query_one("SELECT current_database()", &[])
                 .await
                 .map_err(|e| super::Error::UnableToGetSchema {
-                    source: Box::new(e),
+                    source: maybe_db_source_err(e),
                 })?
                 .try_get(0)
                 .map_err(|e| super::Error::UnableToGetSchema {
-                    source: Box::new(e),
+                    source: maybe_db_source_err(e),
                 })?,
         };
 
@@ -587,7 +595,7 @@ impl PostgresConnection {
             }
             Err(e) => {
                 return Err(super::Error::UnableToGetSchema {
-                    source: Box::new(e),
+                    source: maybe_db_source_err(e),
                 })
             }
         };
@@ -657,7 +665,7 @@ impl PostgresConnection {
                     }
                 }
                 super::Error::UnableToGetSchema {
-                    source: Box::new(e),
+                    source: maybe_db_source_err(e),
                 }
             })?;
 

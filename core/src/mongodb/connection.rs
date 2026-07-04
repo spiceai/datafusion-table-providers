@@ -11,10 +11,12 @@ use mongodb::{
 use snafu::prelude::*;
 use std::sync::Arc;
 
+use crate::mongodb::projection::project_bson_document;
 use crate::mongodb::utils::arrow::mongo_docs_to_arrow;
 use crate::mongodb::utils::schema::infer_arrow_schema_from_documents;
 use crate::mongodb::utils::unnest::{unnest_bson_documents, UnnestBehavior, UnnestParameters};
 use crate::mongodb::{Error, QuerySnafu, Result, UnableToGetSchemaSnafu, UnableToGetTablesSnafu};
+use crate::schema_projection::SchemaProjection;
 use crate::util::schema::merge_inferred_and_declared_schemas;
 
 pub struct MongoDBConnection {
@@ -121,13 +123,22 @@ impl MongoDBConnection {
         filters_doc: &Document,
         limit: Option<i32>,
         sort_doc: &Document,
+        schema_projection: Option<&SchemaProjection>,
     ) -> Result<SendableRecordBatchStream> {
         let collection_name = table_reference.table();
         let coll = self.get_collection(collection_name);
 
-        let mut find = coll
-            .find(filters_doc.clone())
-            .projection(schema_to_mongo_projection(projected_schema));
+        // With a JSON-nesting catch-all the projected schema's `data` column is
+        // not a real MongoDB field; we must fetch the full documents so every
+        // non-declared field can be folded into the catch-all.
+        let nesting = schema_projection.filter(|p| p.has_catch_all());
+        let mongo_projection = if nesting.is_some() {
+            Document::new()
+        } else {
+            schema_to_mongo_projection(projected_schema)
+        };
+
+        let mut find = coll.find(filters_doc.clone()).projection(mongo_projection);
 
         if !sort_doc.is_empty() {
             find = find.sort(sort_doc.clone());
@@ -141,6 +152,7 @@ impl MongoDBConnection {
         let chunked_stream = cursor.try_chunks(4_000);
         let projected_schema_clone = Arc::clone(projected_schema);
         let unnest_parameters = self.unnest_parameters.clone();
+        let projection = schema_projection.filter(|p| p.has_catch_all()).cloned();
 
         let schema = Arc::clone(projected_schema);
         let batch_stream = stream! {
@@ -154,7 +166,17 @@ impl MongoDBConnection {
                             }
                         };
 
-                        let batch = mongo_docs_to_arrow(&unnested_docs, Arc::clone(&projected_schema_clone))?;
+                        // Fold non-declared fields into the catch-all before
+                        // Arrow conversion when JSON nesting is configured.
+                        let projected_docs = match &projection {
+                            Some(p) => unnested_docs
+                                .into_iter()
+                                .map(|d| project_bson_document(d, p))
+                                .collect(),
+                            None => unnested_docs,
+                        };
+
+                        let batch = mongo_docs_to_arrow(&projected_docs, Arc::clone(&projected_schema_clone))?;
                         yield Ok(batch);
                     }
                     Err(e) => yield Err(Error::QueryError { source: Box::new(e) }),
