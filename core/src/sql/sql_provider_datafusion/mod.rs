@@ -334,6 +334,16 @@ impl<T, P> TableProvider for SqlTable<T, P> {
                 if expr::expr_contains_subquery_or_outer_ref(f).unwrap_or(true) {
                     return TableProviderFilterPushDown::Unsupported;
                 }
+                // Respect the configured function-support policy. A filter that
+                // references a scalar/aggregate/window function the target engine
+                // cannot execute must not be pushed down.
+                if self
+                    .function_support
+                    .as_ref()
+                    .is_some_and(|func_support| !func_support.supports(f))
+                {
+                    return TableProviderFilterPushDown::Unsupported;
+                }
                 // Use the same Unparser that scan_to_sql() uses for actual SQL
                 // generation, so the capability check matches what can really
                 // be converted to SQL for the target dialect.
@@ -997,6 +1007,166 @@ mod tests {
             let result = sql_table.scan_to_sql(Some(&vec![0]), &[], None).unwrap();
             assert_eq!(result, "SELECT `name` FROM `users`");
             Ok(())
+        }
+    }
+
+    mod supports_filters_pushdown_tests {
+        use std::any::Any;
+        use std::error::Error;
+        use std::sync::Arc;
+
+        use async_trait::async_trait;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::datasource::TableProvider;
+        use datafusion::logical_expr::expr::ScalarFunction;
+        use datafusion::logical_expr::{
+            col, create_udf, lit, ColumnarValue, Expr, ScalarUDF, TableProviderFilterPushDown,
+            Volatility,
+        };
+        use datafusion::sql::unparser::dialect::SqliteDialect;
+        use datafusion::sql::TableReference;
+
+        use crate::sql::db_connection_pool::{
+            dbconnection::DbConnection, DbConnectionPool, JoinPushDown,
+        };
+        use crate::sql::sql_provider_datafusion::SqlTable;
+        use crate::util::supported_functions::{FunctionRestriction, FunctionSupport};
+
+        struct MockConn {}
+
+        impl DbConnection<(), &'static dyn ToString> for MockConn {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+
+            fn as_any_mut(&mut self) -> &mut dyn Any {
+                self
+            }
+        }
+
+        struct MockDBPool {}
+
+        #[async_trait]
+        impl DbConnectionPool<(), &'static dyn ToString> for MockDBPool {
+            async fn connect(
+                &self,
+            ) -> Result<
+                Box<dyn DbConnection<(), &'static dyn ToString>>,
+                Box<dyn Error + Send + Sync>,
+            > {
+                Ok(Box::new(MockConn {}))
+            }
+
+            fn join_push_down(&self) -> JoinPushDown {
+                JoinPushDown::Disallow
+            }
+        }
+
+        /// Builds a table whose function-support policy allows everything except
+        /// `denied_fn`.
+        fn test_table() -> SqlTable<(), &'static dyn ToString> {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, false),
+                Field::new("age", DataType::Int16, false),
+            ]));
+            let pool = Arc::new(MockDBPool {})
+                as Arc<dyn DbConnectionPool<(), &'static dyn ToString> + Send + Sync>;
+            let function_support = FunctionSupport::new(
+                Some(FunctionRestriction::Deny(vec!["denied_fn".to_string()])),
+                None,
+                None,
+            );
+            SqlTable::new_with_schema("users", &pool, schema, TableReference::bare("users"), None)
+                .with_dialect(Arc::new(SqliteDialect {}))
+                .with_function_support(Some(function_support))
+        }
+
+        /// A call to the denied scalar function: `denied_fn(name)`.
+        fn denied_call() -> Expr {
+            let udf: Arc<ScalarUDF> = Arc::new(create_udf(
+                "denied_fn",
+                vec![DataType::Utf8],
+                DataType::Utf8,
+                Volatility::Immutable,
+                Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+            ));
+            Expr::ScalarFunction(ScalarFunction::new_udf(udf, vec![col("name")]))
+        }
+
+        fn assert_pushdown(filter: Expr, expected: TableProviderFilterPushDown) {
+            let table = test_table();
+            let result = table
+                .supports_filters_pushdown(&[&filter])
+                .expect("supports_filters_pushdown should succeed");
+            assert_eq!(result, vec![expected]);
+        }
+
+        #[test]
+        fn allowed_filter_is_pushed_down() {
+            assert_pushdown(col("age").gt(lit(30)), TableProviderFilterPushDown::Exact);
+        }
+
+        #[test]
+        fn denied_function_alone_is_not_pushed_down() {
+            assert_pushdown(
+                denied_call().eq(lit("x")),
+                TableProviderFilterPushDown::Unsupported,
+            );
+        }
+
+        #[test]
+        fn denied_function_in_and_is_not_pushed_down() {
+            let filter = col("age").gt(lit(30)).and(denied_call().eq(lit("x")));
+            assert_pushdown(filter, TableProviderFilterPushDown::Unsupported);
+        }
+
+        #[test]
+        fn denied_function_in_or_is_not_pushed_down() {
+            let filter = col("age").gt(lit(30)).or(denied_call().eq(lit("x")));
+            assert_pushdown(filter, TableProviderFilterPushDown::Unsupported);
+        }
+
+        #[test]
+        fn denied_function_nested_deeply_is_not_pushed_down() {
+            // (age > 30 AND name = 'a') OR (age < 5 AND denied_fn(name) = 'x')
+            let filter = col("age")
+                .gt(lit(30))
+                .and(col("name").eq(lit("a")))
+                .or(col("age").lt(lit(5)).and(denied_call().eq(lit("x"))));
+            assert_pushdown(filter, TableProviderFilterPushDown::Unsupported);
+        }
+
+        #[test]
+        fn denied_function_negated_is_not_pushed_down() {
+            let filter = !denied_call().eq(lit("x"));
+            assert_pushdown(filter, TableProviderFilterPushDown::Unsupported);
+        }
+
+        #[test]
+        fn complex_allowed_expression_is_pushed_down() {
+            // A nested AND/OR of only allowed expressions stays Exact.
+            let filter = col("age")
+                .gt(lit(30))
+                .and(col("name").eq(lit("a")).or(col("age").lt(lit(5))));
+            assert_pushdown(filter, TableProviderFilterPushDown::Exact);
+        }
+
+        #[test]
+        fn mixed_filters_are_evaluated_independently() {
+            // Each filter in the slice is judged on its own merits.
+            let table = test_table();
+            let allowed = col("age").gt(lit(30));
+            let denied = denied_call().eq(lit("x"));
+            let result = table
+                .supports_filters_pushdown(&[&allowed, &denied])
+                .expect("supports_filters_pushdown should succeed");
+            assert_eq!(
+                result,
+                vec![
+                    TableProviderFilterPushDown::Exact,
+                    TableProviderFilterPushDown::Unsupported,
+                ]
+            );
         }
     }
 
