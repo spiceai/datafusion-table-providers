@@ -109,34 +109,59 @@ impl SQLiteBetweenVisitor {
                 ..
             }) => {
                 // if expr is a numeric literal, wrap it in a decimal scalar
-                *expr = Expr::Function(ast::Function {
-                    name: ast::ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(
-                        "decimal",
-                    ))]),
-                    args: ast::FunctionArguments::List(FunctionArgumentList {
-                        duplicate_treatment: None,
-                        args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
-                            ast::Value::SingleQuotedString(s.clone()).into(),
-                        )))],
-                        clauses: Vec::new(),
-                    }),
-                    over: None,
-                    uses_odbc_syntax: false,
-                    parameters: ast::FunctionArguments::None,
-                    filter: None,
-                    null_treatment: None,
-                    within_group: Vec::new(),
-                });
+                *expr = Self::decimal_function(
+                    "decimal",
+                    vec![Expr::Value(
+                        ast::Value::SingleQuotedString(s.clone()).into(),
+                    )],
+                );
             }
-            Expr::BinaryOp { left, op: _, right } => {
+            Expr::BinaryOp { left, op, right } => {
                 Self::wrap_numeric_values_in_decimal(left);
                 Self::wrap_numeric_values_in_decimal(right);
+
+                // `decimal()` returns TEXT, and SQLite's raw `+`/`-`/`*`
+                // coerce TEXT back to REAL — reintroducing the exact float
+                // error this rewrite exists to avoid. (Visible on SQLite >=
+                // 3.51, whose REAL-to-TEXT conversion is shortest-round-trip:
+                // `decimal('0.06') + decimal('0.01')` feeds `decimal_cmp` the
+                // text `0.06999999999999999` rather than `0.07`.) Evaluate the
+                // arithmetic inside the decimal extension instead.
+                let func_name = match op {
+                    BinaryOperator::Plus => "decimal_add",
+                    BinaryOperator::Minus => "decimal_sub",
+                    BinaryOperator::Multiply => "decimal_mul",
+                    _ => return,
+                };
+                *expr =
+                    Self::decimal_function(func_name, vec![(**left).clone(), (**right).clone()]);
             }
             Expr::Nested(nested_expr) => {
                 Self::wrap_numeric_values_in_decimal(nested_expr);
             }
             _ => {}
         }
+    }
+
+    /// Builds a call to one of the `SQLite` decimal extension functions.
+    fn decimal_function(name: &str, args: Vec<Expr>) -> Expr {
+        Expr::Function(ast::Function {
+            name: ast::ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(name))]),
+            args: ast::FunctionArguments::List(FunctionArgumentList {
+                duplicate_treatment: None,
+                args: args
+                    .into_iter()
+                    .map(|arg| FunctionArg::Unnamed(FunctionArgExpr::Expr(arg)))
+                    .collect(),
+                clauses: Vec::new(),
+            }),
+            over: None,
+            uses_odbc_syntax: false,
+            parameters: ast::FunctionArguments::None,
+            filter: None,
+            null_treatment: None,
+            within_group: Vec::new(),
+        })
     }
 
     fn build_cmp_operator(side: OpSide, negated: bool) -> BinaryOperator {
@@ -356,51 +381,27 @@ mod test {
                                 FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
                                     ast::Value::Number("10".to_string(), false).into()
                                 ))),
-                                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::BinaryOp {
-                                    left: Box::new(Expr::Function(ast::Function {
-                                        name: ast::ObjectName(vec![
-                                            ast::ObjectNamePart::Identifier(Ident::new("decimal"))
-                                        ]),
-                                        args: ast::FunctionArguments::List(FunctionArgumentList {
-                                            duplicate_treatment: None,
-                                            args: vec![FunctionArg::Unnamed(
-                                                FunctionArgExpr::Expr(Expr::Value(
+                                FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                                    SQLiteBetweenVisitor::decimal_function(
+                                        "decimal_add",
+                                        vec![
+                                            SQLiteBetweenVisitor::decimal_function(
+                                                "decimal",
+                                                vec![Expr::Value(
                                                     ast::Value::SingleQuotedString("1".to_string())
-                                                        .into()
-                                                ))
-                                            )],
-                                            clauses: Vec::new(),
-                                        }),
-                                        over: None,
-                                        uses_odbc_syntax: false,
-                                        parameters: ast::FunctionArguments::None,
-                                        filter: None,
-                                        null_treatment: None,
-                                        within_group: Vec::new(),
-                                    })),
-                                    op: BinaryOperator::Plus,
-                                    right: Box::new(Expr::Function(ast::Function {
-                                        name: ast::ObjectName(vec![
-                                            ast::ObjectNamePart::Identifier(Ident::new("decimal"))
-                                        ]),
-                                        args: ast::FunctionArguments::List(FunctionArgumentList {
-                                            duplicate_treatment: None,
-                                            args: vec![FunctionArg::Unnamed(
-                                                FunctionArgExpr::Expr(Expr::Value(
+                                                        .into(),
+                                                )],
+                                            ),
+                                            SQLiteBetweenVisitor::decimal_function(
+                                                "decimal",
+                                                vec![Expr::Value(
                                                     ast::Value::SingleQuotedString("2".to_string())
-                                                        .into()
-                                                ))
-                                            )],
-                                            clauses: Vec::new(),
-                                        }),
-                                        over: None,
-                                        uses_odbc_syntax: false,
-                                        parameters: ast::FunctionArguments::None,
-                                        filter: None,
-                                        null_treatment: None,
-                                        within_group: Vec::new(),
-                                    })),
-                                })),
+                                                        .into(),
+                                                )],
+                                            ),
+                                        ],
+                                    ),
+                                )),
                             ],
                             clauses: Vec::new(),
                         }),
@@ -593,6 +594,38 @@ mod test {
                     )),
                 }),
             }
+        );
+    }
+
+    #[test]
+    fn test_rebuild_between_arithmetic_bounds_use_decimal_functions() {
+        // TPC-H q6 shape: `l_discount BETWEEN 0.06 - 0.01 AND 0.06 + 0.01`.
+        // The bound arithmetic must be evaluated by the decimal extension
+        // (decimal_sub/decimal_add), not SQLite's REAL `+`/`-` — on SQLite >=
+        // 3.51 the REAL result renders as 0.06999999999999999 inside
+        // decimal_cmp and silently drops the l_discount = 0.07 rows.
+        let number = |s: &str| Expr::Value(ast::Value::Number(s.to_string(), false).into());
+        let mut expr = Expr::Between {
+            expr: Box::new(Expr::Identifier(Ident::new("l_discount"))),
+            negated: false,
+            low: Box::new(Expr::BinaryOp {
+                left: Box::new(number("0.06")),
+                op: BinaryOperator::Minus,
+                right: Box::new(number("0.01")),
+            }),
+            high: Box::new(Expr::BinaryOp {
+                left: Box::new(number("0.06")),
+                op: BinaryOperator::Plus,
+                right: Box::new(number("0.01")),
+            }),
+        };
+
+        let _ = SQLiteBetweenVisitor::default().pre_visit_expr(&mut expr);
+
+        assert_eq!(
+            expr.to_string(),
+            "decimal_cmp(l_discount, decimal_sub(decimal('0.06'), decimal('0.01'))) >= 0 \
+             AND decimal_cmp(l_discount, decimal_add(decimal('0.06'), decimal('0.01'))) <= 0"
         );
     }
 
