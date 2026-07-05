@@ -102,22 +102,9 @@ impl<T, P> TableProvider for AdbcDBTable<T, P> {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        let base_results = self.base_table.supports_filters_pushdown(filters)?;
-        #[cfg(feature = "adbc-federation")]
-        if let Some(func_support) = &self.base_table.function_support {
-            return Ok(filters
-                .iter()
-                .zip(base_results)
-                .map(|(filter, base_result)| {
-                    if func_support.supports(filter) {
-                        base_result
-                    } else {
-                        TableProviderFilterPushDown::Unsupported
-                    }
-                })
-                .collect());
-        }
-        Ok(base_results)
+        // Filter pushdown — including the function-support policy — is handled by
+        // the base `SqlTable`.
+        self.base_table.supports_filters_pushdown(filters)
     }
 
     async fn scan(
