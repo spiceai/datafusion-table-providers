@@ -303,6 +303,7 @@ fn columns_meta_to_schema(
         };
         let column_is_binary = map_str_type_to_is_binary(&data_type);
         let column_is_enum = map_str_type_to_is_enum(&data_type);
+        let column_is_unsigned = map_str_type_to_is_unsigned(&data_type);
         let column_use_large_str_or_blob = map_str_type_to_use_large_str_or_blob(&data_type);
 
         let (precision, scale) = match column_type {
@@ -318,6 +319,7 @@ fn columns_meta_to_schema(
             column_type,
             column_is_binary,
             column_is_enum,
+            column_is_unsigned,
             column_use_large_str_or_blob,
             precision,
             scale,
@@ -338,7 +340,7 @@ fn map_str_type_to_column_type(column_name: &str, data_type: &str) -> Result<Col
         _ if data_type.starts_with("decimal") || data_type.starts_with("numeric") => {
             ColumnType::MYSQL_TYPE_DECIMAL
         }
-        // most types can have addtional information: unsigned, size, etc so we use starts_with
+        // most types can have additional information: unsigned, size, etc so we use starts_with
         _ if data_type.starts_with("tinyint") => ColumnType::MYSQL_TYPE_TINY,
         _ if data_type.starts_with("smallint") => ColumnType::MYSQL_TYPE_SHORT,
         _ if data_type.starts_with("int") => ColumnType::MYSQL_TYPE_LONG,
@@ -405,6 +407,13 @@ fn map_str_type_to_use_large_str_or_blob(data_type: &str) -> bool {
 
 fn map_str_type_to_is_enum(data_type: &str) -> bool {
     if data_type.starts_with("enum") {
+        return true;
+    }
+    false
+}
+
+fn map_str_type_to_is_unsigned(data_type: &str) -> bool {
+    if data_type.contains("unsigned") {
         return true;
     }
     false
