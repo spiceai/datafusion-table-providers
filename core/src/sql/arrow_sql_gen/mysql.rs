@@ -63,6 +63,9 @@ pub enum Error {
         "Encountered MySQL zero date '0000-00-00' in column '{column}' but mysql_zero_date_behavior is set to 'error'. Set mysql_zero_date_behavior to 'null' to coerce zero dates to NULL, or fix the source data."
     ))]
     ZeroDateEncountered { column: String },
+
+    #[snafu(display("Unsupported MySQL column type {mysql_type}"))]
+    UnsupportedColumnType { mysql_type: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -686,7 +689,12 @@ pub fn rows_to_arrow(
                         None => builder.append_null(),
                     }
                 }
-                _ => unimplemented!("Unsupported column type {:?}", mysql_type),
+                _ => {
+                    return UnsupportedColumnTypeSnafu {
+                        mysql_type: format!("{mysql_type:?}"),
+                    }
+                    .fail();
+                }
             }
         }
     }
@@ -789,9 +797,7 @@ pub fn map_column_to_data_type(
         | ColumnType::MYSQL_TYPE_TINY_BLOB
         | ColumnType::MYSQL_TYPE_MEDIUM_BLOB
         | ColumnType::MYSQL_TYPE_GEOMETRY
-        | ColumnType::MYSQL_TYPE_VECTOR => {
-            unimplemented!("Unsupported column type {:?}", column_type)
-        }
+        | ColumnType::MYSQL_TYPE_VECTOR => None,
     }
 }
 
@@ -852,5 +858,55 @@ fn handle_null_error<T>(
         Ok(val) => Ok(val),
         Err(FromValueError(Value::NULL)) => Ok(None),
         err => err,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression for https://github.com/spiceai/spiceai/issues/8363: unsupported MySQL
+    // column types (e.g. GEOMETRY) must return `None` so that schema inference can surface a
+    // graceful "Unsupported data type" error, rather than panicking the runtime worker via
+    // `unimplemented!()`.
+    #[test]
+    fn map_column_to_data_type_unsupported_returns_none() {
+        for column_type in [
+            ColumnType::MYSQL_TYPE_GEOMETRY,
+            ColumnType::MYSQL_TYPE_VECTOR,
+            ColumnType::MYSQL_TYPE_TYPED_ARRAY,
+            ColumnType::MYSQL_TYPE_UNKNOWN,
+            ColumnType::MYSQL_TYPE_LONG_BLOB,
+            ColumnType::MYSQL_TYPE_TINY_BLOB,
+            ColumnType::MYSQL_TYPE_MEDIUM_BLOB,
+        ] {
+            assert_eq!(
+                map_column_to_data_type(column_type, false, false, false, false, None, None),
+                None,
+                "expected None for unsupported column type {column_type:?}",
+            );
+        }
+    }
+
+    // Supported types must keep mapping to their existing Arrow types — proves the panic
+    // removal above did not change behavior for the types the connector already handles.
+    #[test]
+    fn map_column_to_data_type_supported_examples() {
+        let cases = [
+            (ColumnType::MYSQL_TYPE_TINY, DataType::Int8),
+            (ColumnType::MYSQL_TYPE_SHORT, DataType::Int16),
+            (ColumnType::MYSQL_TYPE_LONG, DataType::Int32),
+            (ColumnType::MYSQL_TYPE_LONGLONG, DataType::Int64),
+            (ColumnType::MYSQL_TYPE_FLOAT, DataType::Float32),
+            (ColumnType::MYSQL_TYPE_DOUBLE, DataType::Float64),
+            (ColumnType::MYSQL_TYPE_DATE, DataType::Date32),
+        ];
+        for (column_type, expected) in cases {
+            assert_eq!(
+                map_column_to_data_type(column_type, false, false, false, false, None, None),
+                Some(expected.clone()),
+                "unexpected mapping for {column_type:?}",
+            );
+        }
     }
 }
