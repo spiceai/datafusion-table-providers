@@ -212,10 +212,7 @@ macro_rules! append_integer_value {
             }
             .fail()?
         };
-        match $row
-            .get_ref($index)
-            .context(FailedToExtractRowValueSnafu)?
-        {
+        match $row.get_ref($index).context(FailedToExtractRowValueSnafu)? {
             ValueRef::Null => builder.append_null(),
             ValueRef::Real(value) => {
                 let as_i64 = integral_real_to_i64($index, value)?;
@@ -344,8 +341,11 @@ mod tests {
         // SQLite `round()` always returns REAL, even for an integral result; the
         // projected schema (e.g. from DataFusion's Spark-compatible `round`, which
         // preserves integer input types) can still say Int64.
-        let batch = query_to_arrow("SELECT round(5 / 2, 2) AS ratio", Some(int64_schema("ratio")))
-            .expect("integral REAL should decode into an Int64 column");
+        let batch = query_to_arrow(
+            "SELECT round(5 / 2, 2) AS ratio",
+            Some(int64_schema("ratio")),
+        )
+        .expect("integral REAL should decode into an Int64 column");
 
         assert_eq!(batch.schema().field(0).data_type(), &DataType::Int64);
         let col = batch
