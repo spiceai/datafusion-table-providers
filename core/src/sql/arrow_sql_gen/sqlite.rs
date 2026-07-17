@@ -26,7 +26,10 @@ use arrow::{
     },
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
-use rusqlite::{types::Type, Row, Rows};
+use rusqlite::{
+    types::{Type, ValueRef},
+    Row, Rows,
+};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -47,6 +50,11 @@ pub enum Error {
 
     #[snafu(display("Failed to extract column name: {source}"))]
     FailedToExtractColumnName { source: rusqlite::Error },
+
+    #[snafu(display(
+        "Failed to decode REAL value {value} at index {index} as an integer: the value has a fractional part or is out of range"
+    ))]
+    RealNotRepresentableAsInteger { index: usize, value: f64 },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -87,7 +95,9 @@ pub fn rows_to_arrow(
             // Refer to the rusqlite type handling documentation for more details:
             // https://github.com/rusqlite/rusqlite/blob/95680270eca6f405fb51f5fbe6a214aac5fdce58/src/types/mod.rs#L21C1-L22C75
             //
-            // `REAL` to integer: always returns an [`Error::InvalidColumnType`](crate::Error::InvalidColumnType) error.
+            // `REAL` to integer: decoded by `append_integer_value!` when the value is
+            //   exactly integral (SQLite computes e.g. `round()` in REAL even when the
+            //   plan schema says integer); a fractional REAL is a structured error.
             // `INTEGER` to float: casts using `as` operator. Never fails.
             // `REAL` to float: casts using `as` operator. Never fails.
 
@@ -186,6 +196,67 @@ macro_rules! append_value {
     }};
 }
 
+/// Appends a value into an integer-typed builder, tolerating SQLite's dynamic typing.
+///
+/// SQLite computes many numeric expressions in REAL even when DataFusion's plan
+/// schema says integer — e.g. SQLite's `round()` always returns REAL, while
+/// DataFusion's Spark-compatible `round` preserves integer input types. A REAL
+/// that is exactly integral decodes into the integer builder; a fractional or
+/// out-of-range REAL still fails with a structured error, because truncating it
+/// would silently corrupt data.
+macro_rules! append_integer_value {
+    ($builder:expr, $row:expr, $index:expr, $type:ty, $builder_type:ty) => {{
+        let Some(builder) = $builder.as_any_mut().downcast_mut::<$builder_type>() else {
+            FailedToDowncastBuilderSnafu {
+                sqlite_type: format!("{}", Type::Integer),
+            }
+            .fail()?
+        };
+        match $row
+            .get_ref($index)
+            .context(FailedToExtractRowValueSnafu)?
+        {
+            ValueRef::Null => builder.append_null(),
+            ValueRef::Real(value) => {
+                let as_i64 = integral_real_to_i64($index, value)?;
+                builder.append_value(i64_to_integer::<$type>($index, as_i64)?);
+            }
+            // INTEGER decodes with rusqlite's range checks; TEXT and BLOB keep
+            // failing with rusqlite's `InvalidColumnType`, as before.
+            _ => {
+                let value: Option<i64> = $row.get($index).context(FailedToExtractRowValueSnafu)?;
+                match value {
+                    Some(value) => builder.append_value(i64_to_integer::<$type>($index, value)?),
+                    None => builder.append_null(),
+                }
+            }
+        }
+    }};
+}
+
+/// Converts a REAL that is exactly integral to `i64`; errors on fractional,
+/// out-of-range, or non-finite values instead of truncating.
+fn integral_real_to_i64(index: usize, value: f64) -> Result<i64> {
+    // -2^63 and 2^63 are exactly representable as f64; `i64::MAX` is not, so the
+    // upper bound is an exclusive test against 2^63. NaN fails the `fract` test.
+    const I64_LOWER_INCLUSIVE: f64 = -9_223_372_036_854_775_808.0;
+    const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
+    ensure!(
+        value.fract() == 0.0 && (I64_LOWER_INCLUSIVE..I64_UPPER_EXCLUSIVE).contains(&value),
+        RealNotRepresentableAsIntegerSnafu { index, value }
+    );
+    #[allow(clippy::cast_possible_truncation)] // guarded above: integral and in range
+    Ok(value as i64)
+}
+
+/// Narrows an `i64` to the target integer type, mapping overflow to the same
+/// error rusqlite reports for out-of-range INTEGER reads.
+fn i64_to_integer<T: TryFrom<i64>>(index: usize, value: i64) -> Result<T> {
+    T::try_from(value)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
+        .context(FailedToExtractRowValueSnafu)
+}
+
 fn add_row_to_builders(
     row: &Row,
     arrow_types: &[DataType],
@@ -206,34 +277,17 @@ fn add_row_to_builders(
                 };
                 builder.append_null();
             }
-            DataType::Int8 => append_value!(builder, row, i, i8, Int8Builder, Type::Integer),
-            DataType::Int16 => append_value!(builder, row, i, i16, Int16Builder, Type::Integer),
-            DataType::Int32 => append_value!(builder, row, i, i32, Int32Builder, Type::Integer),
-            DataType::Int64 => append_value!(builder, row, i, i64, Int64Builder, Type::Integer),
-            DataType::UInt8 => append_value!(builder, row, i, u8, UInt8Builder, Type::Integer),
-            DataType::UInt16 => append_value!(builder, row, i, u16, UInt16Builder, Type::Integer),
-            DataType::UInt32 => append_value!(builder, row, i, u32, UInt32Builder, Type::Integer),
-            DataType::UInt64 => {
-                // rusqlite 0.40 removed the `FromSql` impl for `u64` (SQLite INTEGER is a
-                // signed 64-bit value). Read as i64 and convert; negative values are out of
-                // range for u64.
-                let Some(builder) = builder.as_any_mut().downcast_mut::<UInt64Builder>() else {
-                    return FailedToDowncastBuilderSnafu {
-                        sqlite_type: format!("{}", Type::Integer),
-                    }
-                    .fail();
-                };
-                let value: Option<i64> = row.get(i).context(FailedToExtractRowValueSnafu)?;
-                match value {
-                    Some(v) => {
-                        let u = u64::try_from(v)
-                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(i, v))
-                            .context(FailedToExtractRowValueSnafu)?;
-                        builder.append_value(u);
-                    }
-                    None => builder.append_null(),
-                }
-            }
+            DataType::Int8 => append_integer_value!(builder, row, i, i8, Int8Builder),
+            DataType::Int16 => append_integer_value!(builder, row, i, i16, Int16Builder),
+            DataType::Int32 => append_integer_value!(builder, row, i, i32, Int32Builder),
+            DataType::Int64 => append_integer_value!(builder, row, i, i64, Int64Builder),
+            DataType::UInt8 => append_integer_value!(builder, row, i, u8, UInt8Builder),
+            DataType::UInt16 => append_integer_value!(builder, row, i, u16, UInt16Builder),
+            DataType::UInt32 => append_integer_value!(builder, row, i, u32, UInt32Builder),
+            // `u64` also goes through the i64 intermediate: rusqlite 0.40 removed the
+            // `FromSql` impl for `u64` (SQLite INTEGER is a signed 64-bit value), and
+            // negative values are out of range for u64.
+            DataType::UInt64 => append_integer_value!(builder, row, i, u64, UInt64Builder),
 
             DataType::Boolean => {
                 append_value!(builder, row, i, bool, BooleanBuilder, Type::Integer)
@@ -264,5 +318,158 @@ fn map_column_type_to_data_type(column_type: Type) -> DataType {
         Type::Real => DataType::Float64,
         Type::Text => DataType::Utf8,
         Type::Blob => DataType::Binary,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, Int64Array, UInt64Array};
+    use rusqlite::Connection;
+
+    fn query_to_arrow(sql: &str, projected_schema: Option<SchemaRef>) -> Result<RecordBatch> {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite connection");
+        let mut stmt = conn.prepare(sql).expect("prepare statement");
+        let num_cols = stmt.column_count();
+        let rows = stmt.query([]).expect("execute query");
+        rows_to_arrow(rows, num_cols, projected_schema)
+    }
+
+    fn int64_schema(name: &str) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, true)]))
+    }
+
+    #[test]
+    fn integral_real_decodes_into_int64_column() {
+        // SQLite `round()` always returns REAL, even for an integral result; the
+        // projected schema (e.g. from DataFusion's Spark-compatible `round`, which
+        // preserves integer input types) can still say Int64.
+        let batch = query_to_arrow("SELECT round(5 / 2, 2) AS ratio", Some(int64_schema("ratio")))
+            .expect("integral REAL should decode into an Int64 column");
+
+        assert_eq!(batch.schema().field(0).data_type(), &DataType::Int64);
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 array");
+        assert_eq!(col.value(0), 2);
+    }
+
+    #[test]
+    fn fractional_real_into_integer_column_is_an_error() {
+        let err = query_to_arrow("SELECT 2.5 AS v", Some(int64_schema("v")))
+            .expect_err("fractional REAL must not silently truncate into an integer column");
+        assert!(
+            matches!(err, Error::RealNotRepresentableAsInteger { index: 0, .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn out_of_range_real_into_integer_column_is_an_error() {
+        let err = query_to_arrow("SELECT 1e19 AS v", Some(int64_schema("v")))
+            .expect_err("REAL beyond i64 range must error");
+        assert!(
+            matches!(err, Error::RealNotRepresentableAsInteger { index: 0, .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn mixed_integer_and_real_rows_decode_into_int64_column() {
+        // SQLite columns are dynamically typed: the same column can hold INTEGER in
+        // one row and REAL in the next.
+        let batch = query_to_arrow(
+            "SELECT v FROM (SELECT 2 AS v UNION ALL SELECT 3.0 ORDER BY 1)",
+            Some(int64_schema("v")),
+        )
+        .expect("mixed INTEGER/integral-REAL rows should decode");
+
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 array");
+        assert_eq!((col.value(0), col.value(1)), (2, 3));
+    }
+
+    #[test]
+    fn null_and_integral_real_decode_into_int64_column() {
+        let batch = query_to_arrow(
+            "SELECT v FROM (SELECT NULL AS v UNION ALL SELECT 4.0)",
+            Some(int64_schema("v")),
+        )
+        .expect("NULL and integral REAL should decode");
+
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 array");
+        assert!(col.is_null(0));
+        assert_eq!(col.value(1), 4);
+    }
+
+    #[test]
+    fn integral_real_decodes_into_uint64_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::UInt64, true)]));
+        let batch = query_to_arrow("SELECT 7.0 AS v", Some(schema))
+            .expect("integral REAL should decode into a UInt64 column");
+
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("UInt64 array");
+        assert_eq!(col.value(0), 7);
+    }
+
+    #[test]
+    fn negative_real_into_uint64_column_is_an_error() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::UInt64, true)]));
+        let err = query_to_arrow("SELECT -1.0 AS v", Some(schema))
+            .expect_err("negative value must be out of range for UInt64");
+        assert!(
+            matches!(err, Error::FailedToExtractRowValue { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn text_into_integer_column_still_fails_with_invalid_column_type() {
+        // A TEXT *first* row switches the whole column to Utf8 decoding (cast to the
+        // projected type happens downstream), so put the TEXT value in a later row:
+        // SQLite orders integers before text, so `1` establishes an Int64 builder.
+        let err = query_to_arrow(
+            "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 'abc' ORDER BY 1)",
+            Some(int64_schema("v")),
+        )
+        .expect_err("TEXT into an integer column must keep failing");
+        assert!(
+            matches!(
+                err,
+                Error::FailedToExtractRowValue {
+                    source: rusqlite::Error::InvalidColumnType(..)
+                }
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn i64_boundaries_round_trip_through_integer_decode() {
+        let batch = query_to_arrow(
+            "SELECT v FROM (SELECT -9223372036854775808 AS v UNION ALL SELECT 9223372036854775807 ORDER BY 1)",
+            Some(int64_schema("v")),
+        )
+        .expect("i64 boundary INTEGER values should decode");
+
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 array");
+        assert_eq!((col.value(0), col.value(1)), (i64::MIN, i64::MAX));
     }
 }
