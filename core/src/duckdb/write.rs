@@ -2,6 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fmt, sync::Arc};
 
 use crate::duckdb::DuckDB;
+use crate::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use crate::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use crate::sql::sql_provider_datafusion::expr;
 use crate::util::{
@@ -890,7 +891,58 @@ fn insert_overwrite(
         .context(super::UnableToCommitTransactionSnafu)
         .map_err(to_retriable_data_write_error)?;
 
+    if write_settings.checkpoint_on_write {
+        checkpoint_after_write(duckdb_conn, table_definition.name());
+    }
+
     Ok(num_rows)
+}
+
+/// Checkpoints the database after an overwrite completes.
+///
+/// A plain `CHECKPOINT` is tried first: it fails fast if other transactions
+/// hold the shared checkpoint lock and is free of side effects when the
+/// database is quiet. Only on failure does it escalate to `FORCE CHECKPOINT`,
+/// which waits for active transactions to finish while blocking new ones from
+/// starting — a stall bounded by the slowest in-flight query plus the
+/// checkpoint write itself, paid only when
+/// actually needed. Failures never fail the write: the data is already
+/// durably committed.
+fn checkpoint_after_write(duckdb_conn: &mut DuckDbConnection, table_name: &RelationName) {
+    // Error messages can span lines; keep log records single-line.
+    fn single_line(e: &duckdb::Error) -> String {
+        e.to_string().replace('\n', " ")
+    }
+
+    let start = std::time::Instant::now();
+    let force = match duckdb_conn.conn.execute_batch("CHECKPOINT") {
+        Ok(()) => false,
+        Err(checkpoint_err) => {
+            tracing::debug!(
+                "CHECKPOINT after overwrite of {table_name} could not run ({}); escalating to FORCE CHECKPOINT",
+                single_line(&checkpoint_err)
+            );
+            // A forced checkpoint waits for in-flight transactions, so its
+            // duration approximates how long other queries on this database
+            // were stalled behind the checkpoint.
+            match duckdb_conn.conn.execute_batch("FORCE CHECKPOINT") {
+                Ok(()) => true,
+                Err(force_err) => {
+                    tracing::warn!(
+                        duration_ms = start.elapsed().as_millis() as u64,
+                        "Failed to checkpoint DuckDB after overwrite of {table_name}: {}",
+                        single_line(&force_err),
+                    );
+                    return;
+                }
+            }
+        }
+    };
+    tracing::debug!(
+        force,
+        duration_ms = start.elapsed().as_millis() as u64,
+        "Checkpoint after overwrite of {table_name} complete"
+    );
 }
 
 #[allow(clippy::doc_markdown)]
@@ -2048,5 +2100,202 @@ mod test {
                 other => panic!("unexpected id {other}"),
             }
         }
+    }
+
+    /// Rows per overwrite generation. Must exceed DuckDB's row group size
+    /// (122,880) so the load writes row groups directly to the database file
+    /// and the WAL stays below the automatic-checkpoint threshold — the setup
+    /// where dropped generations leak without `checkpoint_on_write`.
+    const GROWTH_ROWS_PER_GEN: usize = 130_000;
+    const GROWTH_TABLES: usize = 3;
+    const GROWTH_CYCLES: usize = 8;
+
+    fn growth_schema() -> SchemaRef {
+        Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Utf8, false),
+        ]))
+    }
+
+    fn growth_batch(generation: usize) -> RecordBatch {
+        let ids = Int64Array::from_iter_values(0..GROWTH_ROWS_PER_GEN as i64);
+        let payloads = StringArray::from_iter_values(
+            (0..GROWTH_ROWS_PER_GEN)
+                .map(|i| format!("gen{generation:04}-row{i:07}-{:>24}", i % 977)),
+        );
+        RecordBatch::try_new(growth_schema(), vec![Arc::new(ids), Arc::new(payloads)])
+            .expect("should create growth record batch")
+    }
+
+    /// Runs a refresh-style workload: several logical tables backed by one
+    /// file-based pool, writes serialized by a single mutex, one overwrite
+    /// swap per table per cycle, with concurrent reader threads querying the
+    /// views throughout. Returns the database file size after the last cycle.
+    async fn run_overwrite_growth_workload(
+        db_path: &std::path::Path,
+        checkpoint_on_write: bool,
+    ) -> u64 {
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("duckdb.wal"));
+
+        let pool = Arc::new(
+            DuckDbConnectionPool::new_file(
+                db_path.to_str().expect("db path should be valid utf-8"),
+                &duckdb::AccessMode::ReadWrite,
+            )
+            .expect("should create file-backed pool"),
+        );
+
+        let table_definitions: Vec<Arc<TableDefinition>> = (0..GROWTH_TABLES)
+            .map(|i| {
+                Arc::new(TableDefinition::new(
+                    RelationName::new(format!("growth_t{i}")),
+                    growth_schema(),
+                ))
+            })
+            .collect();
+
+        let write_settings =
+            DuckDBWriteSettings::default().with_checkpoint_on_write(checkpoint_on_write);
+
+        let write_one = |table_definition: Arc<TableDefinition>, generation: usize| {
+            let pool = Arc::clone(&pool);
+            let write_settings = write_settings.clone();
+            async move {
+                let sink = DuckDBDataSink::new(
+                    pool,
+                    table_definition,
+                    InsertOp::Overwrite,
+                    None,
+                    growth_schema(),
+                )
+                .with_write_settings(write_settings);
+                let stream = Box::pin(
+                    MemoryStream::try_new(vec![growth_batch(generation)], growth_schema(), None)
+                        .expect("to get stream"),
+                );
+                let data_sink: Arc<dyn DataSink> = Arc::new(sink);
+                data_sink
+                    .write_all(stream, &Arc::new(TaskContext::default()))
+                    .await
+                    .expect("overwrite should succeed");
+            }
+        };
+
+        // Initial generation for every table so the reader views exist.
+        for table_definition in &table_definitions {
+            write_one(Arc::clone(table_definition), 0).await;
+        }
+
+        // Concurrent readers: dedicated connections from the same pool query
+        // the views continuously. Errors are ignored — a query racing the
+        // view swap is fine.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_handles: Vec<std::thread::JoinHandle<()>> = (0..2)
+            .map(|reader_idx| {
+                let pool = Arc::clone(&pool);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut conn = pool.connect_sync().expect("reader should connect");
+                    let duckdb = DuckDB::duckdb_conn(&mut conn).expect("reader duckdb conn");
+                    let mut i = reader_idx;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let table = format!("growth_t{}", i % GROWTH_TABLES);
+                        let _ = duckdb.conn.query_row(
+                            &format!("SELECT count(*), max(payload) FROM {table}"),
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        );
+                        i += 1;
+                    }
+                })
+            })
+            .collect();
+
+        // Single mutex serializing all writes to the shared file, mirroring
+        // the accelerator's per-file write serialization.
+        let write_mutex = Arc::new(tokio::sync::Mutex::new(()));
+
+        for cycle in 1..=GROWTH_CYCLES {
+            for table_definition in &table_definitions {
+                let _guard = write_mutex.lock().await;
+                write_one(Arc::clone(table_definition), cycle).await;
+            }
+            let size = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+            tracing::info!(
+                "growth workload (checkpoint_on_write={checkpoint_on_write}) cycle {cycle}: file={:.1}MB",
+                size as f64 / 1e6
+            );
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for handle in reader_handles {
+            handle.join().expect("reader thread should join");
+        }
+
+        // Correctness: every view must hold exactly the last generation.
+        let mut conn = Arc::clone(&pool).connect_sync().expect("to connect");
+        let duckdb = DuckDB::duckdb_conn(&mut conn).expect("to get duckdb conn");
+        for (i, _) in table_definitions.iter().enumerate() {
+            let (count, latest_gen_rows) = duckdb
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT count(*), sum(CASE WHEN payload LIKE 'gen{GROWTH_CYCLES:04}-%' THEN 1 ELSE 0 END) FROM growth_t{i}"
+                    ),
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .expect("to count view rows");
+            assert_eq!(
+                count, GROWTH_ROWS_PER_GEN as i64,
+                "growth_t{i} should hold exactly one generation of rows"
+            );
+            assert_eq!(
+                latest_gen_rows, GROWTH_ROWS_PER_GEN as i64,
+                "growth_t{i} should hold the latest generation"
+            );
+        }
+
+        std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Upper bound for the database file after the checkpointed workload.
+    /// The live working set is ~8MB (one ~2.5MB generation per table); without
+    /// `checkpoint_on_write` each cycle leaks ~one generation per table and the
+    /// file reaches ~48MB after [`GROWTH_CYCLES`] cycles, crossing this bound
+    /// by the second cycle.
+    const GROWTH_MAX_CHECKPOINTED_FILE_SIZE: u64 = 16_000_000;
+
+    /// Repeated overwrite swaps (create new generation → repoint view → drop
+    /// old generation) leak dropped generations unless the database is
+    /// checkpointed; verifies `checkpoint_on_write` keeps the file bounded
+    /// near the live working set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_checkpoint_on_write_bounds_overwrite_growth() {
+        let _guard = init_tracing(None);
+        let db_path = std::env::temp_dir().join(format!(
+            "dftp_growth_{}_{:x}.duckdb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should advance")
+                .as_nanos()
+        ));
+
+        let final_size = run_overwrite_growth_workload(&db_path, true).await;
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("duckdb.wal"));
+
+        tracing::info!(
+            "growth workload with checkpoint_on_write finished at {:.1}MB",
+            final_size as f64 / 1e6,
+        );
+
+        assert!(
+            final_size < GROWTH_MAX_CHECKPOINTED_FILE_SIZE,
+            "expected checkpointed file ({final_size} bytes) to stay under \
+             {GROWTH_MAX_CHECKPOINTED_FILE_SIZE} bytes"
+        );
     }
 }
