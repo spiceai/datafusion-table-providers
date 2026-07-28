@@ -65,7 +65,7 @@ impl DuckDBWriteSettings {
                 "false" | "disabled" => false,
                 _ => {
                     tracing::warn!(
-                "Invalid value for checkpoint on write parameter: '{value}'. Expected 'enabled' or 'disabled'. Using default: {}",
+                "Invalid value for checkpoint on write parameter: '{value}'. Expected one of 'enabled', 'disabled', 'true', 'false'. Using default: {}",
                 settings.checkpoint_on_write
                 );
                     settings.checkpoint_on_write

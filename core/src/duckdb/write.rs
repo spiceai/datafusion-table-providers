@@ -856,7 +856,8 @@ fn insert_overwrite(
 /// hold the shared checkpoint lock and is free of side effects when the
 /// database is quiet. Only on failure does it escalate to `FORCE CHECKPOINT`,
 /// which waits for active transactions to finish while blocking new ones from
-/// starting — a stall bounded by the slowest in-flight query, paid only when
+/// starting — a stall bounded by the slowest in-flight query plus the
+/// checkpoint write itself, paid only when
 /// actually needed. Failures never fail the write: the data is already
 /// durably committed.
 fn checkpoint_after_write(duckdb_conn: &mut DuckDbConnection, table_name: &RelationName) {
@@ -2236,6 +2237,7 @@ mod test {
 
         let final_size = run_overwrite_growth_workload(&db_path, true).await;
         let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("duckdb.wal"));
 
         tracing::info!(
             "growth workload with checkpoint_on_write finished at {:.1}MB",
