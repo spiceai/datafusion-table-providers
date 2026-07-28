@@ -5,7 +5,7 @@ use snafu::{prelude::*, ResultExt};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use super::{
-    dbconnection::duckdbconn::{DuckDBAttachments, DuckDBParameter},
+    dbconnection::duckdbconn::{file_identity, DuckDBAttachments, DuckDBParameter, FileIdentity},
     runtime::run_async_with_tokio,
     DbConnectionPool, Mode, Result,
 };
@@ -127,6 +127,7 @@ impl DuckDbConnectionPoolBuilder {
             state: Arc::new(RwLock::new(Arc::new(PoolState {
                 pool,
                 physical_path: ":memory:".into(),
+                physical_identity: None,
             }))),
             write_gate: Arc::new(RwLock::new(())),
             instance_setup_queries: Arc::new(Mutex::new(self.instance_setup_queries)),
@@ -162,6 +163,7 @@ impl DuckDbConnectionPoolBuilder {
             path: self.path.as_str().into(),
             state: Arc::new(RwLock::new(Arc::new(PoolState {
                 pool,
+                physical_identity: file_identity(&self.path),
                 physical_path: self.path.as_str().into(),
             }))),
             write_gate: Arc::new(RwLock::new(())),
@@ -199,7 +201,15 @@ impl DuckDbConnectionPoolBuilder {
 struct PoolState {
     pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
     physical_path: Arc<str>,
+    /// `(device, inode)` of `physical_path` as it was when this instance opened
+    /// it. A file swap compares this against the file currently at the path
+    /// before unlinking it, so it can never destroy a file some *other*
+    /// mechanism (a snapshot restore, an operator, a future replacement path)
+    /// put there in the meantime. `None` on platforms without inode identity,
+    /// where the check is skipped.
+    physical_identity: Option<FileIdentity>,
 }
+
 
 /// The r2d2 settings needed to rebuild an equivalent pool over a new database
 /// file during a file swap.
@@ -264,6 +274,23 @@ impl DuckDbConnectionPool {
     #[must_use]
     pub fn physical_path(&self) -> Arc<str> {
         Arc::clone(&self.load_state().physical_path)
+    }
+
+    /// Whether the file currently at this pool's physical path is still the same
+    /// file the backing instance opened.
+    ///
+    /// Returns `false` only when the identity is known and has changed — i.e.
+    /// something replaced the database file out-of-band. `true` when the pool is
+    /// in-memory, when the platform has no inode identity, or when the path
+    /// cannot be stat'ed, so callers treat "unknown" as "unchanged" and rely on
+    /// their other safeguards.
+    #[must_use]
+    pub fn physical_file_unchanged(&self) -> bool {
+        let state = self.load_state();
+        let Some(expected) = state.physical_identity else {
+            return true;
+        };
+        file_identity(&state.physical_path).is_none_or(|actual| actual == expected)
     }
 
     fn load_state(&self) -> Arc<PoolState> {
@@ -350,6 +377,7 @@ impl DuckDbConnectionPool {
 
         let new_state = Arc::new(PoolState {
             pool,
+            physical_identity: file_identity(new_path),
             physical_path: new_path.into(),
         });
 

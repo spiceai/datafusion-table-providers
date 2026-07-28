@@ -17,7 +17,6 @@ use duckdb::vtab::to_duckdb_type_id;
 use duckdb::ToSql;
 use duckdb::{Connection, DuckdbConnectionManager};
 use dyn_clone::DynClone;
-use once_cell::sync::OnceCell;
 use rand::distr::{Alphanumeric, SampleString};
 use snafu::{prelude::*, ResultExt};
 use tokio::sync::mpsc::Sender;
@@ -64,15 +63,62 @@ impl<T: ToSql + Sync + Send + DynClone> DuckDBSyncParameter for T {
 dyn_clone::clone_trait_object!(DuckDBSyncParameter);
 pub type DuckDBParameter = Box<dyn DuckDBSyncParameter>;
 
+/// Filesystem identity of a file, used to detect that a path now refers to a
+/// *different* file than the one previously opened or attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+/// Reads the identity of the file at `path`, or `None` if it cannot be
+/// determined (missing file, or a platform without inode identity).
+#[must_use]
+pub fn file_identity(path: &str) -> Option<FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// The `search_path` established by a successful attach, together with the
+/// identity each attached file had at that moment.
+///
+/// `ATTACH` binds a path to a file once per DuckDB instance and never
+/// re-resolves it — and `ATTACH IF NOT EXISTS` is a no-op once the attachment
+/// exists — so an instance that attached a file which was later replaced keeps
+/// reading the retired file indefinitely. Comparing identities detects that.
+///
+/// The comparison cannot false-positive: the attaching instance holds the old
+/// file open, so the OS cannot recycle its inode while it is attached. A
+/// differing identity therefore always means the path was genuinely replaced.
+#[derive(Debug)]
+struct AttachedState {
+    search_path: Arc<str>,
+    identities: Vec<(Arc<str>, Option<FileIdentity>)>,
+}
+
 /// Configuration and state for attaching external DuckDB databases.
 #[derive(Debug)]
 pub struct DuckDBAttachments {
     attachments: HashSet<Arc<str>>,
     random_id: String,
     main_db: String,
-    /// Cached search_path after first successful attachments initialization.
-    /// Uses OnceCell to ensure attachment happens exactly once.
-    search_path_cache: OnceCell<Arc<str>>,
+    /// Cached `search_path` from the last successful attach, plus the identity
+    /// each attached file had then. Unlike a plain `OnceCell` this can be
+    /// invalidated: if an attached file is replaced on disk, the next use
+    /// detaches and re-attaches so queries stop reading the retired file.
+    attached: std::sync::Mutex<Option<AttachedState>>,
 }
 
 impl DuckDBAttachments {
@@ -85,8 +131,20 @@ impl DuckDBAttachments {
             attachments,
             random_id,
             main_db: main_db.to_string(),
-            search_path_cache: OnceCell::new(),
+            attached: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Current identity of every attached path, sorted by path so the result is
+    /// comparable across calls without depending on set iteration order.
+    fn attachment_identities(&self) -> Vec<(Arc<str>, Option<FileIdentity>)> {
+        let mut identities: Vec<(Arc<str>, Option<FileIdentity>)> = self
+            .attachments
+            .iter()
+            .map(|db| (Arc::clone(db), file_identity(db)))
+            .collect();
+        identities.sort_by(|(a, _), (b, _)| a.cmp(b));
+        identities
     }
 
     /// Returns a reference to the set of database paths to attach.
@@ -227,15 +285,53 @@ impl DuckDBAttachments {
     }
 
     /// Lazily attaches databases on first call, then applies search_path to the connection.
-    /// Uses cached search_path on subsequent calls.
+    /// Uses the cached search_path on subsequent calls.
+    ///
+    /// If an attached database file has been replaced on disk since the cached
+    /// attach was established — a different file now sits at the same path, as
+    /// a database file swap or a snapshot restore produces — the stale
+    /// attachment still resolves to the retired file, so it is detached and
+    /// re-attached first and queries observe the current file.
     ///
     /// # Errors
     ///
     /// Returns an error if attachment or search_path setting fails.
     pub fn attach_once(&self, conn: &Connection) -> Result<()> {
-        let search_path = self
-            .search_path_cache
-            .get_or_try_init(|| self.attach(conn))?;
+        let identities = self.attachment_identities();
+
+        let search_path = {
+            let mut attached = self
+                .attached
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            match attached.as_ref() {
+                Some(state) if state.identities == identities => Arc::clone(&state.search_path),
+                state => {
+                    if state.is_some() {
+                        tracing::debug!(
+                            "Re-attaching DuckDB databases {:?}: an attached file was replaced on disk",
+                            self.attachments
+                        );
+                        // A failed detach leaves the stale attachment in place;
+                        // `attach` below then reuses it and the retry happens on
+                        // the next checkout. Erroring here would fail a query
+                        // over what is a recoverable staleness condition.
+                        if let Err(e) = self.detach(conn) {
+                            tracing::warn!(
+                                "Failed to detach replaced DuckDB databases; queries may read pre-replacement data until the next attempt: {e}"
+                            );
+                        }
+                    }
+                    let search_path = self.attach(conn)?;
+                    *attached = Some(AttachedState {
+                        search_path: Arc::clone(&search_path),
+                        identities,
+                    });
+                    search_path
+                }
+            }
+        };
 
         conn.execute(&format!("SET search_path = '{}'", search_path), [])
             .context(DuckDBConnectionSnafu)?;

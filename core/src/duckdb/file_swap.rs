@@ -848,6 +848,21 @@ fn complete_swap(
     let configured_path = pool.db_path().to_string();
     let old_physical = pool.physical_path().to_string();
 
+    // Refuse to unlink a file this pool does not own. The swap is not the only
+    // mechanism that can replace the database file — a snapshot restore does too,
+    // out-of-band and on its own schedule — and unlinking whatever happens to sit
+    // at the configured path would silently destroy the other mechanism's file,
+    // leaving the pool and the path resolving to different data. Aborting is
+    // retriable: the staging file is cleaned up and the refresh runs again
+    // against whatever is now the live file.
+    if !pool.physical_file_unchanged() {
+        return Err(to_retriable_data_write_error(
+            super::Error::FileSwapFileReplaced {
+                path: old_physical.clone(),
+            },
+        ));
+    }
+
     std::fs::rename(building_path, generation_path)
         .context(super::UnableToCompleteFileSwapSnafu {
             path: building_path.to_string(),
@@ -905,6 +920,13 @@ fn complete_swap(
     pool.swap_database_file(&target)
         .context(super::DbConnectionPoolSnafu)
         .map_err(to_datafusion_error)?;
+
+    // Other DuckDB instances that `ATTACH`ed this path resolved it to the file
+    // just retired, and `ATTACH IF NOT EXISTS` never re-resolves it. Those
+    // instances notice the replacement themselves on their next checkout (see
+    // `DuckDBAttachments::attach_once`, which compares the attached files'
+    // identities), so cross-instance reads converge on the new file rather than
+    // serving pre-swap data until the process restarts.
 
     tracing::info!(
         "Completed DuckDB database file swap for {configured_path}: refreshed data now served from {target}"
@@ -967,6 +989,17 @@ mod tests {
         definition: &Arc<TableDefinition>,
         rows: &[(i64, &str)],
     ) {
+        let written = try_overwrite_with_swap(pool, definition, rows)
+            .await
+            .expect("overwrite with file swap to succeed");
+        assert_eq!(written, rows.len() as u64);
+    }
+
+    async fn try_overwrite_with_swap(
+        pool: &Arc<DuckDbConnectionPool>,
+        definition: &Arc<TableDefinition>,
+        rows: &[(i64, &str)],
+    ) -> DataFusionResult<u64> {
         let sink = DuckDBDataSink::new(
             Arc::clone(pool),
             Arc::clone(definition),
@@ -985,11 +1018,9 @@ mod tests {
             .expect("stream"),
         );
 
-        let written = Arc::new(sink)
+        Arc::new(sink)
             .write_all(stream, &Arc::new(TaskContext::default()))
             .await
-            .expect("overwrite with file swap to succeed");
-        assert_eq!(written, rows.len() as u64);
     }
 
     fn count(conn: &Connection, sql: &str) -> i64 {
@@ -1157,6 +1188,119 @@ mod tests {
 
         let conn = pooled_raw_connection(&pool);
         assert_eq!(count(&conn, "SELECT COUNT(1) FROM swap_ds"), 1);
+    }
+
+    /// The swap is not the only mechanism that replaces the database file — a
+    /// snapshot restore does too, out-of-band. If something else has replaced the
+    /// file since this pool opened it, the swap must abort rather than unlink the
+    /// replacement and rename its own generation over it (which would leave the
+    /// pool and the configured path resolving to different data).
+    #[tokio::test]
+    async fn test_overwrite_file_swap_aborts_when_file_replaced_out_of_band() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join("replaced.db")
+            .to_string_lossy()
+            .to_string();
+
+        let pool = Arc::new(
+            DuckDbConnectionPoolBuilder::file(&db_path)
+                .with_access_mode(AccessMode::ReadWrite)
+                .build()
+                .expect("pool"),
+        );
+        assert!(
+            pool.physical_file_unchanged(),
+            "a freshly opened pool owns its file"
+        );
+
+        // Something else replaces the configured path with a different file,
+        // exactly as a snapshot restore would.
+        let replacement = dir.path().join("restored.db");
+        {
+            let conn = Connection::open(&replacement).expect("open replacement");
+            conn.execute_batch(
+                "CREATE TABLE restored_marker (v INTEGER); INSERT INTO restored_marker VALUES (7);",
+            )
+            .expect("seed replacement");
+        }
+        std::fs::rename(&replacement, &db_path).expect("replace the live file");
+
+        assert!(
+            !pool.physical_file_unchanged(),
+            "the pool must notice its file was replaced"
+        );
+
+        let definition = swap_dataset_definition();
+        let err = try_overwrite_with_swap(&pool, &definition, &[(1, "one")])
+            .await
+            .expect_err("the swap must refuse to overwrite a replaced file");
+        assert!(
+            err.to_string().contains("replaced by another process"),
+            "unexpected error: {err}"
+        );
+
+        // The replacement survived untouched, and no swap debris was left.
+        let conn = Connection::open(&db_path).expect("open replaced file");
+        assert_eq!(count(&conn, "SELECT COUNT(1) FROM restored_marker"), 1);
+        drop(conn);
+        assert!(
+            swap_artifacts_in(dir.path()).is_empty(),
+            "a refused swap must not leave debris: {:?}",
+            swap_artifacts_in(dir.path())
+        );
+    }
+
+    /// `ATTACH` resolves a path to a file once per instance and `ATTACH IF NOT
+    /// EXISTS` never re-resolves it, so an instance that attached a file which
+    /// was later replaced would keep reading the retired file until the process
+    /// restarted. `attach_once` must notice the replacement and re-attach.
+    #[tokio::test]
+    async fn test_attach_once_reattaches_replaced_database_file() {
+        use crate::sql::db_connection_pool::dbconnection::duckdbconn::DuckDBAttachments;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main_path = dir.path().join("main.db").to_string_lossy().to_string();
+        let peer_path = dir.path().join("peer.db").to_string_lossy().to_string();
+
+        // The peer database that `main` attaches, seeded with one row.
+        {
+            let conn = Connection::open(&peer_path).expect("open peer");
+            conn.execute_batch(
+                "CREATE TABLE peer_data (v INTEGER); INSERT INTO peer_data VALUES (1);",
+            )
+            .expect("seed peer");
+        }
+
+        let main = Connection::open(&main_path).expect("open main");
+        let attachments =
+            DuckDBAttachments::new("main", &[Arc::from(peer_path.as_str()) as Arc<str>]);
+
+        attachments.attach_once(&main).expect("initial attach");
+        assert_eq!(count(&main, "SELECT COUNT(1) FROM peer_data"), 1);
+
+        // Replace the peer file with a different file holding three rows —
+        // the same rename-over-the-path shape a file swap produces.
+        let replacement = dir.path().join("peer_new.db");
+        {
+            let conn = Connection::open(&replacement).expect("open replacement peer");
+            conn.execute_batch(
+                "CREATE TABLE peer_data (v INTEGER); INSERT INTO peer_data VALUES (1), (2), (3);",
+            )
+            .expect("seed replacement peer");
+        }
+        std::fs::rename(&replacement, &peer_path).expect("replace peer file");
+
+        // Without re-resolution this would still read the retired file (1 row).
+        attachments
+            .attach_once(&main)
+            .expect("re-attach after replacement");
+        assert_eq!(
+            count(&main, "SELECT COUNT(1) FROM peer_data"),
+            3,
+            "attachment must be re-resolved to the replacement file"
+        );
     }
 
     #[test]

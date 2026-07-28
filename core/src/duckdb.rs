@@ -204,6 +204,12 @@ pub enum Error {
     FileSwapWalPresent { path: String },
 
     #[snafu(display(
+        "The DuckDB database file {path} was replaced by another process or mechanism while a file swap was in progress. \
+        The swap was aborted rather than overwrite the replacement; the refresh will run again against the current file."
+    ))]
+    FileSwapFileReplaced { path: String },
+
+    #[snafu(display(
         "Failed to register Arrow scan view to build table creation statement: {source}"
     ))]
     UnableToRegisterArrowScanViewForTableCreation { source: duckdb::Error },
