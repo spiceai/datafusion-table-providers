@@ -2203,8 +2203,8 @@ mod test {
     /// The live working set is ~8MB (one ~2.5MB generation per table); without
     /// `checkpoint_on_write` each cycle leaks ~one generation per table and the
     /// file reaches ~48MB after [`GROWTH_CYCLES`] cycles, crossing this bound
-    /// by the fourth cycle.
-    const GROWTH_MAX_CHECKPOINTED_FILE_SIZE: u64 = 20_000_000;
+    /// by the second cycle.
+    const GROWTH_MAX_CHECKPOINTED_FILE_SIZE: u64 = 16_000_000;
 
     /// Repeated overwrite swaps (create new generation → repoint view → drop
     /// old generation) leak dropped generations unless the database is
