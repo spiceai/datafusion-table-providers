@@ -866,31 +866,31 @@ fn checkpoint_after_write(duckdb_conn: &mut DuckDbConnection, table_name: &Relat
     }
 
     let start = std::time::Instant::now();
-    let mut escalation_reason: Option<String> = None;
     let force = match duckdb_conn.conn.execute_batch("CHECKPOINT") {
         Ok(()) => false,
-        // A forced checkpoint waits for in-flight transactions, so its
-        // duration approximates how long other queries on this database were
-        // stalled behind the checkpoint.
-        Err(checkpoint_err) => match duckdb_conn.conn.execute_batch("FORCE CHECKPOINT") {
-            Ok(()) => {
-                escalation_reason = Some(single_line(&checkpoint_err));
-                true
+        Err(checkpoint_err) => {
+            tracing::debug!(
+                "CHECKPOINT after overwrite of {table_name} could not run ({}); escalating to FORCE CHECKPOINT",
+                single_line(&checkpoint_err)
+            );
+            // A forced checkpoint waits for in-flight transactions, so its
+            // duration approximates how long other queries on this database
+            // were stalled behind the checkpoint.
+            match duckdb_conn.conn.execute_batch("FORCE CHECKPOINT") {
+                Ok(()) => true,
+                Err(force_err) => {
+                    tracing::warn!(
+                        duration_ms = start.elapsed().as_millis() as u64,
+                        "Failed to checkpoint DuckDB after overwrite of {table_name}: {}",
+                        single_line(&force_err),
+                    );
+                    return;
+                }
             }
-            Err(force_err) => {
-                tracing::warn!(
-                    duration_ms = start.elapsed().as_millis() as u64,
-                    "Failed to checkpoint DuckDB after overwrite of {table_name}: CHECKPOINT failed with '{}'; FORCE CHECKPOINT failed with '{}'",
-                    single_line(&checkpoint_err),
-                    single_line(&force_err),
-                );
-                return;
-            }
-        },
+        }
     };
     tracing::debug!(
         force,
-        escalation_reason = escalation_reason.as_deref(),
         duration_ms = start.elapsed().as_millis() as u64,
         "Checkpoint after overwrite of {table_name} complete"
     );
