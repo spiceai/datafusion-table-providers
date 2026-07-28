@@ -860,18 +860,29 @@ fn insert_overwrite(
 /// actually needed. Failures never fail the write: the data is already
 /// durably committed.
 fn checkpoint_after_write(duckdb_conn: &mut DuckDbConnection, table_name: &RelationName) {
+    // Error messages can span lines; keep log records single-line.
+    fn single_line(e: &duckdb::Error) -> String {
+        e.to_string().replace('\n', " ")
+    }
+
     let start = std::time::Instant::now();
+    let mut escalation_reason: Option<String> = None;
     let force = match duckdb_conn.conn.execute_batch("CHECKPOINT") {
         Ok(()) => false,
         // A forced checkpoint waits for in-flight transactions, so its
         // duration approximates how long other queries on this database were
         // stalled behind the checkpoint.
-        Err(_) => match duckdb_conn.conn.execute_batch("FORCE CHECKPOINT") {
-            Ok(()) => true,
-            Err(e) => {
+        Err(checkpoint_err) => match duckdb_conn.conn.execute_batch("FORCE CHECKPOINT") {
+            Ok(()) => {
+                escalation_reason = Some(single_line(&checkpoint_err));
+                true
+            }
+            Err(force_err) => {
                 tracing::warn!(
                     duration_ms = start.elapsed().as_millis() as u64,
-                    "Failed to checkpoint DuckDB after overwrite of {table_name}: {e}"
+                    "Failed to checkpoint DuckDB after overwrite of {table_name}: CHECKPOINT failed with '{}'; FORCE CHECKPOINT failed with '{}'",
+                    single_line(&checkpoint_err),
+                    single_line(&force_err),
                 );
                 return;
             }
@@ -879,6 +890,7 @@ fn checkpoint_after_write(duckdb_conn: &mut DuckDbConnection, table_name: &Relat
     };
     tracing::debug!(
         force,
+        escalation_reason = escalation_reason.as_deref(),
         duration_ms = start.elapsed().as_millis() as u64,
         "Checkpoint after overwrite of {table_name} complete"
     );
