@@ -50,11 +50,13 @@ use self::sql_table::DuckDBTable;
 mod federation;
 
 mod creator;
+mod file_swap;
 mod settings;
 pub mod sql_table;
 pub mod write;
 pub mod write_settings;
 pub use creator::{RelationName, TableDefinition, TableManager, ViewCreator};
+pub use file_swap::{recover_database_file_generations, SwapFileRecovery};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -168,6 +170,38 @@ pub enum Error {
 
     #[snafu(display("Failed to register Arrow scan view for DuckDB ingestion: {source}"))]
     UnableToRegisterArrowScanView { source: duckdb::Error },
+
+    #[snafu(display("Failed to prepare the DuckDB database file swap ({path}): {source}"))]
+    UnableToPrepareFileSwap {
+        path: String,
+        source: std::io::Error,
+    },
+
+    #[snafu(display(
+        "Failed to open the staging database file for the DuckDB file swap ({path}): {source}"
+    ))]
+    UnableToOpenSwapStaging { path: String, source: duckdb::Error },
+
+    #[snafu(display("Failed to checkpoint the staging database file for the DuckDB file swap ({path}): {source}"))]
+    UnableToCheckpointSwapStaging { path: String, source: duckdb::Error },
+
+    #[snafu(display("Failed to copy the live database contents during the DuckDB file swap ({detail}): {source}"))]
+    UnableToCopyLiveDatabase {
+        detail: String,
+        source: duckdb::Error,
+    },
+
+    #[snafu(display("Failed to complete the DuckDB database file swap ({path}): {source}"))]
+    UnableToCompleteFileSwap {
+        path: String,
+        source: std::io::Error,
+    },
+
+    #[snafu(display(
+        "A write-ahead log file unexpectedly exists next to the DuckDB file swap staging database ({path}). \
+        The swap was aborted; the live database file is unchanged."
+    ))]
+    FileSwapWalPresent { path: String },
 
     #[snafu(display(
         "Failed to register Arrow scan view to build table creation statement: {source}"
@@ -485,6 +519,13 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
                 .with_indexes(indexes.clone());
 
         let pool = Arc::new(pool);
+        // Record the instance-scoped SET statements on the shared pool so a
+        // database file swap can replay them on the replacement instance
+        // (instance-scoped settings do not survive an instance change).
+        pool.record_instance_setup_queries(
+            self.settings_registry
+                .get_setting_statements(&options, DuckDBSettingScope::Global),
+        );
         make_initial_table(Arc::new(table_definition.clone()), &pool)?;
 
         let write_settings = DuckDBWriteSettings::from_params(&options);
@@ -755,6 +796,11 @@ pub(crate) fn make_initial_table(
     table_definition: Arc<TableDefinition>,
     pool: &Arc<DuckDbConnectionPool>,
 ) -> DataFusionResult<()> {
+    let write_gate = pool.write_gate();
+    let _write_guard = write_gate
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     let cloned_pool = Arc::clone(pool);
     let mut db_conn = Arc::clone(&cloned_pool)
         .connect_sync()

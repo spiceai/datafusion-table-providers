@@ -6,12 +6,18 @@ pub struct DuckDBWriteSettings {
     /// Whether to execute ANALYZE statements after data write operations
     /// to update table statistics for query optimization
     pub recompute_statistics_on_write: bool,
+    /// Whether an `InsertOp::Overwrite` on a file-backed instance writes into a
+    /// fresh database file and atomically swaps it in (reclaiming disk space
+    /// and leaving a checkpointed, WAL-free file) instead of rewriting the
+    /// table inside the live file. See [`crate::duckdb::file_swap`].
+    pub overwrite_file_swap: bool,
 }
 
 impl Default for DuckDBWriteSettings {
     fn default() -> Self {
         Self {
             recompute_statistics_on_write: true, // Enabled by default for better query performance
+            overwrite_file_swap: false,
         }
     }
 }
@@ -30,6 +36,13 @@ impl DuckDBWriteSettings {
         self
     }
 
+    /// Set whether overwrites swap in a freshly written database file
+    #[must_use]
+    pub fn with_overwrite_file_swap(mut self, enabled: bool) -> Self {
+        self.overwrite_file_swap = enabled;
+        self
+    }
+
     /// Parse settings from  table creation parameters
     #[must_use]
     pub fn from_params(params: &HashMap<String, String>) -> Self {
@@ -45,6 +58,20 @@ impl DuckDBWriteSettings {
                 settings.recompute_statistics_on_write
                 );
                     settings.recompute_statistics_on_write
+                }
+            };
+        }
+
+        if let Some(value) = params.get("overwrite_file_swap") {
+            settings.overwrite_file_swap = match value.to_lowercase().as_str() {
+                "true" | "enabled" => true,
+                "false" | "disabled" => false,
+                _ => {
+                    tracing::warn!(
+                        "Invalid value for overwrite file swap parameter: '{value}'. Expected 'enabled' or 'disabled'. Using default: {}",
+                        settings.overwrite_file_swap
+                    );
+                    settings.overwrite_file_swap
                 }
             };
         }

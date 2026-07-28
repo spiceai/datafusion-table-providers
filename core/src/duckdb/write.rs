@@ -34,8 +34,10 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 
 use super::creator::{TableDefinition, TableManager, ViewCreator};
+use super::file_swap;
 use super::write_settings::DuckDBWriteSettings;
 use super::{to_datafusion_error, RelationName};
+use crate::sql::db_connection_pool::Mode;
 
 /// A callback handler that is invoked after data has been successfully written to a DuckDB table
 /// but before the transaction is committed.
@@ -309,6 +311,11 @@ impl DeletionSink for DuckDBDeletionSink {
 
         tokio::task::spawn_blocking(
             move || -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+                let write_gate = pool.write_gate();
+                let _write_guard = write_gate
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+
                 let mut db_conn = pool.connect_sync()?;
                 let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)?;
                 let tx = duckdb_conn.conn.transaction()?;
@@ -348,6 +355,11 @@ impl UpdateSink for DuckDBUpdateSink {
 
         tokio::task::spawn_blocking(
             move || -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+                let write_gate = pool.write_gate();
+                let _write_guard = write_gate
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+
                 let mut db_conn = pool.connect_sync()?;
                 let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)?;
                 let tx = duckdb_conn.conn.transaction()?;
@@ -415,16 +427,36 @@ impl DataSink for DuckDBDataSink {
         let duckdb_write_handle: JoinHandle<datafusion::common::Result<u64>> =
             tokio::task::spawn_blocking(move || {
                 let num_rows = match overwrite {
-                    InsertOp::Overwrite => insert_overwrite(
-                        pool,
-                        &table_definition,
-                        batch_rx,
-                        on_conflict.as_ref(),
-                        on_data_written.as_ref(),
-                        on_commit_transaction,
-                        schema,
-                        &write_settings,
-                    )?,
+                    InsertOp::Overwrite => {
+                        if write_settings.overwrite_file_swap && pool.mode() == Mode::File {
+                            file_swap::insert_overwrite_swap(
+                                pool,
+                                &table_definition,
+                                batch_rx,
+                                on_conflict.as_ref(),
+                                on_data_written.as_ref(),
+                                on_commit_transaction,
+                                schema,
+                                &write_settings,
+                            )?
+                        } else {
+                            if write_settings.overwrite_file_swap {
+                                tracing::warn!(
+                                    "The DuckDB overwrite file swap requires a file-backed instance; overwriting in place"
+                                );
+                            }
+                            insert_overwrite(
+                                pool,
+                                &table_definition,
+                                batch_rx,
+                                on_conflict.as_ref(),
+                                on_data_written.as_ref(),
+                                on_commit_transaction,
+                                schema,
+                                &write_settings,
+                            )?
+                        }
+                    }
                     InsertOp::Append | InsertOp::Replace => insert_append(
                         pool,
                         &table_definition,
@@ -546,6 +578,14 @@ fn insert_append(
     schema: SchemaRef,
     write_settings: &DuckDBWriteSettings,
 ) -> datafusion::common::Result<u64> {
+    // Writers hold the write gate in shared mode (acquired before the
+    // connection checkout) so a database file swap can never interleave with
+    // this write; see `DuckDbConnectionPool::write_gate`.
+    let write_gate = pool.write_gate();
+    let _write_guard = write_gate
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     let mut db_conn = pool
         .connect_sync()
         .context(super::DbConnectionPoolSnafu)
@@ -696,6 +736,14 @@ fn insert_overwrite(
     schema: SchemaRef,
     write_settings: &DuckDBWriteSettings,
 ) -> datafusion::common::Result<u64> {
+    // Writers hold the write gate in shared mode (acquired before the
+    // connection checkout) so a database file swap can never interleave with
+    // this write; see `DuckDbConnectionPool::write_gate`.
+    let write_gate = pool.write_gate();
+    let _write_guard = write_gate
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     let cloned_pool = Arc::clone(&pool);
     let mut db_conn = pool
         .connect_sync()
@@ -847,7 +895,7 @@ fn insert_overwrite(
 
 #[allow(clippy::doc_markdown)]
 /// Writes a stream of ``RecordBatch``es to a DuckDB table.
-fn write_to_table(
+pub(super) fn write_to_table(
     table: &TableManager,
     tx: &Transaction<'_>,
     schema: SchemaRef,
