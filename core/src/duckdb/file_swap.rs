@@ -1198,11 +1198,7 @@ mod tests {
     #[tokio::test]
     async fn test_overwrite_file_swap_aborts_when_file_replaced_out_of_band() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir
-            .path()
-            .join("replaced.db")
-            .to_string_lossy()
-            .to_string();
+        let db_path = dir.path().join("replaced.db").to_string_lossy().to_string();
 
         let pool = Arc::new(
             DuckDbConnectionPoolBuilder::file(&db_path)

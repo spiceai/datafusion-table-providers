@@ -210,7 +210,6 @@ struct PoolState {
     physical_identity: Option<FileIdentity>,
 }
 
-
 /// The r2d2 settings needed to rebuild an equivalent pool over a new database
 /// file during a file swap.
 struct PoolRebuildConfig {
