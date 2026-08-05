@@ -93,13 +93,46 @@ pub(crate) fn quoted_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// Renders `expr` as a SQL fragment for `engine`.
+///
+/// The fragment goes into a statement that names exactly one table, so every qualified column in
+/// `expr` must carry the same relation. A predicate spanning two relations has no meaning in such a
+/// statement, and rendering it by column name alone would silently *widen* it: `t1.id = t2.id` would
+/// become `"id" = "id"`, a tautology that a `DELETE` applies to every row. `DataFusion` never offers
+/// a cross-relation predicate to a single-table provider — it pushes a filter into a scan only when
+/// that scan covers it, and it validates ownership before unqualifying a DML filter — but this
+/// function is public and its callers have no such guarantee, so the check belongs here.
+///
+/// References are compared for exact equality rather than with `TableReference::resolved_eq`, which
+/// treats a component the other side omits as matching: a bare `t` is `resolved_eq` to both
+/// `a.schema.t` and `b.schema.t`, so it is not transitive, and comparing every reference against one
+/// arbitrarily chosen pivot could then admit two genuinely different tables. Without the session's
+/// default catalog and schema this function cannot canonicalise a partial reference, so mixed
+/// qualification of one table (`t` alongside `public.t`) is refused too — no caller produces it, and
+/// refusing is the direction that cannot widen a statement.
+pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String> {
+    let mut relations = expr
+        .column_refs()
+        .into_iter()
+        .filter_map(|column| column.relation.as_ref());
+    if let Some(first) = relations.next() {
+        if relations.any(|other| other != first) {
+            return Err(Error::UnsupportedFilterExpr {
+                expr: format!("{expr}"),
+            });
+        }
+    }
+
+    render_expr(expr, engine)
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::cast_precision_loss)]
-pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String> {
+fn render_expr(expr: &Expr, engine: Option<Engine>) -> Result<String> {
     match expr {
         Expr::BinaryExpr(binary_expr) => {
-            let left = to_sql_with_engine(&binary_expr.left, engine)?;
-            let right = to_sql_with_engine(&binary_expr.right, engine)?;
+            let left = render_expr(&binary_expr.left, engine)?;
+            let right = render_expr(&binary_expr.right, engine)?;
 
             if let Some(Engine::DuckDB) = engine {
                 // TODO: DuckDB doesn't support comparison between timestamp_s /timestamp_ms with timestampz as of v1
@@ -138,10 +171,28 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
                 _ => Ok(format!("{} {} {}", left, binary_expr.op, right)),
             }
         }
-        Expr::Column(name) => match engine {
-            Some(Engine::Spark | Engine::ODBC) => Ok(format!("{name}")),
-            _ => Ok(quoted_identifier(&name.to_string())),
-        },
+        Expr::Column(column) => {
+            // Render the column's own name, dropping any qualifier. Rendering `Column`'s
+            // `Display` would emit its *flat* name, making a qualified `t.a` the single identifier
+            // `"t.a"` — a column that usually does not exist, and where it does (dotted names are
+            // legal in Arrow and in every engine here) is not the one the caller named.
+            //
+            // Dropping it is safe because `to_sql_with_engine` has already established that the
+            // whole fragment names at most one relation, and the statement it goes into names
+            // exactly one table. `DataFusion` unqualifies at the same boundary for the same reason
+            // (`strip_column_qualifiers` for DML filters, `unnormalize_cols` for pushed-down ones).
+            //
+            // Rejecting a lone qualifier instead would break the callers that use this function as
+            // a *capability probe*: `supports_filters_pushdown` is asked about the qualified
+            // predicate while `scan` receives the unqualified one, and `ClickHouseTable` (plus the
+            // runtime's DuckDB vector index) answers it by rendering here and mapping `Err(_)` to
+            // `Unsupported`. An error would silently keep those predicates — `LIKE` among them —
+            // out of the remote statement.
+            match engine {
+                Some(Engine::Spark | Engine::ODBC) => Ok(column.name.clone()),
+                _ => Ok(quoted_identifier(&column.name)),
+            }
+        }
         Expr::Cast(cast) => handle_cast(cast, engine, expr),
         Expr::Literal(value, _) => match value {
             ScalarValue::Date32(Some(value)) => match engine {
@@ -248,8 +299,8 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
                     expr: format!("{expr}"),
                 });
             }
-            let expr = to_sql_with_engine(&like_expr.expr, engine)?;
-            let pattern = to_sql_with_engine(&like_expr.pattern, engine)?;
+            let expr = render_expr(&like_expr.expr, engine)?;
+            let pattern = render_expr(&like_expr.pattern, engine)?;
 
             let mut op_and_pattern = match (engine, like_expr.case_insensitive) {
                 (Some(Engine::Postgres | Engine::DuckDB), true) => format!("ILIKE {pattern}"),
@@ -273,11 +324,11 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
             Ok(format!("{expr} {op_and_pattern}"))
         }
         Expr::InList(in_list) => {
-            let expr = to_sql_with_engine(&in_list.expr, engine)?;
+            let expr = render_expr(&in_list.expr, engine)?;
             let list = in_list
                 .list
                 .iter()
-                .map(|expr| to_sql_with_engine(expr, engine))
+                .map(|expr| render_expr(expr, engine))
                 .collect::<Result<Vec<String>>>()?;
 
             let op = if in_list.negated { "NOT IN" } else { "IN" };
@@ -288,7 +339,7 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
             let args = scalar_function
                 .args
                 .iter()
-                .map(|expr| to_sql_with_engine(expr, engine))
+                .map(|expr| render_expr(expr, engine))
                 .collect::<Result<Vec<String>>>()?;
 
             Ok(format!("{}({})", scalar_function.name(), args.join(", ")))
@@ -308,16 +359,16 @@ fn handle_cast(cast: &Cast, engine: Option<Engine>, expr: &Expr) -> Result<Strin
         arrow::datatypes::DataType::Timestamp(_, Some(_) | None) => match engine {
             Some(Engine::ODBC) => Ok(format!(
                 "CAST({} AS TIMESTAMP)",
-                to_sql_with_engine(&cast.expr, engine)?,
+                render_expr(&cast.expr, engine)?,
             )),
             // This needs to match the timestamp conversion below
             Some(Engine::DuckDB) => Ok(format!(
                 "TO_TIMESTAMP(EPOCH(CAST({} AS TIMESTAMP)))",
-                to_sql_with_engine(&cast.expr, engine)?,
+                render_expr(&cast.expr, engine)?,
             )),
             Some(Engine::SQLite) => Ok(format!(
                 "datetime({}, 'subsec', 'utc')",
-                to_sql_with_engine(&cast.expr, engine)?,
+                render_expr(&cast.expr, engine)?,
             )),
             Some(Engine::Spark) => EngineNotSupportedForExpressionSnafu {
                 engine: "Spark".to_string(),
@@ -326,12 +377,12 @@ fn handle_cast(cast: &Cast, engine: Option<Engine>, expr: &Expr) -> Result<Strin
             .fail()?,
             _ => Ok(format!(
                 "CAST({} AS TIMESTAMPTZ)",
-                to_sql_with_engine(&cast.expr, engine)?,
+                render_expr(&cast.expr, engine)?,
             )),
         },
         arrow::datatypes::DataType::Int64 => Ok(format!(
             "CAST({} AS BIGINT)",
-            to_sql_with_engine(&cast.expr, engine)?,
+            render_expr(&cast.expr, engine)?,
         )),
         _ => Err(Error::UnsupportedFilterExpr {
             expr: format!("{expr}"),
@@ -991,5 +1042,241 @@ mod tests {
         assert_eq!(to_sql(&col("a").eq(int(1)))?, "\"a\" = 1");
 
         Ok(())
+    }
+
+    /// A qualified column must render as the column it names. Rendering `Column`'s flat name made
+    /// `t.a` one identifier, which either fails to bind or — where a column of that literal name
+    /// exists — binds the wrong one.
+    #[test]
+    fn a_qualified_column_renders_as_its_own_column() -> Result<()> {
+        let qualified = Expr::Column(datafusion::common::Column::new(Some("t"), "a"));
+
+        for (engine, expected) in [
+            (None, "\"a\""),
+            (Some(Engine::DuckDB), "\"a\""),
+            (Some(Engine::SQLite), "\"a\""),
+            (Some(Engine::Postgres), "\"a\""),
+            (Some(Engine::MySQL), "\"a\""),
+            (Some(Engine::ODBC), "a"),
+            (Some(Engine::Spark), "a"),
+        ] {
+            assert_eq!(
+                to_sql_with_engine(&qualified, engine)?,
+                expected,
+                "engine {engine:?}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A predicate spanning two relations cannot be rendered for a single-table statement, and
+    /// rendering it by column name alone would *widen* it into `"id" = "id"` — a tautology that a
+    /// `DELETE` applies to every row. It has to be refused, not erased.
+    #[test]
+    fn a_cross_relation_predicate_is_refused() {
+        let left = Expr::Column(datafusion::common::Column::new(Some("t1"), "id"));
+        let right = Expr::Column(datafusion::common::Column::new(Some("t2"), "id"));
+
+        let err = to_sql(&left.eq(right)).expect_err("a cross-relation predicate must be refused");
+        assert!(
+            matches!(err, Error::UnsupportedFilterExpr { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// One relation used by two columns is not a cross-relation predicate — this is the shape a
+    /// planner-produced filter over two columns of the same table has.
+    #[test]
+    fn one_relation_used_twice_renders() -> Result<()> {
+        let left = Expr::Column(datafusion::common::Column::new(Some("t"), "a"));
+        let right = Expr::Column(datafusion::common::Column::new(Some("t"), "b"));
+
+        assert_eq!(to_sql(&left.eq(right))?, "\"a\" = \"b\"");
+
+        Ok(())
+    }
+
+    /// Mixed qualification of one table cannot be told apart from two tables without the session's
+    /// default catalog and schema, so it is refused rather than resolved.
+    #[test]
+    fn mixed_qualification_of_one_relation_is_refused() {
+        let bare = Expr::Column(datafusion::common::Column::new(Some("t"), "a"));
+        let partial = Expr::Column(datafusion::common::Column::new(
+            Some(datafusion::sql::TableReference::partial("public", "t")),
+            "b",
+        ));
+
+        assert!(matches!(
+            to_sql(&bare.eq(partial)),
+            Err(Error::UnsupportedFilterExpr { .. })
+        ));
+    }
+
+    /// `TableReference::resolved_eq` treats an omitted component as matching, so a bare reference is
+    /// `resolved_eq` to two different fully qualified tables. Comparing against one arbitrarily
+    /// chosen pivot under those semantics would admit this predicate — over columns of two distinct
+    /// catalogs — and then erase both qualifiers into `"id" = "id"`.
+    #[test]
+    fn two_catalogs_bridged_by_a_bare_reference_are_refused() {
+        let left = Expr::Column(datafusion::common::Column::new(
+            Some(datafusion::sql::TableReference::full("a", "public", "t")),
+            "id",
+        ));
+        let bridge = Expr::Column(datafusion::common::Column::new(Some("t"), "id"));
+        let right = Expr::Column(datafusion::common::Column::new(
+            Some(datafusion::sql::TableReference::full("b", "public", "t")),
+            "id",
+        ));
+
+        // Every ordering of the three references must refuse, whatever order `column_refs` yields.
+        for predicate in [
+            left.clone()
+                .eq(bridge.clone())
+                .and(right.clone().eq(bridge.clone())),
+            bridge
+                .clone()
+                .eq(left.clone())
+                .and(bridge.clone().eq(right.clone())),
+            right.eq(bridge.clone()).and(bridge.eq(left)),
+        ] {
+            assert!(
+                matches!(to_sql(&predicate), Err(Error::UnsupportedFilterExpr { .. })),
+                "accepted a predicate spanning two catalogs: {predicate}"
+            );
+        }
+    }
+
+    /// The qualifier is what gets dropped, not every dot: a column whose own name contains a dot is
+    /// a legal Arrow field name and must still render as itself. This is also the column a
+    /// qualified `t.a` would have bound to had it kept rendering flat.
+    #[test]
+    fn an_unqualified_dotted_column_name_is_not_a_qualifier() -> Result<()> {
+        let dotted = Expr::Column(datafusion::common::Column::new_unqualified("t.a"));
+
+        assert_eq!(to_sql(&dotted.clone().eq(int(1)))?, "\"t.a\" = 1");
+        assert_eq!(
+            to_sql_with_engine(&dotted, Some(Engine::DuckDB))?,
+            "\"t.a\""
+        );
+
+        Ok(())
+    }
+
+    /// The qualifier has to be dropped wherever the column sits, not only at the top of the tree.
+    #[test]
+    fn a_qualified_column_inside_a_predicate_renders_as_its_own_column() -> Result<()> {
+        let predicate = Expr::Column(datafusion::common::Column::new(Some("t"), "a"))
+            .eq(int(1))
+            .and(col("b").eq(utf8("x")));
+
+        assert_eq!(to_sql(&predicate)?, "(\"a\" = 1) AND (\"b\" = 'x')");
+
+        Ok(())
+    }
+
+    /// An unqualified column keeps rendering exactly as before, for both the quoted and the bare
+    /// engine arms.
+    #[test]
+    fn an_unqualified_column_renders_unchanged() -> Result<()> {
+        assert_eq!(to_sql(&col("a"))?, "\"a\"");
+        assert_eq!(
+            to_sql_with_engine(&col("a"), Some(Engine::DuckDB))?,
+            "\"a\""
+        );
+        assert_eq!(to_sql_with_engine(&col("a"), Some(Engine::Spark))?, "a");
+        assert_eq!(to_sql_with_engine(&col("a"), Some(Engine::ODBC))?, "a");
+
+        Ok(())
+    }
+
+    /// `supports_filters_pushdown` is asked about the **qualified** predicate while `scan` receives
+    /// the unqualified one, and `ClickHouseTable` answers that question by rendering here and
+    /// mapping `Err(_)` to `Unsupported` (as does the runtime's DuckDB vector index). So this
+    /// function must render the shape the probe passes it: refusing a qualifier would silently stop
+    /// those predicates from reaching the remote statement, and the physical-pushdown fallback does
+    /// not cover `LIKE`.
+    ///
+    /// The predicate is captured from a real `SessionContext` rather than hand-built, so the test
+    /// keeps holding if `DataFusion` changes when it normalizes.
+    #[tokio::test]
+    async fn a_predicate_as_the_pushdown_probe_receives_it_still_renders() {
+        use datafusion::catalog::{Session, TableProvider};
+        use datafusion::logical_expr::{TableProviderFilterPushDown, TableType};
+        use datafusion::physical_plan::{empty::EmptyExec, ExecutionPlan};
+        use datafusion::prelude::SessionContext;
+        use std::sync::Mutex;
+
+        #[derive(Debug)]
+        struct ProbeRecorder {
+            schema: arrow::datatypes::SchemaRef,
+            probed: Arc<Mutex<Vec<Expr>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl TableProvider for ProbeRecorder {
+            fn schema(&self) -> arrow::datatypes::SchemaRef {
+                Arc::clone(&self.schema)
+            }
+            fn table_type(&self) -> TableType {
+                TableType::Base
+            }
+            fn supports_filters_pushdown(
+                &self,
+                filters: &[&Expr],
+            ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
+                self.probed
+                    .lock()
+                    .expect("lock")
+                    .extend(filters.iter().map(|f| (*f).clone()));
+                Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+            }
+            async fn scan(
+                &self,
+                _state: &dyn Session,
+                _projection: Option<&Vec<usize>>,
+                _filters: &[Expr],
+                _limit: Option<usize>,
+            ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+                Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))))
+            }
+        }
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("name", DataType::Utf8, true),
+        ]));
+        let probed = Arc::new(Mutex::new(Vec::new()));
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "docs",
+            Arc::new(ProbeRecorder {
+                schema,
+                probed: Arc::clone(&probed),
+            }),
+        )
+        .expect("register");
+
+        ctx.sql("SELECT * FROM docs WHERE name LIKE '%x%'")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("collect");
+
+        let filters = probed.lock().expect("lock").clone();
+        assert!(!filters.is_empty(), "the pushdown probe saw no filter");
+        for filter in &filters {
+            assert!(
+                filter
+                    .column_refs()
+                    .iter()
+                    .any(|column| column.relation.is_some()),
+                "the probe is expected to receive a qualified column: {filter:?}"
+            );
+            assert_eq!(
+                to_sql_with_engine(filter, None).expect("the probed predicate must render"),
+                "\"name\" LIKE '%x%'"
+            );
+        }
     }
 }

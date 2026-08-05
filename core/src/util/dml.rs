@@ -258,6 +258,29 @@ mod tests {
         assert_eq!(sql, r#""name" = 'O''Brien'"#);
     }
 
+    /// A predicate reaching a DML sink can carry a qualifier, and it must render as the column it
+    /// names rather than as one flat identifier.
+    #[test]
+    fn test_filters_to_sql_renders_a_qualified_column_as_its_own_column() {
+        let filter = Expr::Column(datafusion::common::Column::new(Some("t"), "id")).eq(lit(1i32));
+
+        let sql = filters_to_sql(&[filter], None).expect("filters_to_sql should succeed");
+        assert_eq!(sql, r#""id" = 1"#);
+    }
+
+    /// The same applies to a SET clause, whose value expression can carry a column reference.
+    #[test]
+    fn test_assignments_to_sql_renders_a_qualified_column_value() {
+        let assignments = vec![(
+            "name".to_string(),
+            Expr::Column(datafusion::common::Column::new(Some("t"), "other")),
+        )];
+
+        let sql =
+            assignments_to_sql(&assignments, None).expect("assignments_to_sql should succeed");
+        assert_eq!(sql, r#""name" = "other""#);
+    }
+
     /// A SET clause carries both a value and a column name, and interpolates the name itself.
     #[test]
     fn test_assignments_to_sql_escapes_value_and_column_name() {
@@ -359,5 +382,64 @@ mod duckdb_execution_tests {
         let mut expected: Vec<String> = ROWS.iter().map(|row| (*row).to_string()).collect();
         expected.sort();
         assert_eq!(surviving_after_delete(&filters), expected);
+    }
+
+    /// The flat rendering of a qualified column is not merely invalid — against a table that has a
+    /// column of that literal name it is *bindable*, so the statement succeeds against the wrong
+    /// column. This runs the `DELETE` the DML path builds for `t.a = 1` over a table holding both
+    /// `a` and `t.a`, and asserts the row the caller selected is the one that goes.
+    #[test]
+    fn a_qualified_column_deletes_by_the_column_it_names() {
+        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+        conn.execute_batch(r#"CREATE TABLE t ("a" INTEGER, "t.a" INTEGER)"#)
+            .expect("create");
+        conn.execute_batch("INSERT INTO t VALUES (1, 99), (99, 1)")
+            .expect("insert");
+
+        let filters =
+            vec![Expr::Column(datafusion::common::Column::new(Some("t"), "a")).eq(lit(1i32))];
+        let where_clause =
+            filters_to_sql(&filters, Some(Engine::DuckDB)).expect("a qualified column must render");
+        conn.execute_batch(&format!("DELETE FROM t WHERE {where_clause}"))
+            .expect("the rendered DELETE must be valid SQL for DuckDB");
+
+        let mut stmt = conn.prepare(r#"SELECT "a" FROM t"#).expect("prepare");
+        let surviving: Vec<i32> = stmt
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<duckdb::Result<Vec<i32>>>()
+            .expect("rows");
+
+        // Rendered flat, `"t.a" = 1` binds the decoy column and leaves `a = 1` behind instead.
+        assert_eq!(surviving, vec![99], "the wrong row was deleted");
+    }
+
+    /// The reason a cross-relation predicate must be refused rather than rendered by column name:
+    /// erased to `"id" = "id"` it is a tautology, and the `DELETE` built from it empties the table.
+    #[test]
+    fn a_cross_relation_predicate_cannot_become_a_tautology() {
+        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+        conn.execute_batch("CREATE TABLE t (id INTEGER)")
+            .expect("create");
+        conn.execute_batch("INSERT INTO t VALUES (1), (2), (3)")
+            .expect("insert");
+
+        let filters = vec![
+            Expr::Column(datafusion::common::Column::new(Some("t1"), "id")).eq(Expr::Column(
+                datafusion::common::Column::new(Some("t2"), "id"),
+            )),
+        ];
+        assert!(
+            filters_to_sql(&filters, Some(Engine::DuckDB)).is_err(),
+            "a cross-relation predicate must not render into a WHERE clause"
+        );
+
+        // What the erased rendering would have meant.
+        conn.execute_batch(r#"DELETE FROM t WHERE "id" = "id""#)
+            .expect("the erased rendering is valid SQL");
+        let remaining: i64 = conn
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(remaining, 0, "the erased predicate is a tautology");
     }
 }
