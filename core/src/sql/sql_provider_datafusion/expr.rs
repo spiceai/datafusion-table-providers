@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use bigdecimal::{num_bigint::BigInt, BigDecimal};
 use datafusion::{
@@ -69,9 +69,19 @@ impl Engine {
 /// needs rather than inherit whichever arm happens to be the catch-all.
 pub(crate) fn string_literal(value: &str, engine: Option<Engine>) -> String {
     let escaped = match engine {
-        Some(Engine::MySQL | Engine::Spark) => value.replace('\\', r"\\").replace('\'', "''"),
+        Some(Engine::MySQL | Engine::Spark) => {
+            if value.contains(['\\', '\'']) {
+                Cow::Owned(value.replace('\\', r"\\").replace('\'', "''"))
+            } else {
+                Cow::Borrowed(value)
+            }
+        }
         Some(Engine::DuckDB | Engine::SQLite | Engine::Postgres | Engine::ODBC) | None => {
-            value.replace('\'', "''")
+            if value.contains('\'') {
+                Cow::Owned(value.replace('\'', "''"))
+            } else {
+                Cow::Borrowed(value)
+            }
         }
     };
     format!("'{escaped}'")
