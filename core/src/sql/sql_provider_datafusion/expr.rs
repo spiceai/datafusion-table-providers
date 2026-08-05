@@ -53,10 +53,11 @@ impl Engine {
 /// excluded. Quote doubling is accepted by every engine this function renders for, and matches
 /// what `DataFusion`'s own unparser emits.
 ///
-/// `Engine::MySQL` and `Engine::Spark` additionally treat `\` as an escape character (MySQL
-/// unless `NO_BACKSLASH_ESCAPES` is set), so a backslash-bearing value needs engine-aware
-/// escaping on top of this. No caller renders either engine through this function today — both
-/// reach their target through `SqlTable`, which unparses with a `Dialect`.
+/// Quote doubling is sufficient only where `\` is an ordinary character in a string literal,
+/// which holds for every engine that reaches this function: `Engine::DuckDB`, `Engine::SQLite`
+/// and `None` (the Postgres write path, with the default `standard_conforming_strings = on`).
+/// `Engine::MySQL` and `Engine::Spark` treat `\` as an escape character, so the caller refuses
+/// to render a string literal for them rather than emit one this cannot escape.
 pub(crate) fn string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -141,7 +142,22 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
             ScalarValue::Boolean(Some(value)) => Ok(value.to_string()),
             ScalarValue::Utf8(Some(value))
             | ScalarValue::LargeUtf8(Some(value))
-            | ScalarValue::Utf8View(Some(value)) => Ok(string_literal(value)),
+            | ScalarValue::Utf8View(Some(value)) => match engine {
+                // These treat `\` as an escape character inside a string literal, so quote
+                // doubling alone is not a sufficient escape: `\'` consumes the first quote of
+                // the pair and the second one closes the literal. Refuse rather than emit a
+                // literal this function cannot escape correctly — no caller renders either
+                // engine through here (both build a `SqlTable`, which unparses with a
+                // `Dialect`), so this closes the gap instead of documenting it.
+                Some(engine @ (Engine::MySQL | Engine::Spark)) => {
+                    EngineNotSupportedForExpressionSnafu {
+                        engine: format!("{engine:?}"),
+                        expr: format!("{expr}"),
+                    }
+                    .fail()
+                }
+                _ => Ok(string_literal(value)),
+            },
             ScalarValue::Float32(Some(value)) => Ok(value.to_string()),
             ScalarValue::Float64(Some(value)) => Ok(value.to_string()),
             ScalarValue::Int8(Some(value)) => Ok(value.to_string()),
@@ -817,13 +833,12 @@ mod tests {
     fn test_apostrophe_in_string_literal_is_doubled() -> Result<()> {
         assert_eq!(to_sql(&utf8("O'Brien"))?, "'O''Brien'");
 
-        // Every engine renders through the same arm, and quote doubling is correct for each.
+        // The engines for which quote doubling is the complete escape, i.e. those where `\`
+        // is an ordinary character in a string literal.
         for engine in [
             Engine::DuckDB,
             Engine::SQLite,
             Engine::Postgres,
-            Engine::MySQL,
-            Engine::Spark,
             Engine::ODBC,
         ] {
             assert_eq!(
@@ -832,6 +847,31 @@ mod tests {
                 "engine {engine:?} must escape the quote"
             );
         }
+
+        Ok(())
+    }
+
+    /// Quote doubling is not a complete escape where `\` is itself an escape character, so a
+    /// string literal for those engines must fail loudly rather than render unsafely.
+    #[test]
+    fn test_backslash_escaping_engines_refuse_a_string_literal() {
+        for engine in [Engine::MySQL, Engine::Spark] {
+            let err = to_sql_with_engine(&utf8("plain"), Some(engine))
+                .expect_err("a string literal must not render for a backslash-escaping engine");
+            assert!(
+                matches!(err, Error::EngineNotSupportedForExpression { .. }),
+                "engine {engine:?} produced {err:?}"
+            );
+        }
+    }
+
+    /// A backslash immediately before a quote is the case quote doubling cannot handle on a
+    /// backslash-escaping engine: `'\''` would there be `\'` followed by a closing quote.
+    /// On the engines that reach this function `\` is ordinary, so `'\''` is one literal
+    /// holding `\'` — pinned here because it is why the engines above are refused.
+    #[test]
+    fn test_backslash_before_a_quote_renders_for_standard_engines() -> Result<()> {
+        assert_eq!(to_sql(&utf8(r"\' OR 1=1 --"))?, r"'\'' OR 1=1 --'");
 
         Ok(())
     }

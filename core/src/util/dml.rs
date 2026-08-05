@@ -272,3 +272,92 @@ mod tests {
         assert_eq!(sql, r#""we""ird" = 1"#);
     }
 }
+
+/// The rendered SQL is only correct if the target engine agrees, so these run the statement the
+/// DML paths build and assert on the rows that actually survive it. A rendering assertion alone
+/// cannot distinguish "escaped" from "escaped in a form this engine accepts".
+#[cfg(all(test, feature = "duckdb"))]
+mod duckdb_execution_tests {
+    use super::*;
+    use crate::sql::sql_provider_datafusion::expr::Engine;
+    use datafusion::prelude::*;
+    use duckdb::Connection;
+
+    const ROWS: [&str; 4] = ["O'Brien", "plain", "x' OR 1=1 --", r"\' OR 1=1 --"];
+
+    /// Deletes with the WHERE clause `filters_to_sql` renders, and returns the surviving names.
+    fn surviving_after_delete(filters: &[Expr]) -> Vec<String> {
+        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+        conn.execute_batch("CREATE TABLE t (name VARCHAR)")
+            .expect("create");
+        for row in ROWS {
+            conn.execute("INSERT INTO t VALUES (?)", [row])
+                .expect("insert");
+        }
+
+        let where_clause =
+            filters_to_sql(filters, Some(Engine::DuckDB)).expect("filters_to_sql should succeed");
+        conn.execute_batch(&format!("DELETE FROM t WHERE {where_clause}"))
+            .expect("the rendered DELETE must be valid SQL for DuckDB");
+
+        let mut stmt = conn
+            .prepare("SELECT name FROM t ORDER BY name")
+            .expect("prepare");
+        let mut names: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<duckdb::Result<Vec<String>>>()
+            .expect("rows");
+        names.sort();
+        names
+    }
+
+    fn all_but(excluded: &str) -> Vec<String> {
+        let mut rest: Vec<String> = ROWS
+            .iter()
+            .filter(|row| **row != excluded)
+            .map(|row| (*row).to_string())
+            .collect();
+        rest.sort();
+        rest
+    }
+
+    /// An apostrophe rendered bare makes the statement fail to parse, so the delete cannot run.
+    #[test]
+    fn an_apostrophe_bearing_value_deletes_exactly_its_row() {
+        let filters = vec![col("name").eq(lit("O'Brien"))];
+
+        assert_eq!(surviving_after_delete(&filters), all_but("O'Brien"));
+    }
+
+    /// The unbounded-deletion shape: rendered bare this binds as a tautology and removes every
+    /// row. It must remove exactly the one row whose value it is.
+    #[test]
+    fn a_tautology_shaped_value_deletes_exactly_its_row() {
+        let filters = vec![col("name").eq(lit("x' OR 1=1 --"))];
+
+        assert_eq!(surviving_after_delete(&filters), all_but("x' OR 1=1 --"));
+    }
+
+    /// A backslash immediately before the quote is the composition quote doubling cannot handle
+    /// on a backslash-escaping engine. DuckDB treats `\` as ordinary, so it must stay contained.
+    #[test]
+    fn a_backslash_before_a_quote_deletes_exactly_its_row() {
+        let filters = vec![col("name").eq(lit(r"\' OR 1=1 --"))];
+
+        assert_eq!(surviving_after_delete(&filters), all_but(r"\' OR 1=1 --"));
+    }
+
+    /// Two filters are joined with `AND`, so a quote in either must stay inside its own literal.
+    #[test]
+    fn a_conjunction_of_quote_bearing_values_matches_nothing() {
+        let filters = vec![
+            col("name").eq(lit("O'Brien")),
+            col("name").eq(lit("x' OR 1=1 --")),
+        ];
+
+        let mut expected: Vec<String> = ROWS.iter().map(|row| (*row).to_string()).collect();
+        expected.sort();
+        assert_eq!(surviving_after_delete(&filters), expected);
+    }
+}
