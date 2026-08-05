@@ -289,3 +289,131 @@ async fn test_postgres_partitioned_table_schema_inference() {
         .await
         .expect("to stop postgres container");
 }
+
+/// A foreign table's schema comes from its local `pg_attribute` definition, so it
+/// resolves without querying the relation's data.
+///
+/// Three properties are asserted together because they share one setup:
+///
+/// 1. Types resolve identically to an ordinary table (`relkind = 'f'` is covered by
+///    the catalog query).
+/// 2. An **empty** foreign table still reports its full column set. Data-based
+///    inference yields `Schema::empty()` when the sample query returns no rows, so a
+///    foreign table that happens to be empty at registration would otherwise register
+///    with no columns at all.
+/// 3. A column declared `NOT NULL` on the foreign table is reported **nullable**.
+///    `PostgreSQL` never enforces that declaration against the remote data -- here
+///    `note` is nullable on the remote and holds a NULL -- so treating it as non-null
+///    would let a consumer assume a null-free column and return wrong results.
+#[tokio::test]
+async fn test_postgres_foreign_table_schema_inference() {
+    let port = crate::get_random_port();
+    let container = common::start_postgres_docker_container("postgres:latest", port, None)
+        .await
+        .expect("Postgres container to start");
+
+    let postgres_pool = Arc::new(
+        PostgresConnectionPool::new(to_secret_map(common::get_pg_params(port)))
+            .await
+            .expect("unable to create Postgres connection pool"),
+    );
+    let pg_conn = postgres_pool
+        .connect_direct()
+        .await
+        .expect("to connect to postgres");
+
+    let mut params = common::get_pg_params(port);
+    let password = params.remove("pg_pass").expect("pg_pass should be present");
+
+    // `loopback` points the foreign tables back at this same database, so the
+    // remote side is real without needing a second container. The port is the
+    // container-internal 5432, not the host-mapped one.
+    let foreign_table_sql = format!(
+        r#"
+        CREATE TABLE remote_orders (
+            id INTEGER NOT NULL,
+            note TEXT,
+            amount NUMERIC(10,2),
+            order_date DATE,
+            tags TEXT[]
+        );
+
+        INSERT INTO remote_orders (id, note, amount, order_date, tags)
+            VALUES (1, NULL, 12.34, DATE '2024-01-01', ARRAY['a','b']);
+
+        CREATE TABLE remote_empty (id INTEGER NOT NULL, label TEXT);
+
+        CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+
+        CREATE SERVER loopback FOREIGN DATA WRAPPER postgres_fdw
+            OPTIONS (host 'localhost', port '5432', dbname 'postgres');
+
+        CREATE USER MAPPING FOR postgres SERVER loopback
+            OPTIONS (user 'postgres', password '{password}');
+
+        CREATE FOREIGN TABLE ft_orders (
+            id INTEGER NOT NULL,
+            note TEXT NOT NULL,
+            amount NUMERIC(10,2),
+            order_date DATE,
+            tags TEXT[]
+        ) SERVER loopback OPTIONS (table_name 'remote_orders');
+
+        CREATE FOREIGN TABLE ft_empty (
+            id INTEGER NOT NULL,
+            label TEXT
+        ) SERVER loopback OPTIONS (table_name 'remote_empty')
+    "#
+    );
+
+    for cmd in foreign_table_sql.split(";") {
+        if cmd.trim().is_empty() {
+            continue;
+        }
+        pg_conn
+            .conn
+            .execute(cmd, &[])
+            .await
+            .expect("executing foreign table SQL");
+    }
+
+    let table_factory = PostgresTableFactory::new(postgres_pool);
+
+    let orders = table_factory
+        .table_provider(TableReference::bare("ft_orders"))
+        .await
+        .expect("to create table provider for foreign table");
+
+    // Every field is nullable, including `id` and `note`, which the foreign table
+    // declares NOT NULL.
+    let expected_orders = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new("note", DataType::Utf8, true),
+        Field::new("amount", DataType::Decimal128(10, 2), true),
+        Field::new("order_date", DataType::Date32, true),
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
+    ]));
+    assert_eq!(orders.schema(), expected_orders);
+
+    // The remote table is empty; the schema must still be complete.
+    let empty = table_factory
+        .table_provider(TableReference::bare("ft_empty"))
+        .await
+        .expect("to create table provider for empty foreign table");
+
+    let expected_empty = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new("label", DataType::Utf8, true),
+    ]));
+    assert_eq!(empty.schema(), expected_empty);
+
+    // Tear down
+    container
+        .remove()
+        .await
+        .expect("to stop postgres container");
+}
