@@ -783,5 +783,4 @@ mod tests {
             "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < TO_TIMESTAMP(1767225600)"
         );
     }
-
 }
