@@ -50,10 +50,9 @@ impl Engine {
 /// Interpolating the value bare lets a single quote close the literal early: an ordinary
 /// apostrophe then makes the statement fail to parse, and a value shaped like `x' OR 1=1 --`
 /// binds as a wider predicate than the caller wrote, so a `DELETE` can match rows the filter
-/// excluded. Quote doubling is accepted by every engine this function renders for, and matches
-/// what `DataFusion`'s own unparser emits.
+/// excluded. Doubling is what `DataFusion`'s own unparser emits.
 ///
-/// Quote doubling is sufficient only where `\` is an ordinary character in a string literal,
+/// It is a complete escape only where `\` is an ordinary character in a string literal,
 /// which holds for every engine that reaches this function: `Engine::DuckDB`, `Engine::SQLite`
 /// and `None` (the Postgres write path, with the default `standard_conforming_strings = on`).
 /// `Engine::MySQL` and `Engine::Spark` treat `\` as an escape character, so the caller refuses
