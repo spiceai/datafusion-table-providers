@@ -56,7 +56,26 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
             if let Some(Engine::DuckDB) = engine {
                 // TODO: DuckDB doesn't support comparison between timestamp_s /timestamp_ms with timestampz as of v1
                 // Revisit in future DuckDB versions
-                if right.starts_with("TO_TIMESTAMP") && !left.starts_with("TO_TIMESTAMP") {
+                //
+                // Only a comparison can have a timestamp operand to normalize. Without this
+                // guard the rewrite also fires on `AND`/`OR`, whose left operand is a
+                // predicate, not a timestamp: it then emits `EPOCH_MS(<predicate>)` and
+                // DuckDB rejects the statement with `Binder Error: epoch_ms(BOOLEAN)`.
+                let is_timestamp_comparison = matches!(
+                    binary_expr.op,
+                    Operator::Eq
+                        | Operator::NotEq
+                        | Operator::Lt
+                        | Operator::LtEq
+                        | Operator::Gt
+                        | Operator::GtEq
+                        | Operator::IsDistinctFrom
+                        | Operator::IsNotDistinctFrom
+                );
+                if is_timestamp_comparison
+                    && right.starts_with("TO_TIMESTAMP")
+                    && !left.starts_with("TO_TIMESTAMP")
+                {
                     return Ok(format!(
                         "TO_TIMESTAMP(EPOCH_MS({}) / 1000) {} {}",
                         left, binary_expr.op, right
@@ -684,4 +703,85 @@ mod tests {
 
         Ok(())
     }
+
+    fn bool_lit(v: bool) -> Expr {
+        Expr::Literal(ScalarValue::Boolean(Some(v)), None)
+    }
+
+    fn int_lit(v: i64) -> Expr {
+        Expr::Literal(ScalarValue::Int64(Some(v)), None)
+    }
+
+    fn ts_lit() -> Expr {
+        Expr::Literal(
+            ScalarValue::TimestampNanosecond(Some(1_767_225_600_000_000_000), None),
+            None,
+        )
+    }
+
+    /// A logical connective is not a timestamp comparison. The DuckDB timestamp
+    /// normalization must not fire on `AND`/`OR`: the left operand of a connective is a
+    /// predicate, and wrapping a predicate in `EPOCH_MS` makes DuckDB's binder reject the
+    /// whole statement with `Binder Error: epoch_ms(BOOLEAN)`.
+    #[test]
+    fn test_duckdb_or_with_timestamp_right_operand_is_not_rewritten() {
+        let expr = col("flag").eq(bool_lit(true)).or(col("ts").lt(ts_lit()));
+
+        let sql = to_sql_with_engine(&expr, Some(Engine::DuckDB)).expect("to unparse");
+
+        assert!(
+            !sql.contains("EPOCH_MS(\"flag\""),
+            "the boolean operand of OR must not be wrapped in EPOCH_MS: {sql}"
+        );
+        assert_eq!(
+            sql,
+            "(\"flag\" = true) OR (TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < TO_TIMESTAMP(1767225600))"
+        );
+    }
+
+    #[test]
+    fn test_duckdb_and_with_timestamp_right_operand_is_not_rewritten() {
+        let expr = col("flag").eq(bool_lit(true)).and(col("ts").lt(ts_lit()));
+
+        let sql = to_sql_with_engine(&expr, Some(Engine::DuckDB)).expect("to unparse");
+
+        assert!(
+            !sql.contains("EPOCH_MS(\"flag\""),
+            "the boolean operand of AND must not be wrapped in EPOCH_MS: {sql}"
+        );
+        assert_eq!(
+            sql,
+            "(\"flag\" = true) AND (TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < TO_TIMESTAMP(1767225600))"
+        );
+    }
+
+    /// The left operand of the outer connective is itself a connective, so it renders
+    /// parenthesised rather than as a bare predicate — it must still not be wrapped.
+    #[test]
+    fn test_duckdb_nested_connective_operand_is_not_rewritten() {
+        let inner = col("x").eq(int_lit(1)).and(col("y").eq(int_lit(2)));
+        let expr = inner.or(col("ts").lt(ts_lit()));
+
+        let sql = to_sql_with_engine(&expr, Some(Engine::DuckDB)).expect("to unparse");
+
+        assert!(
+            !sql.contains("EPOCH_MS((") && !sql.contains("EPOCH_MS(\"x\""),
+            "a predicate operand must not be wrapped in EPOCH_MS: {sql}"
+        );
+    }
+
+    /// The normalization must be preserved for a genuine timestamp comparison — this is
+    /// the case the rewrite exists to serve.
+    #[test]
+    fn test_duckdb_timestamp_comparison_is_still_rewritten() {
+        let expr = col("ts").lt(ts_lit());
+
+        let sql = to_sql_with_engine(&expr, Some(Engine::DuckDB)).expect("to unparse");
+
+        assert_eq!(
+            sql,
+            "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < TO_TIMESTAMP(1767225600)"
+        );
+    }
+
 }
