@@ -36,7 +36,8 @@ pub fn assignments_to_sql(
     let parts: Result<Vec<String>, _> = assignments
         .iter()
         .map(|(col, val)| {
-            expr::to_sql_with_engine(val, engine).map(|sql_val| format!(r#""{col}" = {sql_val}"#))
+            expr::to_sql_with_engine(val, engine)
+                .map(|sql_val| format!("{} = {sql_val}", expr::quote_identifier(col)))
         })
         .collect();
     parts
@@ -230,6 +231,28 @@ mod tests {
         let sql =
             assignments_to_sql(&assignments, None).expect("assignments_to_sql should succeed");
         assert_eq!(sql, r#""name" = 'foo'"#);
+    }
+
+    /// A `WHERE` value containing an apostrophe must stay one literal: unescaped it either fails
+    /// to parse or, for a value that closes the literal and adds a predicate, matches every row.
+    #[test]
+    fn test_filters_to_sql_escapes_string_literal() {
+        let filter = col("name").eq(lit("O'Brien"));
+        let sql = filters_to_sql(&[filter], None).expect("filters_to_sql should succeed");
+        assert_eq!(sql, r#""name" = 'O''Brien'"#);
+
+        let injected = col("name").eq(lit("x' OR 1=1 --"));
+        let sql = filters_to_sql(&[injected], None).expect("filters_to_sql should succeed");
+        assert_eq!(sql, r#""name" = 'x'' OR 1=1 --'"#);
+    }
+
+    /// The `SET` clause interpolates both a value and a column name, so both need escaping.
+    #[test]
+    fn test_assignments_to_sql_escapes_value_and_column() {
+        let assignments = vec![(r#"we"ird"#.to_string(), lit("O'Brien"))];
+        let sql =
+            assignments_to_sql(&assignments, None).expect("assignments_to_sql should succeed");
+        assert_eq!(sql, r#""we""ird" = 'O''Brien'"#);
     }
 
     #[test]

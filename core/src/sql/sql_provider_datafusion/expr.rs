@@ -92,7 +92,7 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
         }
         Expr::Column(name) => match engine {
             Some(Engine::Spark | Engine::ODBC) => Ok(format!("{name}")),
-            _ => Ok(format!("\"{name}\"")),
+            _ => Ok(quote_identifier(&name.to_string())),
         },
         Expr::Cast(cast) => handle_cast(cast, engine, expr),
         Expr::Literal(value, _) => match value {
@@ -119,7 +119,7 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
             ScalarValue::Boolean(Some(value)) => Ok(value.to_string()),
             ScalarValue::Utf8(Some(value))
             | ScalarValue::LargeUtf8(Some(value))
-            | ScalarValue::Utf8View(Some(value)) => Ok(format!("'{value}'")),
+            | ScalarValue::Utf8View(Some(value)) => Ok(string_literal(value, engine)),
             ScalarValue::Float32(Some(value)) => Ok(value.to_string()),
             ScalarValue::Float64(Some(value)) => Ok(value.to_string()),
             ScalarValue::Int8(Some(value)) => Ok(value.to_string()),
@@ -291,6 +291,38 @@ fn handle_cast(cast: &Cast, engine: Option<Engine>, expr: &Expr) -> Result<Strin
     }
 }
 
+/// Render `value` as a SQL string literal for `engine`, escaping the characters the engine reads
+/// as significant inside one.
+///
+/// Every engine here terminates a literal on `'` and accepts a doubled `''` for an embedded one.
+/// MySQL and Spark additionally read `\` as an escape character inside a literal — MySQL unless
+/// `NO_BACKSLASH_ESCAPES` is set, which is off by default — so there a value ending in a
+/// backslash would otherwise escape its own closing quote; both characters are doubled for them.
+/// Postgres needs no backslash handling under `standard_conforming_strings`, on by default since
+/// 9.1, and DuckDB, `SQLite` and ODBC treat `\` as an ordinary character.
+///
+/// The match is exhaustive over [`Engine`] on purpose: a new engine must state which escaping it
+/// needs rather than inherit whichever arm happens to be the catch-all.
+fn string_literal(value: &str, engine: Option<Engine>) -> String {
+    let escaped = match engine {
+        Some(Engine::MySQL | Engine::Spark) => value.replace('\\', r"\\").replace('\'', "''"),
+        Some(Engine::DuckDB | Engine::SQLite | Engine::Postgres | Engine::ODBC) | None => {
+            value.replace('\'', "''")
+        }
+    };
+    format!("'{escaped}'")
+}
+
+/// Quote `name` as a double-quoted SQL identifier, doubling any embedded `"` so it cannot
+/// terminate the identifier early.
+///
+/// Identifiers reach here from the query plan rather than from a literal, but a column whose name
+/// contains a quote is legal in DuckDB, `SQLite` and Postgres, and interpolating one unescaped
+/// produces the same broken-or-worse statement an unescaped literal does.
+pub(crate) fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 // Helper function to check if expression contains subquery or outer reference
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 
@@ -394,6 +426,130 @@ mod tests {
             "\"l_shipmode\" IN ('MAIL', 'SHIP')"
         );
 
+        Ok(())
+    }
+
+    /// Every engine that quotes with `'` must accept the doubled form for an embedded quote, so
+    /// `O'Brien` renders as a single literal instead of terminating after `O`.
+    #[test]
+    fn test_string_literal_doubles_embedded_quote() -> Result<()> {
+        for engine in [
+            None,
+            Some(Engine::DuckDB),
+            Some(Engine::SQLite),
+            Some(Engine::Postgres),
+            Some(Engine::MySQL),
+            Some(Engine::Spark),
+            Some(Engine::ODBC),
+        ] {
+            for value in [
+                ScalarValue::Utf8(Some("O'Brien".to_string())),
+                ScalarValue::LargeUtf8(Some("O'Brien".to_string())),
+                ScalarValue::Utf8View(Some("O'Brien".to_string())),
+            ] {
+                let expr = Expr::Literal(value, None);
+                assert_eq!(
+                    to_sql_with_engine(&expr, engine)?,
+                    "'O''Brien'",
+                    "engine {engine:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A value that closes the literal and appends its own predicate must stay inert: the whole
+    /// value belongs inside the quotes. Before the escaping, `x' OR 1=1 --` bound as a `TRUE`
+    /// disjunct and a `DELETE` filtering on it removed every row.
+    #[test]
+    fn test_string_literal_neutralizes_injected_predicate() -> Result<()> {
+        let expr = Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
+            left: Box::new(col("name")),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("x' OR 1=1 --".to_string())),
+                None,
+            )),
+        });
+        assert_eq!(
+            to_sql_with_engine(&expr, Some(Engine::DuckDB))?,
+            r#""name" = 'x'' OR 1=1 --'"#
+        );
+        Ok(())
+    }
+
+    /// MySQL and Spark also read `\` inside a literal, so a trailing backslash would escape the
+    /// closing quote. The other engines take `\` literally and must not gain an extra one.
+    #[test]
+    fn test_string_literal_backslash_is_engine_specific() -> Result<()> {
+        let expr = Expr::Literal(ScalarValue::Utf8(Some(r"C:\temp\".to_string())), None);
+
+        for engine in [Engine::MySQL, Engine::Spark] {
+            assert_eq!(
+                to_sql_with_engine(&expr, Some(engine))?,
+                r"'C:\\temp\\'",
+                "engine {engine:?}"
+            );
+        }
+
+        for engine in [
+            None,
+            Some(Engine::DuckDB),
+            Some(Engine::SQLite),
+            Some(Engine::Postgres),
+            Some(Engine::ODBC),
+        ] {
+            assert_eq!(
+                to_sql_with_engine(&expr, engine)?,
+                r"'C:\temp\'",
+                "engine {engine:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The escaping has to reach every path that renders a literal, not just a bare comparison.
+    #[test]
+    fn test_string_literal_escaped_in_like_and_in_list() -> Result<()> {
+        let like = Expr::Like(Like {
+            expr: Box::new(col("name")),
+            pattern: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("%O'B%".to_string())),
+                None,
+            )),
+            case_insensitive: false,
+            negated: false,
+            escape_char: None,
+        });
+        assert_eq!(
+            to_sql_with_engine(&like, Some(Engine::DuckDB))?,
+            r#""name" LIKE '%O''B%'"#
+        );
+
+        let in_list = Expr::InList(InList {
+            expr: Box::new(col("name")),
+            list: vec![
+                Expr::Literal(ScalarValue::Utf8(Some("O'Brien".to_string())), None),
+                Expr::Literal(ScalarValue::Utf8(Some("D'Arcy".to_string())), None),
+            ],
+            negated: false,
+        });
+        assert_eq!(
+            to_sql_with_engine(&in_list, Some(Engine::DuckDB))?,
+            r#""name" IN ('O''Brien', 'D''Arcy')"#
+        );
+        Ok(())
+    }
+
+    /// A column name may itself contain the quote character that delimits the identifier.
+    #[test]
+    fn test_column_identifier_doubles_embedded_quote() -> Result<()> {
+        let expr = Expr::Column(datafusion::common::Column::new_unqualified(r#"we"ird"#));
+        assert_eq!(
+            to_sql_with_engine(&expr, Some(Engine::DuckDB))?,
+            r#""we""ird""#
+        );
+        assert_eq!(quote_identifier("plain"), r#""plain""#);
         Ok(())
     }
 

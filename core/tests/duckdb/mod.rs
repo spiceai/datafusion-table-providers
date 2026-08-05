@@ -462,3 +462,58 @@ mod composite_delete_stack_overflow {
         handle.join().unwrap();
     }
 }
+
+/// Executes the `DELETE` statements the DML path builds against DuckDB, for filter values that
+/// contain the character that delimits a SQL string literal.
+///
+/// Unescaped, the two values below fail in opposite directions: `O'Brien` terminates the literal
+/// early and DuckDB rejects the statement, while `x' OR 1=1 --` closes the literal and appends a
+/// tautology, so the delete binds and removes every row instead of none.
+mod dml_string_literal_escaping {
+    use datafusion::prelude::{col, lit};
+    use datafusion_table_providers::sql::sql_provider_datafusion::expr::Engine;
+    use datafusion_table_providers::util::dml::filters_to_sql;
+    use duckdb::Connection;
+
+    fn setup() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+        conn.execute_batch(
+            "CREATE TABLE people (name VARCHAR);
+             INSERT INTO people VALUES ('O''Brien'), ('Smith'), ('Jones');",
+        )
+        .expect("seed table");
+        conn
+    }
+
+    fn row_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM people", [], |r| r.get(0))
+            .expect("count rows")
+    }
+
+    fn delete_where(conn: &Connection, value: &str) -> duckdb::Result<()> {
+        let where_clause = filters_to_sql(&[col("name").eq(lit(value))], Some(Engine::DuckDB))
+            .expect("filters_to_sql");
+        conn.execute_batch(&format!("DELETE FROM people WHERE {where_clause}"))
+    }
+
+    /// An apostrophe is ordinary in a name. Unescaped it produced
+    /// `DELETE FROM people WHERE "name" = 'O'Brien'`, which DuckDB rejects with a parser error.
+    #[test]
+    fn apostrophe_in_value_deletes_only_the_matching_row() {
+        let conn = setup();
+        delete_where(&conn, "O'Brien").expect("delete with an apostrophe should execute");
+        assert_eq!(row_count(&conn), 2, "only the matching row should be gone");
+    }
+
+    /// Unescaped, this value bound as `"name" = 'x' OR 1=1 --'` and deleted all three rows.
+    #[test]
+    fn quote_bearing_value_matches_no_row_rather_than_every_row() {
+        let conn = setup();
+        delete_where(&conn, "x' OR 1=1 --").expect("delete should execute");
+        assert_eq!(
+            row_count(&conn),
+            3,
+            "no row matches, so none may be deleted"
+        );
+    }
+}
