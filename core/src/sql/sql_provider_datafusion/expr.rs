@@ -45,6 +45,28 @@ impl Engine {
     }
 }
 
+/// Renders `value` as a SQL string literal, doubling any embedded single quote.
+///
+/// Interpolating the value bare lets a single quote close the literal early: an ordinary
+/// apostrophe then makes the statement fail to parse, and a value shaped like `x' OR 1=1 --`
+/// binds as a wider predicate than the caller wrote, so a `DELETE` can match rows the filter
+/// excluded. Quote doubling is accepted by every engine this function renders for, and matches
+/// what `DataFusion`'s own unparser emits.
+///
+/// `Engine::MySQL` and `Engine::Spark` additionally treat `\` as an escape character (MySQL
+/// unless `NO_BACKSLASH_ESCAPES` is set), so a backslash-bearing value needs engine-aware
+/// escaping on top of this. No caller renders either engine through this function today — both
+/// reach their target through `SqlTable`, which unparses with a `Dialect`.
+pub(crate) fn string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Renders `name` as a double-quoted SQL identifier, doubling any embedded quote so that a
+/// quote in a column name cannot close the identifier early.
+pub(crate) fn quoted_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::cast_precision_loss)]
 pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String> {
@@ -92,7 +114,7 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
         }
         Expr::Column(name) => match engine {
             Some(Engine::Spark | Engine::ODBC) => Ok(format!("{name}")),
-            _ => Ok(format!("\"{name}\"")),
+            _ => Ok(quoted_identifier(&name.to_string())),
         },
         Expr::Cast(cast) => handle_cast(cast, engine, expr),
         Expr::Literal(value, _) => match value {
@@ -119,7 +141,7 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
             ScalarValue::Boolean(Some(value)) => Ok(value.to_string()),
             ScalarValue::Utf8(Some(value))
             | ScalarValue::LargeUtf8(Some(value))
-            | ScalarValue::Utf8View(Some(value)) => Ok(format!("'{value}'")),
+            | ScalarValue::Utf8View(Some(value)) => Ok(string_literal(value)),
             ScalarValue::Float32(Some(value)) => Ok(value.to_string()),
             ScalarValue::Float64(Some(value)) => Ok(value.to_string()),
             ScalarValue::Int8(Some(value)) => Ok(value.to_string()),
@@ -782,5 +804,119 @@ mod tests {
             sql,
             "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < TO_TIMESTAMP(1767225600)"
         );
+    }
+
+    fn utf8(value: &str) -> Expr {
+        Expr::Literal(ScalarValue::Utf8(Some(value.to_string())), None)
+    }
+
+    /// An apostrophe is ordinary in real data (names, addresses, free text). Rendered bare it
+    /// closes the literal early and the statement fails to parse, so a `DELETE`/`UPDATE`
+    /// filtering on such a value cannot run at all.
+    #[test]
+    fn test_apostrophe_in_string_literal_is_doubled() -> Result<()> {
+        assert_eq!(to_sql(&utf8("O'Brien"))?, "'O''Brien'");
+
+        // Every engine renders through the same arm, and quote doubling is correct for each.
+        for engine in [
+            Engine::DuckDB,
+            Engine::SQLite,
+            Engine::Postgres,
+            Engine::MySQL,
+            Engine::Spark,
+            Engine::ODBC,
+        ] {
+            assert_eq!(
+                to_sql_with_engine(&utf8("O'Brien"), Some(engine))?,
+                "'O''Brien'",
+                "engine {engine:?} must escape the quote"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// `LargeUtf8`/`Utf8View` share the arm — DataFusion's type coercion picks between them, so
+    /// escaping only one variant would leave the defect reachable.
+    #[test]
+    fn test_every_string_scalar_variant_is_escaped() -> Result<()> {
+        for value in [
+            ScalarValue::Utf8(Some("it's".to_string())),
+            ScalarValue::LargeUtf8(Some("it's".to_string())),
+            ScalarValue::Utf8View(Some("it's".to_string())),
+        ] {
+            assert_eq!(to_sql(&Expr::Literal(value, None))?, "'it''s'");
+        }
+
+        Ok(())
+    }
+
+    /// The unbounded-deletion shape: rendered bare, `WHERE "name" = 'x' OR 1=1 --'` binds as a
+    /// tautology and a `DELETE` matches every row instead of none.
+    #[test]
+    fn test_quote_bearing_value_stays_a_single_literal() -> Result<()> {
+        let expr = col("name").eq(utf8("x' OR 1=1 --"));
+
+        assert_eq!(to_sql(&expr)?, "\"name\" = 'x'' OR 1=1 --'");
+
+        Ok(())
+    }
+
+    /// Every construct that carries a string value routes through the same literal arm.
+    #[test]
+    fn test_quotes_are_escaped_in_like_and_in_list() -> Result<()> {
+        let like = Expr::Like(Like {
+            expr: Box::new(col("name")),
+            pattern: Box::new(utf8("%O'B%")),
+            case_insensitive: false,
+            negated: false,
+            escape_char: None,
+        });
+        assert_eq!(to_sql(&like)?, "\"name\" LIKE '%O''B%'");
+
+        let in_list = Expr::InList(InList {
+            expr: Box::new(col("name")),
+            list: vec![utf8("O'Brien"), utf8("plain")],
+            negated: false,
+        });
+        assert_eq!(to_sql(&in_list)?, "\"name\" IN ('O''Brien', 'plain')");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_string_literal_edge_cases() -> Result<()> {
+        assert_eq!(to_sql(&utf8(""))?, "''");
+        assert_eq!(to_sql(&utf8("'"))?, "''''");
+        assert_eq!(to_sql(&utf8("''"))?, "''''''");
+        assert_eq!(to_sql(&utf8("a'b'c"))?, "'a''b''c'");
+
+        // A backslash is an ordinary character for the engines reached through this function,
+        // so it must pass through unchanged rather than be doubled.
+        assert_eq!(to_sql(&utf8(r"a\b"))?, r"'a\b'");
+
+        Ok(())
+    }
+
+    /// An Arrow field name may contain a double quote, which would otherwise close the
+    /// identifier early and leave the rest of the name as SQL text.
+    #[test]
+    fn test_quote_in_column_name_is_doubled() -> Result<()> {
+        let column = Expr::Column(datafusion::common::Column::new_unqualified("we\"ird"));
+        let expr = column.eq(utf8("v"));
+
+        assert_eq!(to_sql(&expr)?, "\"we\"\"ird\" = 'v'");
+
+        Ok(())
+    }
+
+    /// A value with no quote in it must render exactly as before — the escape is a no-op for
+    /// the overwhelmingly common case.
+    #[test]
+    fn test_ordinary_values_are_unchanged() -> Result<()> {
+        assert_eq!(to_sql(&col("a").eq(utf8("plain")))?, "\"a\" = 'plain'");
+        assert_eq!(to_sql(&col("a").eq(int(1)))?, "\"a\" = 1");
+
+        Ok(())
     }
 }

@@ -36,7 +36,8 @@ pub fn assignments_to_sql(
     let parts: Result<Vec<String>, _> = assignments
         .iter()
         .map(|(col, val)| {
-            expr::to_sql_with_engine(val, engine).map(|sql_val| format!(r#""{col}" = {sql_val}"#))
+            expr::to_sql_with_engine(val, engine)
+                .map(|sql_val| format!("{col} = {sql_val}", col = expr::quoted_identifier(col)))
         })
         .collect();
     parts
@@ -241,5 +242,33 @@ mod tests {
         let sql =
             assignments_to_sql(&assignments, None).expect("assignments_to_sql should succeed");
         assert_eq!(sql, r#""name" = 'foo', "age" = 30"#);
+    }
+
+    /// The WHERE clause a `DELETE`/`UPDATE` is built from must keep a quote-bearing value
+    /// inside its literal: rendered bare, `= 'x' OR 1=1 --'` is a tautology and the statement
+    /// matches every row.
+    #[test]
+    fn test_filters_to_sql_escapes_a_quote_bearing_value() {
+        let filter = col("name").eq(lit("x' OR 1=1 --"));
+        let sql = filters_to_sql(&[filter], None).expect("filters_to_sql should succeed");
+        assert_eq!(sql, r#""name" = 'x'' OR 1=1 --'"#);
+
+        let apostrophe = col("name").eq(lit("O'Brien"));
+        let sql = filters_to_sql(&[apostrophe], None).expect("filters_to_sql should succeed");
+        assert_eq!(sql, r#""name" = 'O''Brien'"#);
+    }
+
+    /// A SET clause carries both a value and a column name, and interpolates the name itself.
+    #[test]
+    fn test_assignments_to_sql_escapes_value_and_column_name() {
+        let assignments = vec![("name".to_string(), lit("O'Brien"))];
+        let sql =
+            assignments_to_sql(&assignments, None).expect("assignments_to_sql should succeed");
+        assert_eq!(sql, r#""name" = 'O''Brien'"#);
+
+        let quoted_column = vec![("we\"ird".to_string(), lit(1i32))];
+        let sql =
+            assignments_to_sql(&quoted_column, None).expect("assignments_to_sql should succeed");
+        assert_eq!(sql, r#""we""ird" = 1"#);
     }
 }
