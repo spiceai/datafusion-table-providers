@@ -911,8 +911,7 @@ pub(crate) mod tests {
     use crate::{
         duckdb::make_initial_table,
         sql::db_connection_pool::{
-            dbconnection::duckdbconn::DuckDbConnection,
-            duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
+            dbconnection::duckdbconn::DuckDbConnection, duckdbpool::DuckDbConnectionPool,
         },
     };
     use datafusion::{
@@ -2076,21 +2075,13 @@ pub(crate) mod tests {
     /// `duckdb_tables()`. An attached database holding that same name contributes a second row,
     /// and the row the lookup picks decides the columns the dataset's table is created with.
     ///
-    /// The session sits on an *attached* catalog here, the way the file-swap path leaves it, so
-    /// that the default catalog — which `duckdb_tables()` lists first — is the one holding the
-    /// decoy. An unscoped lookup reads that row rather than the table it just created.
+    /// The decoy sits in another *schema* of the same database, which `duckdb_tables()` lists
+    /// ahead of `main`, so an unscoped lookup reads the decoy's DDL rather than the table it just
+    /// created.
     #[tokio::test]
-    async fn test_create_table_reads_back_its_own_ddl_not_an_attachments() {
+    async fn test_create_table_reads_back_its_own_ddl_not_another_schemas() {
         let _guard = init_tracing(None);
-        // Every connection this pool hands out sits on `live`, including the one
-        // `create_table` checks out for itself.
-        let pool = Arc::new(
-            DuckDbConnectionPoolBuilder::memory()
-                .with_connection_setup_query("ATTACH IF NOT EXISTS ':memory:' AS live")
-                .with_connection_setup_query("USE live")
-                .build()
-                .expect("to build a memory duckdb connection pool"),
-        );
+        let pool = get_mem_duckdb();
 
         let table_definition = get_basic_table_definition();
         let internal = TableManager::new(Arc::clone(&table_definition))
@@ -2103,17 +2094,19 @@ pub(crate) mod tests {
             .downcast_mut::<DuckDbConnection>()
             .expect("to downcast to duckdb connection");
 
-        // The decoy goes in the *default* catalog, which the session no longer resolves bare
-        // names in.
-        conn.get_underlying_conn_mut()
-            .execute(
+        {
+            let raw = conn.get_underlying_conn_mut();
+            raw.execute("CREATE SCHEMA elsewhere", [])
+                .expect("to create a second schema");
+            raw.execute(
                 &format!(
-                    "CREATE TABLE memory.main.{decoy} (decoy VARCHAR)",
+                    "CREATE TABLE elsewhere.{decoy} (decoy VARCHAR)",
                     decoy = internal.table_name().quoted()
                 ),
                 [],
             )
             .expect("to create the decoy table");
+        }
 
         let tx = conn
             .get_underlying_conn_mut()
@@ -2139,7 +2132,7 @@ pub(crate) mod tests {
                 .iter()
                 .map(|f| f.name().clone())
                 .collect::<Vec<_>>(),
-            "the table is created from its own DDL, not from the attached database's decoy"
+            "the table is created from its own DDL, not from the other schema's decoy"
         );
 
         tx.rollback().expect("should rollback transaction");
