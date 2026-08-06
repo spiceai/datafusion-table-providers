@@ -596,22 +596,37 @@ impl TableManager {
         &self,
         tx: &Transaction<'_>,
     ) -> super::Result<HashSet<String>> {
-        // `duckdb_constraints.table_name` holds the table's name as an ordinary string column, so
-        // the name is matched as a string literal here and never reaches an identifier parser.
-        // `pragma_table_info` cannot serve this lookup: it re-parses its argument with DuckDB's
-        // qualified-name parser, which splits a dotted name and rejects the doubled quote an
-        // escaped identifier carries ("Unterminated quote in qualified name").
-        //
-        // The view spans every attached database and schema — and the file-swap path does attach a
-        // second database — so the lookup is narrowed to the one a bare table reference resolves
-        // in, which is what `pragma_table_info` resolved through.
-        let sql = format!(
-            "SELECT unnest(constraint_column_names) FROM duckdb_constraints() \
-             WHERE database_name = current_database() AND schema_name = current_schema() \
-             AND table_name = {table_name} AND constraint_type = 'PRIMARY KEY'",
-            table_name =
-                expr::string_literal(self.table_name().as_str(), Some(expr::Engine::DuckDB))
-        );
+        let table_name = self.table_name();
+        let sql = if table_name.as_str().contains('"') {
+            // `pragma_table_info` re-parses its argument with DuckDB's own qualified-name parser,
+            // and that parser rejects the doubled quote an escaped identifier carries
+            // ("Unterminated quote in qualified name"), so no escaping at this call site can
+            // address a name holding a `"`. `duckdb_constraints.table_name` is an ordinary string
+            // column, which needs no identifier parsing at all.
+            //
+            // It is the fallback rather than the only path because it costs a scan over every
+            // constraint in every attached database: measured against 100 tables it takes ~8ms to
+            // the pragma's ~0.8ms, and it grows with the table count while the pragma stays flat.
+            // This lookup runs on every append, so the common name keeps the constant-time path.
+            //
+            // The view also spans every attachment — and the file-swap path does attach a second
+            // database — so it is narrowed to the database and schema a bare table reference
+            // resolves in, which is what the pragma resolved through.
+            format!(
+                "SELECT unnest(constraint_column_names) FROM duckdb_constraints() \
+                 WHERE database_name = current_database() AND schema_name = current_schema() \
+                 AND table_name = {table_name} AND constraint_type = 'PRIMARY KEY'",
+                table_name = expr::string_literal(table_name.as_str(), Some(expr::Engine::DuckDB))
+            )
+        } else {
+            // A name carrying a dot must stay a single identifier rather than split into
+            // schema.table, so the quoted identifier is nested inside the string literal and needs
+            // the literal escape as well as the identifier one.
+            format!(
+                "SELECT name FROM pragma_table_info({table_name}) WHERE pk = true",
+                table_name = expr::string_literal(&table_name.quoted(), Some(expr::Engine::DuckDB))
+            )
+        };
         tracing::debug!("{sql}");
 
         let mut stmt = tx
@@ -1816,71 +1831,80 @@ pub(crate) mod tests {
         tx.rollback().expect("should rollback transaction");
     }
 
-    /// `current_primary_keys` used to address the table through `pragma_table_info`, whose
-    /// argument DuckDB re-parses as a qualified name. No escaping reaches that parser: the
-    /// doubled quote of an escaped identifier is rejected outright, so the primary-key drift
-    /// check could not read back a table whose name holds a `"`.
+    /// `current_primary_keys` addressed the table through `pragma_table_info`, whose argument
+    /// DuckDB re-parses as a qualified name. No escaping reaches that parser: the doubled quote of
+    /// an escaped identifier is rejected outright, so the primary-key drift check could not read
+    /// back a table whose name holds a `"`. A `"` now selects the `duckdb_constraints()` fallback.
+    ///
+    /// Runs one identical table under three names, so the two lookups are held to the same answer
+    /// rather than only to their own: a `"` (the fallback), a dot (the pragma, whose argument must
+    /// stay one identifier rather than split into schema.table), and a plain name.
     #[tokio::test]
-    async fn test_quote_bearing_table_name_reaches_the_primary_key_lookup() {
+    async fn test_both_primary_key_lookups_agree_on_an_awkward_table_name() {
         let _guard = init_tracing(None);
-        let pool = get_mem_duckdb();
 
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
-            arrow::datatypes::Field::new("part", arrow::datatypes::DataType::Int64, false),
-            arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Utf8, true),
-        ]));
-        let table_definition = Arc::new(
-            TableDefinition::new(RelationName::new(r#"we"ird.tbl"#), Arc::clone(&schema))
-                .with_constraints(get_pk_constraints(&["id", "part"], Arc::clone(&schema))),
-        );
+        for name in [r#"we"ird.tbl"#, "sch.dotted", "o'brien", "plain"] {
+            let pool = get_mem_duckdb();
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+                arrow::datatypes::Field::new("part", arrow::datatypes::DataType::Int64, false),
+                arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Utf8, true),
+            ]));
+            let table_definition = Arc::new(
+                TableDefinition::new(RelationName::new(name), Arc::clone(&schema))
+                    .with_constraints(get_pk_constraints(&["id", "part"], Arc::clone(&schema))),
+            );
 
-        let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
-        let conn = pool_conn
-            .as_any_mut()
-            .downcast_mut::<DuckDbConnection>()
-            .expect("to downcast to duckdb connection");
-        let tx = conn
-            .get_underlying_conn_mut()
-            .transaction()
-            .expect("should begin transaction");
+            let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
+            let conn = pool_conn
+                .as_any_mut()
+                .downcast_mut::<DuckDbConnection>()
+                .expect("to downcast to duckdb connection");
+            let tx = conn
+                .get_underlying_conn_mut()
+                .transaction()
+                .expect("should begin transaction");
 
-        // Built by hand rather than through `create_table` so the table carries constraints the
-        // primary key does not cover: `duckdb_constraints()` holds one row per constraint of every
-        // kind, so the lookup has to pick out the PRIMARY KEY rows. A UNIQUE column and a NOT NULL
-        // column outside the key are the two other kinds the accelerator's tables can carry.
-        let table = TableManager::from_table_name(
-            Arc::clone(&table_definition),
-            RelationName::new(r#"we"ird.tbl"#),
-        );
-        tx.execute(
-            &format!(
-                "CREATE TABLE {table} (\
-                 id BIGINT, part BIGINT, payload VARCHAR UNIQUE, tag VARCHAR NOT NULL, \
-                 PRIMARY KEY (id, part))",
-                table = table.table_name().quoted(),
-            ),
-            [],
-        )
-        .expect("to create a table whose name holds a quote");
+            // Built by hand rather than through `create_table` so the table carries constraints the
+            // primary key does not cover: `duckdb_constraints()` holds one row per constraint of
+            // every kind, so the fallback has to pick out the PRIMARY KEY rows. A UNIQUE column and
+            // a NOT NULL column outside the key are the two other kinds these tables can carry.
+            let table = TableManager::from_table_name(
+                Arc::clone(&table_definition),
+                RelationName::new(name),
+            );
+            tx.execute(
+                &format!(
+                    "CREATE TABLE {table} (\
+                     id BIGINT, part BIGINT, payload VARCHAR UNIQUE, tag VARCHAR NOT NULL, \
+                     PRIMARY KEY (id, part))",
+                    table = table.table_name().quoted(),
+                ),
+                [],
+            )
+            .unwrap_or_else(|e| panic!("should create a table named {name:?}: {e}"));
 
-        let primary_keys = table
-            .current_primary_keys(&tx)
-            .expect("to read the primary keys of a quote-bearing table name");
-        assert_eq!(
-            primary_keys,
-            ["id".to_string(), "part".to_string()]
-                .into_iter()
-                .collect::<HashSet<String>>(),
-            "both primary-key columns come back, and neither the UNIQUE nor the NOT NULL column does"
-        );
+            assert_eq!(
+                table
+                    .current_primary_keys(&tx)
+                    .unwrap_or_else(|e| panic!("should read the primary keys of {name:?}: {e}")),
+                ["id".to_string(), "part".to_string()]
+                    .into_iter()
+                    .collect::<HashSet<String>>(),
+                "for {name:?}, both primary-key columns come back and neither the UNIQUE nor the \
+                 NOT NULL column does"
+            );
 
-        // The drift check itself, which is the only caller, must now agree.
-        assert!(table
-            .verify_primary_keys_match(&table, &tx)
-            .expect("to compare primary keys"));
+            // The drift check itself, which is the only caller, must agree.
+            assert!(
+                table
+                    .verify_primary_keys_match(&table, &tx)
+                    .expect("to compare primary keys"),
+                "the drift check must see no drift for {name:?}"
+            );
 
-        tx.rollback().expect("should rollback transaction");
+            tx.rollback().expect("should rollback transaction");
+        }
     }
 
     /// `duckdb_constraints()` spans every attached database and schema, unlike the
