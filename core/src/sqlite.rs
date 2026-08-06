@@ -9,6 +9,7 @@ use crate::sql::db_connection_pool::{
     DbConnectionPool, Mode,
 };
 use crate::sql::sql_provider_datafusion;
+use crate::sql::sql_provider_datafusion::expr;
 use crate::util::schema::SchemaValidator;
 use crate::util::supported_functions::FunctionSupport;
 use crate::UnsupportedTypeAction;
@@ -735,14 +736,16 @@ impl Sqlite {
     }
 
     async fn table_exists(&self, sqlite_conn: &mut SqliteConnection) -> bool {
+        // `sqlite_master.name` holds the table's name, so it is matched as a string literal
+        // here rather than named as an identifier.
         let sql = format!(
             "SELECT EXISTS (
           SELECT 1
           FROM sqlite_master
           WHERE type='table'
-          AND name = '{name}'
+          AND name = {name}
         )",
-            name = self.table
+            name = expr::string_literal(&self.table.to_string(), Some(expr::Engine::SQLite))
         );
         tracing::trace!("{sql}");
 
@@ -823,7 +826,7 @@ impl Sqlite {
         let column_names: Vec<String> = schema
             .fields()
             .iter()
-            .map(|f| format!("\"{}\"", f.name()))
+            .map(|f| expr::quoted_identifier(f.name()))
             .collect();
 
         let placeholders: Vec<String> = (0..schema.fields().len())
@@ -1533,6 +1536,8 @@ pub(crate) mod tests {
         prelude::SessionContext,
     };
 
+    use crate::sql::db_connection_pool::JoinPushDown;
+
     use super::*;
 
     #[tokio::test]
@@ -1666,5 +1671,105 @@ pub(crate) mod tests {
                 .into_iter()
                 .collect::<HashSet<String>>()
         );
+    }
+
+    async fn memory_pool() -> Arc<SqliteConnectionPool> {
+        Arc::new(
+            SqliteConnectionPool::new(
+                ":memory:",
+                Mode::Memory,
+                JoinPushDown::Disallow,
+                Vec::new(),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("should create an in-memory sqlite pool"),
+        )
+    }
+
+    /// `table_exists` matches `sqlite_master.name` as a string literal. An apostrophe in the
+    /// dataset name closed that literal early, and because the query result is discarded with
+    /// `unwrap_or(false)` the parse error surfaced as "the table does not exist" — silently, on a
+    /// table that is right there.
+    #[tokio::test]
+    async fn test_table_exists_escapes_an_apostrophe_in_the_table_name() {
+        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "id",
+            DataType::Int64,
+            true,
+        )]));
+        let sqlite = Sqlite::new(
+            TableReference::bare("o'brien"),
+            Arc::clone(&schema),
+            memory_pool().await,
+            Constraints::new_unverified(vec![]),
+        );
+
+        let mut db_conn = sqlite.connect().await.expect("should connect to db");
+        let sqlite_conn = Sqlite::sqlite_conn(&mut db_conn).expect("should get sqlite connection");
+
+        assert!(
+            !sqlite.table_exists(sqlite_conn).await,
+            "the table has not been created yet"
+        );
+
+        sqlite_conn
+            .conn
+            .call(|conn| {
+                conn.execute(r#"CREATE TABLE "o'brien" (id INTEGER)"#, [])?;
+                Ok::<_, tokio_rusqlite::Error>(())
+            })
+            .await
+            .expect("should create the table");
+
+        assert!(
+            sqlite.table_exists(sqlite_conn).await,
+            "the table exists and must be found despite the apostrophe in its name"
+        );
+    }
+
+    /// The prepared-insert column list interpolated Arrow field names into quoted identifiers
+    /// without escaping them, so a quote in a column name closed the identifier early.
+    #[tokio::test]
+    async fn test_insert_batch_prepared_escapes_a_quote_in_a_column_name() {
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new(r#"we"ird"#, DataType::Int64, true),
+            arrow::datatypes::Field::new("plain", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![1_i64, 2])),
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .expect("should build the record batch");
+
+        let sqlite = Sqlite::new(
+            TableReference::bare("tbl"),
+            Arc::clone(&schema),
+            memory_pool().await,
+            Constraints::new_unverified(vec![]),
+        );
+
+        // `insert_batch_prepared` takes the transaction as an argument and reads only the table
+        // name and schema off `self`, so a plain rusqlite connection is enough to execute it.
+        let mut conn = rusqlite::Connection::open_in_memory().expect("should open sqlite");
+        conn.execute(
+            r#"CREATE TABLE "tbl" ("we""ird" INTEGER, "plain" TEXT)"#,
+            [],
+        )
+        .expect("should create the table");
+        let tx = conn.transaction().expect("should begin a transaction");
+
+        sqlite
+            .insert_batch_prepared(&tx, batch, None)
+            .expect("should insert a batch with a quote-bearing column name");
+        tx.commit().expect("should commit");
+
+        let total: i64 = conn
+            .query_row(r#"SELECT SUM("we""ird") FROM "tbl""#, [], |r| r.get(0))
+            .expect("should read the rows back");
+        assert_eq!(total, 3);
     }
 }
