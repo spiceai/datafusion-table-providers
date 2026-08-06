@@ -87,6 +87,7 @@ pub struct SqlTable<T: 'static, P: 'static> {
     constraints: Option<Constraints>,
     pub(crate) function_support: Option<FunctionSupport>,
     allow_physical_filter_pushdown: bool,
+    allow_physical_sort_pushdown: bool,
 }
 
 impl<T, P> std::fmt::Debug for SqlTable<T, P> {
@@ -135,6 +136,7 @@ impl<T, P> SqlTable<T, P> {
             constraints: None,
             function_support: None,
             allow_physical_filter_pushdown: true,
+            allow_physical_sort_pushdown: true,
         })
     }
 
@@ -155,6 +157,7 @@ impl<T, P> SqlTable<T, P> {
             constraints: None,
             function_support: None,
             allow_physical_filter_pushdown: true,
+            allow_physical_sort_pushdown: true,
         }
     }
 
@@ -185,6 +188,19 @@ impl<T, P> SqlTable<T, P> {
     #[must_use]
     pub fn with_allow_physical_filter_pushdown(mut self, allow: bool) -> Self {
         self.allow_physical_filter_pushdown = allow;
+        self
+    }
+
+    /// Disables physical-level sort pushdown on the underlying `SqlExec`.
+    ///
+    /// When set to `false`, a `SortExec` above the scan will NOT be absorbed into
+    /// the generated SQL as an `ORDER BY`, and the sort is performed by DataFusion
+    /// instead. This is required for query languages that cannot order an arbitrary
+    /// scan: CQL (ScyllaDB/Cassandra) accepts `ORDER BY` only when the partition key
+    /// is restricted by `=` or `IN`, and rejects the statement otherwise.
+    #[must_use]
+    pub fn with_allow_physical_sort_pushdown(mut self, allow: bool) -> Self {
+        self.allow_physical_sort_pushdown = allow;
         self
     }
 
@@ -271,7 +287,8 @@ impl<T, P> SqlTable<T, P> {
             sql,
             self.dialect_arc(),
         )?
-        .with_allow_physical_filter_pushdown(self.allow_physical_filter_pushdown);
+        .with_allow_physical_filter_pushdown(self.allow_physical_filter_pushdown)
+        .with_allow_physical_sort_pushdown(self.allow_physical_sort_pushdown);
         Ok(Arc::new(exec))
     }
 
@@ -399,6 +416,7 @@ pub struct SqlExec<T, P> {
     properties: Arc<PlanProperties>,
     dialect: Arc<dyn Dialect + Send + Sync>,
     allow_physical_filter_pushdown: bool,
+    allow_physical_sort_pushdown: bool,
 }
 
 impl<T, P> Clone for SqlExec<T, P> {
@@ -410,6 +428,7 @@ impl<T, P> Clone for SqlExec<T, P> {
             properties: self.properties.clone(),
             dialect: Arc::clone(&self.dialect),
             allow_physical_filter_pushdown: self.allow_physical_filter_pushdown,
+            allow_physical_sort_pushdown: self.allow_physical_sort_pushdown,
         }
     }
 }
@@ -436,6 +455,7 @@ impl<T, P> SqlExec<T, P> {
             )),
             dialect,
             allow_physical_filter_pushdown: true,
+            allow_physical_sort_pushdown: true,
         })
     }
 
@@ -456,6 +476,25 @@ impl<T, P> SqlExec<T, P> {
     #[must_use]
     pub fn allow_physical_filter_pushdown(&self) -> bool {
         self.allow_physical_filter_pushdown
+    }
+
+    /// Disables physical-level sort pushdown (`try_pushdown_sort`).
+    ///
+    /// When set to `false`, this `SqlExec` will reject sort pushdown requests, so
+    /// the `SortExec` above it is kept and DataFusion performs the sort. This is
+    /// required for query languages that cannot order an arbitrary scan: CQL
+    /// (ScyllaDB/Cassandra) accepts `ORDER BY` only when the partition key is
+    /// restricted by `=` or `IN`, and rejects the statement otherwise.
+    #[must_use]
+    pub fn with_allow_physical_sort_pushdown(mut self, allow: bool) -> Self {
+        self.allow_physical_sort_pushdown = allow;
+        self
+    }
+
+    /// Returns whether physical-level sort pushdown is enabled.
+    #[must_use]
+    pub fn allow_physical_sort_pushdown(&self) -> bool {
+        self.allow_physical_sort_pushdown
     }
 
     #[must_use]
@@ -659,7 +698,7 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
         use datafusion::logical_expr::expr::Sort;
         use datafusion::physical_expr::expressions::Column;
 
-        if order.is_empty() {
+        if !self.allow_physical_sort_pushdown || order.is_empty() {
             return Ok(SortOrderPushdownResult::Unsupported);
         }
 
@@ -703,6 +742,7 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
             properties: self.properties.clone(),
             dialect: Arc::clone(&self.dialect),
             allow_physical_filter_pushdown: self.allow_physical_filter_pushdown,
+            allow_physical_sort_pushdown: self.allow_physical_sort_pushdown,
         };
 
         // Update equivalence properties to reflect the output ordering
@@ -738,6 +778,7 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
             properties: self.properties.clone(),
             dialect: Arc::clone(&self.dialect),
             allow_physical_filter_pushdown: self.allow_physical_filter_pushdown,
+            allow_physical_sort_pushdown: self.allow_physical_sort_pushdown,
         }))
     }
 
@@ -793,6 +834,7 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
             properties: self.properties.clone(),
             dialect: Arc::clone(&self.dialect),
             allow_physical_filter_pushdown: self.allow_physical_filter_pushdown,
+            allow_physical_sort_pushdown: self.allow_physical_sort_pushdown,
         };
 
         Ok(
@@ -1171,7 +1213,7 @@ mod tests {
     }
 
     mod sort_pushdown_tests {
-        use crate::sql::sql_provider_datafusion::SqlExec;
+        use crate::sql::sql_provider_datafusion::{SqlExec, SqlTable};
         use arrow::compute::SortOptions;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
         use datafusion::physical_expr::expressions::Column;
@@ -1179,6 +1221,7 @@ mod tests {
         use datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult;
         use datafusion::physical_plan::ExecutionPlan;
         use datafusion::sql::unparser::dialect::DefaultDialect;
+        use datafusion::sql::TableReference;
         use std::sync::Arc;
 
         use crate::sql::db_connection_pool::{
@@ -1371,6 +1414,90 @@ mod tests {
                 }
                 other => panic!("Expected Exact, got {:?}", sort_result_name(&other)),
             }
+        }
+
+        #[test]
+        fn test_sort_pushdown_is_allowed_by_default() {
+            assert!(
+                make_exec("SELECT \"name\" FROM \"users\"").allow_physical_sort_pushdown(),
+                "sort pushdown must stay on unless a provider opts out"
+            );
+        }
+
+        #[test]
+        fn test_sort_pushdown_disabled_returns_unsupported() {
+            // ScyllaDB/CQL: `ORDER BY` is rejected unless the partition key is
+            // restricted by `=`/`IN`, so the sort must stay above the scan.
+            // https://github.com/spiceai/spiceai/issues/10775
+            let exec = make_exec("SELECT \"name\", \"age\" FROM \"users\"")
+                .with_allow_physical_sort_pushdown(false);
+
+            match exec.try_pushdown_sort(&order_by_name()).unwrap() {
+                SortOrderPushdownResult::Unsupported => {}
+                other => panic!("Expected Unsupported, got {:?}", sort_result_name(&other)),
+            }
+        }
+
+        #[test]
+        fn test_disabled_sort_pushdown_survives_limit_pushdown() {
+            // LimitPushdown runs before PushdownSort, so the node the sort rule sees
+            // is the one `with_fetch` produced, not the one the table built.
+            let exec = make_exec("SELECT \"name\", \"age\" FROM \"users\"")
+                .with_allow_physical_sort_pushdown(false);
+            let with_limit = exec.with_fetch(Some(10)).expect("with_fetch should apply");
+
+            match with_limit.try_pushdown_sort(&order_by_name()).unwrap() {
+                SortOrderPushdownResult::Unsupported => {}
+                other => panic!("Expected Unsupported, got {:?}", sort_result_name(&other)),
+            }
+        }
+
+        #[test]
+        fn test_disabled_sort_pushdown_survives_clone() {
+            let exec = make_exec("SELECT \"name\" FROM \"users\"")
+                .with_allow_physical_sort_pushdown(false);
+            assert!(!exec.clone().allow_physical_sort_pushdown());
+        }
+
+        #[test]
+        fn test_table_threads_sort_pushdown_setting_into_its_plan() {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, false),
+                Field::new("age", DataType::Int16, false),
+            ]));
+            let pool = Arc::new(MockDBPool {})
+                as Arc<dyn DbConnectionPool<(), &'static dyn ToString> + Send + Sync>;
+            let table = SqlTable::new_with_schema(
+                "mock",
+                &pool,
+                Arc::clone(&schema),
+                TableReference::bare("users"),
+                None,
+            )
+            .with_allow_physical_sort_pushdown(false);
+
+            let plan = table
+                .create_physical_plan(None, "SELECT \"name\", \"age\" FROM \"users\"".to_string())
+                .expect("physical plan should be created");
+            let exec = plan
+                .downcast_ref::<SqlExec<(), &'static dyn ToString>>()
+                .expect("plan should be a SqlExec");
+
+            assert!(!exec.allow_physical_sort_pushdown());
+            match exec.try_pushdown_sort(&order_by_name()).unwrap() {
+                SortOrderPushdownResult::Unsupported => {}
+                other => panic!("Expected Unsupported, got {:?}", sort_result_name(&other)),
+            }
+        }
+
+        fn order_by_name() -> Vec<PhysicalSortExpr> {
+            vec![PhysicalSortExpr {
+                expr: Arc::new(Column::new("name", 0)),
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                },
+            }]
         }
 
         fn sort_result_name(
