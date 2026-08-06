@@ -1845,24 +1845,24 @@ pub(crate) mod tests {
             .transaction()
             .expect("should begin transaction");
 
-        let table = TableManager::new(Arc::clone(&table_definition))
-            .with_internal(true)
-            .expect("to create table manager");
-        table
-            .create_table(Arc::clone(&pool), &tx)
-            .expect("to create a table whose name holds a quote");
-
-        // A UNIQUE constraint shares the catalog view with the primary key, so the lookup has to
-        // pick out the PRIMARY KEY rows rather than every constraint on the table.
+        // Built by hand rather than through `create_table` so the table carries constraints the
+        // primary key does not cover: `duckdb_constraints()` holds one row per constraint of every
+        // kind, so the lookup has to pick out the PRIMARY KEY rows. A UNIQUE column and a NOT NULL
+        // column outside the key are the two other kinds the accelerator's tables can carry.
+        let table = TableManager::from_table_name(
+            Arc::clone(&table_definition),
+            RelationName::new(r#"we"ird.tbl"#),
+        );
         tx.execute(
             &format!(
-                "CREATE UNIQUE INDEX {index} ON {table} (payload)",
-                index = RelationName::new("uq_payload").quoted(),
+                "CREATE TABLE {table} (\
+                 id BIGINT, part BIGINT, payload VARCHAR UNIQUE, tag VARCHAR NOT NULL, \
+                 PRIMARY KEY (id, part))",
                 table = table.table_name().quoted(),
             ),
             [],
         )
-        .expect("to create a unique index");
+        .expect("to create a table whose name holds a quote");
 
         let primary_keys = table
             .current_primary_keys(&tx)
@@ -1872,7 +1872,7 @@ pub(crate) mod tests {
             ["id".to_string(), "part".to_string()]
                 .into_iter()
                 .collect::<HashSet<String>>(),
-            "both primary-key columns come back, and the unique index does not"
+            "both primary-key columns come back, and neither the UNIQUE nor the NOT NULL column does"
         );
 
         // The drift check itself, which is the only caller, must now agree.
