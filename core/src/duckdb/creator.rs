@@ -68,7 +68,7 @@ impl From<TableReference> for RelationName {
 /// database, while the tables this module creates are named bare and therefore live in
 /// `current_database().current_schema()`. Matching on `table_name` alone lets an attached
 /// database — one the `attach_databases` parameter added, or the staging file the accelerator's
-/// swap path attaches — answer for a table of the same name that this connection cannot address.
+/// swap path attaches — answer for a table of the same name that this module does not manage.
 const CURRENT_CATALOG_SCOPE: &str =
     "database_name = current_database() AND schema_name = current_schema()";
 
@@ -1944,8 +1944,8 @@ pub(crate) mod tests {
     /// named `decoy_name` with a column no definition in these tests declares.
     ///
     /// This is the shape both the `attach_databases` parameter and the accelerator's file-swap
-    /// staging file produce: a catalog the connection can see but a bare table reference cannot
-    /// address.
+    /// staging file produce: a catalog the connection can see but a bare `CREATE TABLE` never
+    /// lands in.
     fn attach_decoy_database(conn: &mut DuckDbConnection, decoy_name: &RelationName) {
         let raw = conn.get_underlying_conn_mut();
         raw.execute("ATTACH ':memory:' AS staging", [])
@@ -1953,6 +1953,23 @@ pub(crate) mod tests {
         raw.execute(
             &format!(
                 "CREATE TABLE staging.main.{decoy} (decoy VARCHAR)",
+                decoy = decoy_name.quoted()
+            ),
+            [],
+        )
+        .expect("to create the decoy table");
+    }
+
+    /// Creates a same-named decoy table in another schema of the *current* database. Bare names
+    /// resolve in `current_schema()`, so this table is not the one the creator manages either —
+    /// and `duckdb_tables()` lists it ahead of `main`.
+    fn create_decoy_in_another_schema(conn: &mut DuckDbConnection, decoy_name: &RelationName) {
+        let raw = conn.get_underlying_conn_mut();
+        raw.execute("CREATE SCHEMA elsewhere", [])
+            .expect("to create a second schema");
+        raw.execute(
+            &format!(
+                "CREATE TABLE elsewhere.{decoy} (decoy VARCHAR)",
                 decoy = decoy_name.quoted()
             ),
             [],
@@ -2094,19 +2111,7 @@ pub(crate) mod tests {
             .downcast_mut::<DuckDbConnection>()
             .expect("to downcast to duckdb connection");
 
-        {
-            let raw = conn.get_underlying_conn_mut();
-            raw.execute("CREATE SCHEMA elsewhere", [])
-                .expect("to create a second schema");
-            raw.execute(
-                &format!(
-                    "CREATE TABLE elsewhere.{decoy} (decoy VARCHAR)",
-                    decoy = internal.table_name().quoted()
-                ),
-                [],
-            )
-            .expect("to create the decoy table");
-        }
+        create_decoy_in_another_schema(conn, internal.table_name());
 
         let tx = conn
             .get_underlying_conn_mut()
@@ -2205,19 +2210,7 @@ pub(crate) mod tests {
             .downcast_mut::<DuckDbConnection>()
             .expect("to downcast to duckdb connection");
 
-        {
-            let raw = conn.get_underlying_conn_mut();
-            raw.execute("CREATE SCHEMA elsewhere", [])
-                .expect("to create a second schema");
-            raw.execute(
-                &format!(
-                    "CREATE TABLE elsewhere.{decoy} (decoy VARCHAR)",
-                    decoy = table_definition.name().quoted()
-                ),
-                [],
-            )
-            .expect("to create the decoy table");
-        }
+        create_decoy_in_another_schema(conn, table_definition.name());
 
         let tx = conn
             .get_underlying_conn_mut()
