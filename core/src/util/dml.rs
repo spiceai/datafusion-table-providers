@@ -45,18 +45,11 @@ pub fn assignments_to_sql(
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
 }
 
-/// Renders `DELETE FROM <table> [WHERE <sql_where>]`.
+/// Renders `DELETE FROM <table> [WHERE <sql_where>]`, quoting `table_name` so that a quote in it
+/// cannot close the identifier and leave the rest of the name to be read as statement text.
 ///
-/// `table_name` is rendered as a delimited identifier, so an embedded `"` is doubled for the same
-/// reason a quote in a value is: left bare it closes the identifier early and the remainder of the
-/// name becomes statement text. `DuckDB`, `SQLite` and `PostgreSQL` all read `""` inside a
-/// delimited identifier as one quote and give `\` no meaning there, so doubling is the whole escape
-/// for every engine that reaches here — unlike a string literal, where a backslash mode can leave
-/// doubling incomplete.
-///
-/// The name is the table's own component rather than a
-/// [`datafusion::common::TableReference`], because that is what the write paths hold; this does not
-/// qualify an unqualified name.
+/// Doubling is the whole escape here, unlike in a string literal: none of `DuckDB`, `SQLite` and
+/// `PostgreSQL` give `\` any meaning inside a delimited identifier.
 pub fn delete_statement(table_name: &str, sql_where: Option<&str>) -> String {
     let table = expr::quoted_identifier(table_name);
     match sql_where {
@@ -361,6 +354,16 @@ mod tests {
             delete_statement_returning_count(r#"we"ird"#, None),
             r#"WITH deleted AS (DELETE FROM "we""ird" RETURNING *) SELECT COUNT(*) FROM deleted"#
         );
+
+        // A quote at either end has no ordinary character beside it to make the doubling obvious.
+        assert_eq!(
+            delete_statement(r#"trailing""#, None),
+            r#"DELETE FROM "trailing""""#
+        );
+        assert_eq!(
+            delete_statement(r#""leading"#, None),
+            r#"DELETE FROM """leading""#
+        );
     }
 
     /// A name carrying SQL of its own is what the missing escape actually costs: interpolated, the
@@ -383,14 +386,6 @@ mod tests {
         assert_eq!(
             delete_statement(r#"back\slash"quote"#, None),
             r#"DELETE FROM "back\slash""quote""#
-        );
-        assert_eq!(
-            delete_statement(r#"trailing""#, None),
-            r#"DELETE FROM "trailing""""#
-        );
-        assert_eq!(
-            delete_statement(r#""leading"#, None),
-            r#"DELETE FROM """leading""#
         );
     }
 
@@ -538,8 +533,7 @@ mod duckdb_execution_tests {
         conn.execute_batch(r#"INSERT INTO "we""ird" VALUES (1), (2), (3)"#)
             .expect("insert");
 
-        let sql = delete_statement(r#"we"ird"#, Some(r#""id" = 2"#));
-        conn.execute_batch(&sql)
+        conn.execute_batch(&delete_statement(r#"we"ird"#, Some(r#""id" = 2"#)))
             .expect("the rendered DELETE must be valid SQL for DuckDB");
 
         let mut stmt = conn
@@ -570,9 +564,12 @@ mod duckdb_execution_tests {
         conn.execute_batch(r#"INSERT INTO "we""ird" VALUES (1, 10), (2, 20)"#)
             .expect("insert");
 
-        let sql = update_statement(r#"we"ird"#, r#""qty" = 99"#, Some(r#""id" = 2"#));
-        conn.execute_batch(&sql)
-            .expect("the rendered UPDATE must be valid SQL for DuckDB");
+        conn.execute_batch(&update_statement(
+            r#"we"ird"#,
+            r#""qty" = 99"#,
+            Some(r#""id" = 2"#),
+        ))
+        .expect("the rendered UPDATE must be valid SQL for DuckDB");
 
         let mut stmt = conn
             .prepare(r#"SELECT qty FROM "we""ird" ORDER BY id"#)
@@ -666,8 +663,8 @@ mod duckdb_execution_tests {
 }
 
 /// `SQLite` is the second engine these statements are built for, and it reads a delimited
-/// identifier by its own rules. Postgres has no in-process equivalent, so its agreement is covered
-/// by the integration suite rather than here.
+/// identifier by its own rules. Postgres, the third, needs a running server and so has no
+/// in-process equivalent to assert against.
 #[cfg(all(test, feature = "sqlite"))]
 mod sqlite_execution_tests {
     use super::*;
