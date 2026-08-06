@@ -12,3 +12,9 @@ lint:
 .PHONY: test-integration
 test-integration:
 	RUST_LOG=debug cargo test --test integration --no-default-features --features postgres,sqlite,mysql,flight,clickhouse,mongodb,adbc -- --nocapture
+
+# Type-checks the integration suite without needing Docker, so `make test`
+# running only `--lib` can't let the suite rot uncompiled.
+.PHONY: check-integration
+check-integration:
+	cargo test --test integration --no-default-features --features postgres,sqlite,mysql,flight,clickhouse,mongodb,adbc --no-run
