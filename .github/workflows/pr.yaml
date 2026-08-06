@@ -33,6 +33,12 @@ jobs:
 
       - run: cargo clippy --all-features -- -D warnings
 
+      # `make test` runs only `--lib`, so nothing else in CI compiles the
+      # integration suite. Type-check it here (no Docker required) so it can't
+      # silently rot.
+      - name: Check integration tests compile
+        run: make check-integration
+
   build:
     name: Build (${{ matrix.features }})
     runs-on: ubuntu-latest

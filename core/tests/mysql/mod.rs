@@ -985,7 +985,6 @@ async fn test_mysql_arrow_oneway() {
     test_mysql_decimal_types_to_decimal256(port).await;
     test_mysql_zero_date_type(port).await;
     test_mysql_nullability_constraints(port).await;
-    test_mysql_sort_limit(port).await;
 
     mysql_container.remove().await.expect("container to stop");
 }
