@@ -8,7 +8,10 @@ use crate::sql::sql_provider_datafusion::expr;
 use crate::util::{
     constraints,
     count_exec::make_count_exec,
-    dml::{assignments_to_sql, filters_to_sql, DeletionExec, DeletionSink, UpdateExec, UpdateSink},
+    dml::{
+        assignments_to_sql, delete_statement, filters_to_sql, update_statement, DeletionExec,
+        DeletionSink, UpdateExec, UpdateSink,
+    },
     on_conflict::OnConflict,
     retriable_error::{check_and_mark_retriable_error, to_retriable_data_write_error},
 };
@@ -323,11 +326,7 @@ impl DeletionSink for DuckDBDeletionSink {
 
                 let table_name = table_definition.resolve_dml_table_name(&tx)?;
 
-                let delete_sql = if let Some(sql_where) = &sql_where {
-                    format!(r#"DELETE FROM "{table_name}" WHERE {sql_where}"#)
-                } else {
-                    format!(r#"DELETE FROM "{table_name}""#)
-                };
+                let delete_sql = delete_statement(&table_name, sql_where.as_deref());
                 let count = tx.execute(&delete_sql, [])?;
 
                 tx.commit()?;
@@ -367,11 +366,7 @@ impl UpdateSink for DuckDBUpdateSink {
 
                 let table_name = table_definition.resolve_dml_table_name(&tx)?;
 
-                let sql = if let Some(sql_where) = &sql_where {
-                    format!(r#"UPDATE "{table_name}" SET {set_clause} WHERE {sql_where}"#)
-                } else {
-                    format!(r#"UPDATE "{table_name}" SET {set_clause}"#)
-                };
+                let sql = update_statement(&table_name, &set_clause, sql_where.as_deref());
                 let count = tx.execute(&sql, [])?;
 
                 tx.commit()?;
@@ -985,8 +980,9 @@ pub(super) fn write_to_table(
 ///
 /// Errors are logged but do not fail the operation since statistics updates are non-critical.
 pub fn execute_analyze_sql(tx: &Transaction, table_name: &str) {
-    // DuckDB doesn't support parameterized table names in the ANALYZE statement
-    let analyze_sql = format!(r#"ANALYZE "{table_name}""#);
+    // DuckDB doesn't support parameterized table names in the ANALYZE statement, so the name is
+    // quoted as an identifier instead.
+    let analyze_sql = format!("ANALYZE {}", expr::quoted_identifier(table_name));
     tracing::debug!("Executing analyze SQL: {analyze_sql}");
     match tx.prepare(&analyze_sql) {
         Ok(mut stmt) => match stmt.execute([]) {

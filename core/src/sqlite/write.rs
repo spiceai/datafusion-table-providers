@@ -21,7 +21,10 @@ use crate::sql::sql_provider_datafusion::expr;
 use crate::util::{
     constraints,
     count_exec::make_count_exec,
-    dml::{assignments_to_sql, filters_to_sql, DeletionExec, DeletionSink, UpdateExec, UpdateSink},
+    dml::{
+        assignments_to_sql, delete_statement, filters_to_sql, update_statement, DeletionExec,
+        DeletionSink, UpdateExec, UpdateSink,
+    },
     on_conflict::OnConflict,
     retriable_error::{check_and_mark_retriable_error, to_retriable_data_write_error},
 };
@@ -148,12 +151,12 @@ impl TableProvider for SqliteTableWriter {
         let table_name = self.sqlite().table_name().to_string();
         let sqlite = self.sqlite();
 
-        let sql = if filters.is_empty() {
-            format!(r#"UPDATE "{table_name}" SET {set_clause}"#)
+        let sql_where = if filters.is_empty() {
+            None
         } else {
-            let sql_where = filters_to_sql(&filters, Some(expr::Engine::SQLite))?;
-            format!(r#"UPDATE "{table_name}" SET {set_clause} WHERE {sql_where}"#)
+            Some(filters_to_sql(&filters, Some(expr::Engine::SQLite))?)
         };
+        let sql = update_statement(&table_name, &set_clause, sql_where.as_deref());
 
         Ok(Arc::new(UpdateExec::new(Arc::new(SqliteUpdateSink {
             sqlite,
@@ -180,11 +183,7 @@ impl DeletionSink for SqliteDeletionSink {
             .conn
             .call(move |conn| -> Result<u64, rusqlite::Error> {
                 let tx = conn.transaction()?;
-                let delete_sql = if let Some(sql_where) = &sql_where {
-                    format!(r#"DELETE FROM "{table_name}" WHERE {sql_where}"#)
-                } else {
-                    format!(r#"DELETE FROM "{table_name}""#)
-                };
+                let delete_sql = delete_statement(&table_name, sql_where.as_deref());
                 tx.execute(&delete_sql, [])?;
                 // rusqlite 0.40 removed FromSql for u64; changes() is always non-negative.
                 let count: i64 = tx.query_row("SELECT changes()", [], |row| row.get(0))?;
