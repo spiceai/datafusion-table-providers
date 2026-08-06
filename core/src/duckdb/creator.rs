@@ -911,7 +911,8 @@ pub(crate) mod tests {
     use crate::{
         duckdb::make_initial_table,
         sql::db_connection_pool::{
-            dbconnection::duckdbconn::DuckDbConnection, duckdbpool::DuckDbConnectionPool,
+            dbconnection::duckdbconn::DuckDbConnection,
+            duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
         },
     };
     use datafusion::{
@@ -2074,10 +2075,22 @@ pub(crate) mod tests {
     /// `create_table` reads the DDL DuckDB generated for the table it just created back out of
     /// `duckdb_tables()`. An attached database holding that same name contributes a second row,
     /// and the row the lookup picks decides the columns the dataset's table is created with.
+    ///
+    /// The session sits on an *attached* catalog here, the way the file-swap path leaves it, so
+    /// that the default catalog — which `duckdb_tables()` lists first — is the one holding the
+    /// decoy. An unscoped lookup reads that row rather than the table it just created.
     #[tokio::test]
     async fn test_create_table_reads_back_its_own_ddl_not_an_attachments() {
         let _guard = init_tracing(None);
-        let pool = get_mem_duckdb();
+        // Every connection this pool hands out sits on `live`, including the one
+        // `create_table` checks out for itself.
+        let pool = Arc::new(
+            DuckDbConnectionPoolBuilder::memory()
+                .with_connection_setup_query("ATTACH IF NOT EXISTS ':memory:' AS live")
+                .with_connection_setup_query("USE live")
+                .build()
+                .expect("to build a memory duckdb connection pool"),
+        );
 
         let table_definition = get_basic_table_definition();
         let internal = TableManager::new(Arc::clone(&table_definition))
@@ -2090,7 +2103,17 @@ pub(crate) mod tests {
             .downcast_mut::<DuckDbConnection>()
             .expect("to downcast to duckdb connection");
 
-        attach_decoy_database(conn, internal.table_name());
+        // The decoy goes in the *default* catalog, which the session no longer resolves bare
+        // names in.
+        conn.get_underlying_conn_mut()
+            .execute(
+                &format!(
+                    "CREATE TABLE memory.main.{decoy} (decoy VARCHAR)",
+                    decoy = internal.table_name().quoted()
+                ),
+                [],
+            )
+            .expect("to create the decoy table");
 
         let tx = conn
             .get_underlying_conn_mut()
