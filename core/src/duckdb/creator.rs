@@ -1836,14 +1836,22 @@ pub(crate) mod tests {
     /// an escaped identifier is rejected outright, so the primary-key drift check could not read
     /// back a table whose name holds a `"`. A `"` now selects the `duckdb_constraints()` fallback.
     ///
-    /// Runs one identical table under three names, so the two lookups are held to the same answer
-    /// rather than only to their own: a `"` (the fallback), a dot (the pragma, whose argument must
-    /// stay one identifier rather than split into schema.table), and a plain name.
+    /// Runs one identical table under several names, so the two lookups are held to the same
+    /// answer rather than only to their own: a `"` (the fallback), a `"` alongside an apostrophe
+    /// (the fallback, whose own argument is a string literal the apostrophe would close), a dot
+    /// (the pragma, whose argument must stay one identifier rather than split into schema.table),
+    /// an apostrophe alone (the pragma's literal), and a plain name.
     #[tokio::test]
     async fn test_both_primary_key_lookups_agree_on_an_awkward_table_name() {
         let _guard = init_tracing(None);
 
-        for name in [r#"we"ird.tbl"#, "sch.dotted", "o'brien", "plain"] {
+        for name in [
+            r#"we"ird.tbl"#,
+            r#"o'br"ien.tbl"#,
+            "sch.dotted",
+            "o'brien",
+            "plain",
+        ] {
             let pool = get_mem_duckdb();
             let schema = Arc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
@@ -1908,9 +1916,12 @@ pub(crate) mod tests {
     }
 
     /// `duckdb_constraints()` spans every attached database and schema, unlike the
-    /// `pragma_table_info` lookup it replaced, which resolved the name the way a query would. The
-    /// accelerator's file-swap path attaches a second database, so an unconstrained lookup would
-    /// read another attachment's same-named table and report the wrong primary keys.
+    /// `pragma_table_info` path it falls back from, which resolves the name the way a query would.
+    /// The accelerator's file-swap path attaches a second database, so an unconstrained lookup
+    /// would read another attachment's same-named table and report the wrong primary keys.
+    ///
+    /// The name carries a `"` so that the fallback — the only path with this exposure — is the one
+    /// under test.
     #[tokio::test]
     async fn test_primary_key_lookup_ignores_an_attached_databases_same_named_table() {
         let _guard = init_tracing(None);
@@ -1920,7 +1931,7 @@ pub(crate) mod tests {
             arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
         ]));
         let table_definition = Arc::new(
-            TableDefinition::new(RelationName::new("collides"), Arc::clone(&schema))
+            TableDefinition::new(RelationName::new(r#"col"lides"#), Arc::clone(&schema))
                 .with_constraints(get_pk_constraints(&["id"], Arc::clone(&schema))),
         );
 
