@@ -1381,9 +1381,18 @@ impl Sqlite {
         &self,
         sqlite_conn: &mut SqliteConnection,
     ) -> DataFusionResult<HashSet<String>> {
+        // The `pragma_index_list` table-valued function takes the table's name as an ordinary
+        // string argument, so it is matched as a string literal here. The `PRAGMA index_list(…)`
+        // statement form instead parses its argument as a name token, which a quote, an
+        // apostrophe, a space or a dot in the name breaks outright.
         let query_result = sqlite_conn
             .query_arrow(
-                format!("PRAGMA index_list({name})", name = self.table).as_str(),
+                format!(
+                    "SELECT name FROM pragma_index_list({name})",
+                    name =
+                        expr::string_literal(&self.table.to_string(), Some(expr::Engine::SQLite))
+                )
+                .as_str(),
                 &[],
                 None,
             )
@@ -1417,9 +1426,16 @@ impl Sqlite {
         &self,
         sqlite_conn: &mut SqliteConnection,
     ) -> DataFusionResult<HashSet<String>> {
+        // `pragma_table_info` as a table-valued function, for the same reason as `get_indexes`:
+        // its argument is an ordinary string rather than a name the statement form re-parses.
         let query_result = sqlite_conn
             .query_arrow(
-                format!("PRAGMA table_info({name})", name = self.table).as_str(),
+                format!(
+                    "SELECT name, pk FROM pragma_table_info({name})",
+                    name =
+                        expr::string_literal(&self.table.to_string(), Some(expr::Engine::SQLite))
+                )
+                .as_str(),
                 &[],
                 None,
             )
@@ -1726,6 +1742,77 @@ pub(crate) mod tests {
             sqlite.table_exists(sqlite_conn).await,
             "the table exists and must be found despite the apostrophe in its name"
         );
+    }
+
+    /// `get_primary_keys` and `get_indexes` interpolated the table's name straight into
+    /// `PRAGMA table_info(…)` / `PRAGMA index_list(…)`, whose argument SQLite parses as a name
+    /// token. A quote, an apostrophe, a space or a dot in a dataset name therefore failed to
+    /// parse, and the drift check that calls them could never run for such a table. The
+    /// table-valued form takes the name as an ordinary string instead.
+    #[tokio::test]
+    async fn test_awkward_table_names_reach_the_pragma_lookups() {
+        for name in [
+            r#"we"ird.tbl"#,
+            "o'brien",
+            "has space",
+            "sch.dotted",
+            "plain",
+        ] {
+            let schema = Arc::new(Schema::new(vec![
+                arrow::datatypes::Field::new("id", DataType::Int64, false),
+                arrow::datatypes::Field::new("part", DataType::Int64, false),
+                arrow::datatypes::Field::new("payload", DataType::Utf8, true),
+            ]));
+            let sqlite = Sqlite::new(
+                TableReference::bare(name),
+                Arc::clone(&schema),
+                memory_pool().await,
+                Constraints::new_unverified(vec![]),
+            );
+
+            let mut db_conn = sqlite.connect().await.expect("should connect to db");
+            let sqlite_conn =
+                Sqlite::sqlite_conn(&mut db_conn).expect("should get sqlite connection");
+
+            let quoted = format!(r#""{}""#, name.replace('"', r#""""#));
+            let ddl = format!(
+                r#"CREATE TABLE {quoted} (id INTEGER, part INTEGER, payload TEXT, PRIMARY KEY (id, part));
+                   CREATE INDEX "i_{}" ON {quoted} (payload);"#,
+                name.replace('"', r#""""#)
+            );
+            sqlite_conn
+                .conn
+                .call(move |conn| {
+                    conn.execute_batch(&ddl)?;
+                    Ok::<_, tokio_rusqlite::Error>(())
+                })
+                .await
+                .expect("should create the table and its index");
+
+            assert_eq!(
+                sqlite
+                    .get_primary_keys(sqlite_conn)
+                    .await
+                    .unwrap_or_else(|e| panic!("should read primary keys of {name:?}: {e}")),
+                ["id".to_string(), "part".to_string()]
+                    .into_iter()
+                    .collect::<HashSet<String>>(),
+                "both primary-key columns of {name:?} come back"
+            );
+
+            // SQLite backs the composite primary key with a `sqlite_autoindex_…`, which
+            // `get_indexes` filters out — only the declared index is a configured one.
+            assert_eq!(
+                sqlite
+                    .get_indexes(sqlite_conn)
+                    .await
+                    .unwrap_or_else(|e| panic!("should read indexes of {name:?}: {e}")),
+                [format!("i_{name}")]
+                    .into_iter()
+                    .collect::<HashSet<String>>(),
+                "the declared index on {name:?} comes back, and the autoindex does not"
+            );
+        }
     }
 
     /// The prepared-insert column list interpolated Arrow field names into quoted identifiers

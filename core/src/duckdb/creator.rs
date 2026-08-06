@@ -596,20 +596,21 @@ impl TableManager {
         &self,
         tx: &Transaction<'_>,
     ) -> super::Result<HashSet<String>> {
-        // DuckDB provides convenient queryable 'pragma_table_info' table function.
-        // A complex table name with a schema as part of the name must be quoted as
-        // '"<name>"', otherwise it will be parsed to schema and table name — so the
-        // quoted identifier is nested inside a string literal here, and needs the
-        // literal escape as well as the identifier one.
+        // `duckdb_constraints.table_name` holds the table's name as an ordinary string column, so
+        // the name is matched as a string literal here and never reaches an identifier parser.
+        // `pragma_table_info` cannot serve this lookup: it re-parses its argument with DuckDB's
+        // qualified-name parser, which splits a dotted name and rejects the doubled quote an
+        // escaped identifier carries ("Unterminated quote in qualified name").
         //
-        // A name holding a double quote still cannot be looked up this way: DuckDB parses the
-        // argument with its own qualified-name parser, which rejects the doubled quote
-        // ("Unterminated quote in qualified name"). Escaping cannot reach that; see
-        // https://github.com/spiceai/spiceai/issues/12677.
+        // The view spans every attached database and schema — and the file-swap path does attach a
+        // second database — so the lookup is narrowed to the one a bare table reference resolves
+        // in, which is what `pragma_table_info` resolved through.
         let sql = format!(
-            "SELECT name FROM pragma_table_info({table_name}) WHERE pk = true",
+            "SELECT unnest(constraint_column_names) FROM duckdb_constraints() \
+             WHERE database_name = current_database() AND schema_name = current_schema() \
+             AND table_name = {table_name} AND constraint_type = 'PRIMARY KEY'",
             table_name =
-                expr::string_literal(&self.table_name().quoted(), Some(expr::Engine::DuckDB))
+                expr::string_literal(self.table_name().as_str(), Some(expr::Engine::DuckDB))
         );
         tracing::debug!("{sql}");
 
@@ -1810,6 +1811,129 @@ pub(crate) mod tests {
                 .expect("to read indexes back through duckdb_indexes")
                 .len(),
             1
+        );
+
+        tx.rollback().expect("should rollback transaction");
+    }
+
+    /// `current_primary_keys` used to address the table through `pragma_table_info`, whose
+    /// argument DuckDB re-parses as a qualified name. No escaping reaches that parser: the
+    /// doubled quote of an escaped identifier is rejected outright, so the primary-key drift
+    /// check could not read back a table whose name holds a `"`.
+    #[tokio::test]
+    async fn test_quote_bearing_table_name_reaches_the_primary_key_lookup() {
+        let _guard = init_tracing(None);
+        let pool = get_mem_duckdb();
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("part", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Utf8, true),
+        ]));
+        let table_definition = Arc::new(
+            TableDefinition::new(RelationName::new(r#"we"ird.tbl"#), Arc::clone(&schema))
+                .with_constraints(get_pk_constraints(&["id", "part"], Arc::clone(&schema))),
+        );
+
+        let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
+        let conn = pool_conn
+            .as_any_mut()
+            .downcast_mut::<DuckDbConnection>()
+            .expect("to downcast to duckdb connection");
+        let tx = conn
+            .get_underlying_conn_mut()
+            .transaction()
+            .expect("should begin transaction");
+
+        let table = TableManager::new(Arc::clone(&table_definition))
+            .with_internal(true)
+            .expect("to create table manager");
+        table
+            .create_table(Arc::clone(&pool), &tx)
+            .expect("to create a table whose name holds a quote");
+
+        // A UNIQUE constraint shares the catalog view with the primary key, so the lookup has to
+        // pick out the PRIMARY KEY rows rather than every constraint on the table.
+        tx.execute(
+            &format!(
+                "CREATE UNIQUE INDEX {index} ON {table} (payload)",
+                index = RelationName::new("uq_payload").quoted(),
+                table = table.table_name().quoted(),
+            ),
+            [],
+        )
+        .expect("to create a unique index");
+
+        let primary_keys = table
+            .current_primary_keys(&tx)
+            .expect("to read the primary keys of a quote-bearing table name");
+        assert_eq!(
+            primary_keys,
+            ["id".to_string(), "part".to_string()]
+                .into_iter()
+                .collect::<HashSet<String>>(),
+            "both primary-key columns come back, and the unique index does not"
+        );
+
+        // The drift check itself, which is the only caller, must now agree.
+        assert!(table
+            .verify_primary_keys_match(&table, &tx)
+            .expect("to compare primary keys"));
+
+        tx.rollback().expect("should rollback transaction");
+    }
+
+    /// `duckdb_constraints()` spans every attached database and schema, unlike the
+    /// `pragma_table_info` lookup it replaced, which resolved the name the way a query would. The
+    /// accelerator's file-swap path attaches a second database, so an unconstrained lookup would
+    /// read another attachment's same-named table and report the wrong primary keys.
+    #[tokio::test]
+    async fn test_primary_key_lookup_ignores_an_attached_databases_same_named_table() {
+        let _guard = init_tracing(None);
+        let pool = get_mem_duckdb();
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let table_definition = Arc::new(
+            TableDefinition::new(RelationName::new("collides"), Arc::clone(&schema))
+                .with_constraints(get_pk_constraints(&["id"], Arc::clone(&schema))),
+        );
+
+        let table = TableManager::new(Arc::clone(&table_definition))
+            .with_internal(true)
+            .expect("to create table manager");
+
+        let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
+        let conn = pool_conn
+            .as_any_mut()
+            .downcast_mut::<DuckDbConnection>()
+            .expect("to downcast to duckdb connection");
+
+        // A second database holding a table of the same name, with a *different* primary key.
+        let raw = conn.get_underlying_conn_mut();
+        raw.execute("ATTACH ':memory:' AS staging", [])
+            .expect("to attach a second database");
+        raw.execute(
+            &format!(
+                "CREATE TABLE staging.main.{table} (decoy BIGINT PRIMARY KEY)",
+                table = table.table_name().quoted()
+            ),
+            [],
+        )
+        .expect("to create the decoy table");
+
+        let tx = raw.transaction().expect("should begin transaction");
+        table
+            .create_table(Arc::clone(&pool), &tx)
+            .expect("to create the table");
+
+        assert_eq!(
+            table
+                .current_primary_keys(&tx)
+                .expect("to read the primary keys"),
+            ["id".to_string()].into_iter().collect::<HashSet<String>>(),
+            "the attached database's same-named table must not contribute its primary key"
         );
 
         tx.rollback().expect("should rollback transaction");
