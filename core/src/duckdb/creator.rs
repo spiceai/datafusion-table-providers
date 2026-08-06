@@ -39,6 +39,11 @@ impl RelationName {
         Self(name.into())
     }
 
+    #[must_use]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
     /// Renders the name as a double-quoted DuckDB identifier, doubling any embedded quote.
     ///
     /// Every statement this module builds by hand names its relation through here rather than
@@ -522,7 +527,7 @@ impl TableManager {
             .query_row(
                 &format!(
                     "select sql from duckdb_tables() where table_name = {}",
-                    expr::string_literal(&table_name.to_string(), Some(expr::Engine::DuckDB))
+                    expr::string_literal(table_name.as_str(), Some(expr::Engine::DuckDB))
                 ),
                 [],
                 |r| r.get::<usize, String>(0),
@@ -600,7 +605,7 @@ impl TableManager {
         // A name holding a double quote still cannot be looked up this way: DuckDB parses the
         // argument with its own qualified-name parser, which rejects the doubled quote
         // ("Unterminated quote in qualified name"). Escaping cannot reach that; see
-        // https://github.com/spiceai/spiceai/issues/12675.
+        // https://github.com/spiceai/spiceai/issues/12677.
         let sql = format!(
             "SELECT name FROM pragma_table_info({table_name}) WHERE pk = true",
             table_name =
@@ -632,7 +637,7 @@ impl TableManager {
         let sql = format!(
             "SELECT index_name FROM duckdb_indexes WHERE table_name = {table_name}",
             table_name =
-                expr::string_literal(&self.table_name().to_string(), Some(expr::Engine::DuckDB))
+                expr::string_literal(self.table_name().as_str(), Some(expr::Engine::DuckDB))
         );
 
         tracing::debug!("{sql}");
