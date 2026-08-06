@@ -627,9 +627,12 @@ impl TableManager {
     /// Returns the current indexes in database for this table.
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn current_indexes(&self, tx: &Transaction<'_>) -> super::Result<HashSet<String>> {
+        // `duckdb_indexes.table_name` holds the table's name, so it is matched as a string
+        // literal here rather than named as an identifier.
         let sql = format!(
-            "SELECT index_name FROM duckdb_indexes WHERE table_name = '{table_name}'",
-            table_name = &self.table_name().to_string()
+            "SELECT index_name FROM duckdb_indexes WHERE table_name = {table_name}",
+            table_name =
+                expr::string_literal(&self.table_name().to_string(), Some(expr::Engine::DuckDB))
         );
 
         tracing::debug!("{sql}");
@@ -1764,7 +1767,11 @@ pub(crate) mod tests {
         ]));
         let table_definition = Arc::new(
             TableDefinition::new(RelationName::new("o'brien"), Arc::clone(&schema))
-                .with_constraints(get_pk_constraints(&["id"], Arc::clone(&schema))),
+                .with_constraints(get_pk_constraints(&["id"], Arc::clone(&schema)))
+                .with_indexes(vec![(
+                    ColumnReference::try_from("id").expect("valid column reference"),
+                    IndexType::Enabled,
+                )]),
         );
 
         let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
@@ -1789,6 +1796,16 @@ pub(crate) mod tests {
             .current_primary_keys(&tx)
             .expect("to read primary keys back through pragma_table_info")
             .contains("id"));
+
+        // `current_indexes` matches `duckdb_indexes.table_name` as a literal too.
+        table.create_indexes(&tx).expect("to create indexes");
+        assert_eq!(
+            table
+                .current_indexes(&tx)
+                .expect("to read indexes back through duckdb_indexes")
+                .len(),
+            1
+        );
 
         tx.rollback().expect("should rollback transaction");
     }
