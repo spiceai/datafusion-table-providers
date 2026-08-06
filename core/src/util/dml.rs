@@ -58,8 +58,12 @@ pub fn delete_statement(table_name: &str, sql_where: Option<&str>) -> String {
     }
 }
 
-/// Renders [`delete_statement`] wrapped so that it reports how many rows it removed, for an engine
-/// whose `DELETE` does not report a count on its own.
+/// Renders [`delete_statement`] wrapped in a CTE that returns the removed rows, so the count comes
+/// back as a result row: `WITH deleted AS (DELETE ... RETURNING *) SELECT COUNT(*) FROM deleted`.
+///
+/// This is for a caller that reads the count from a query rather than from the driver's
+/// affected-row tag — the `PostgreSQL` deletion sink runs this with `query_one` inside its
+/// transaction, so the count and the delete stay one statement.
 pub fn delete_statement_returning_count(table_name: &str, sql_where: Option<&str>) -> String {
     let delete = delete_statement(table_name, sql_where);
     format!("WITH deleted AS ({delete} RETURNING *) SELECT COUNT(*) FROM deleted")
