@@ -735,6 +735,12 @@ impl Sqlite {
             .ok_or_else(|| UnableToDowncastDbConnectionSnafu {}.build())
     }
 
+    /// The table's name rendered as a SQLite string literal, for the catalog lookups that match
+    /// on the name rather than naming the table as an identifier.
+    fn table_name_literal(&self) -> String {
+        expr::string_literal(&self.table.to_string(), Some(expr::Engine::SQLite))
+    }
+
     async fn table_exists(&self, sqlite_conn: &mut SqliteConnection) -> bool {
         // `sqlite_master.name` holds the table's name, so it is matched as a string literal
         // here rather than named as an identifier.
@@ -745,7 +751,7 @@ impl Sqlite {
           WHERE type='table'
           AND name = {name}
         )",
-            name = expr::string_literal(&self.table.to_string(), Some(expr::Engine::SQLite))
+            name = self.table_name_literal()
         );
         tracing::trace!("{sql}");
 
@@ -1389,8 +1395,7 @@ impl Sqlite {
             .query_arrow(
                 format!(
                     "SELECT name FROM pragma_index_list({name})",
-                    name =
-                        expr::string_literal(&self.table.to_string(), Some(expr::Engine::SQLite))
+                    name = self.table_name_literal()
                 )
                 .as_str(),
                 &[],
@@ -1432,8 +1437,7 @@ impl Sqlite {
             .query_arrow(
                 format!(
                     "SELECT name, pk FROM pragma_table_info({name})",
-                    name =
-                        expr::string_literal(&self.table.to_string(), Some(expr::Engine::SQLite))
+                    name = self.table_name_literal()
                 )
                 .as_str(),
                 &[],
@@ -1774,11 +1778,10 @@ pub(crate) mod tests {
             let sqlite_conn =
                 Sqlite::sqlite_conn(&mut db_conn).expect("should get sqlite connection");
 
-            let quoted = format!(r#""{}""#, name.replace('"', r#""""#));
+            let escaped = name.replace('"', r#""""#);
             let ddl = format!(
-                r#"CREATE TABLE {quoted} (id INTEGER, part INTEGER, payload TEXT, PRIMARY KEY (id, part));
-                   CREATE INDEX "i_{}" ON {quoted} (payload);"#,
-                name.replace('"', r#""""#)
+                r#"CREATE TABLE "{escaped}" (id INTEGER, part INTEGER, payload TEXT, PRIMARY KEY (id, part));
+                   CREATE INDEX "i_{escaped}" ON "{escaped}" (payload);"#
             );
             sqlite_conn
                 .conn
