@@ -1216,8 +1216,13 @@ mod tests {
         use crate::sql::sql_provider_datafusion::{SqlExec, SqlTable};
         use arrow::compute::SortOptions;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
-        use datafusion::physical_expr::expressions::Column;
+        use datafusion::common::config::ConfigOptions;
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::expressions::{binary, col, lit, Column};
         use datafusion::physical_expr::PhysicalSortExpr;
+        use datafusion::physical_plan::filter_pushdown::{
+            ChildFilterPushdownResult, ChildPushdownResult, FilterPushdownPhase, PushedDown,
+        };
         use datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult;
         use datafusion::physical_plan::ExecutionPlan;
         use datafusion::sql::unparser::dialect::DefaultDialect;
@@ -1447,6 +1452,44 @@ mod tests {
             let with_limit = exec.with_fetch(Some(10)).expect("with_fetch should apply");
 
             match with_limit.try_pushdown_sort(&order_by_name()).unwrap() {
+                SortOrderPushdownResult::Unsupported => {}
+                other => panic!("Expected Unsupported, got {:?}", sort_result_name(&other)),
+            }
+        }
+
+        #[test]
+        fn test_disabled_sort_pushdown_survives_filter_pushdown() {
+            // FilterPushdown runs before PushdownSort, so the node the sort rule sees
+            // can be the one a filter rewrite produced.
+            let exec = make_exec("SELECT \"name\", \"age\" FROM \"users\"")
+                .with_allow_physical_sort_pushdown(false);
+            let schema = exec.schema();
+            let predicate = binary(
+                col("age", &schema).expect("column should resolve"),
+                Operator::Gt,
+                lit(30i16),
+                &schema,
+            )
+            .expect("predicate should build");
+
+            let propagation = exec
+                .handle_child_pushdown_result(
+                    FilterPushdownPhase::Pre,
+                    ChildPushdownResult {
+                        parent_filters: vec![ChildFilterPushdownResult {
+                            filter: predicate,
+                            child_results: vec![PushedDown::Yes],
+                        }],
+                        self_filters: vec![],
+                    },
+                    &ConfigOptions::default(),
+                )
+                .expect("filter pushdown should succeed");
+            let rewritten = propagation
+                .updated_node
+                .expect("the filter should be absorbed into the SQL");
+
+            match rewritten.try_pushdown_sort(&order_by_name()).unwrap() {
                 SortOrderPushdownResult::Unsupported => {}
                 other => panic!("Expected Unsupported, got {:?}", sort_result_name(&other)),
             }
