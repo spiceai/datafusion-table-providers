@@ -92,7 +92,12 @@ SELECT
     WHEN t.typtype = 'c' THEN 'composite'
     ELSE pg_catalog.format_type(a.atttypid, a.atttypmod)
     END AS data_type,
-    CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable,
+    -- A foreign table's NOT NULL is an unverified promise about remote data:
+    -- PostgreSQL never enforces it, so the remote can and does return NULL for
+    -- such a column. Reporting it non-nullable would let a consumer assume a
+    -- null-free column and produce wrong results, so foreign tables are always
+    -- reported nullable.
+    CASE WHEN a.attnotnull AND cls.relkind <> 'f' THEN 'NO' ELSE 'YES' END AS is_nullable,
     CASE
     WHEN t.typcategory = 'A' THEN
         jsonb_build_object(
@@ -137,7 +142,11 @@ LEFT JOIN pg_type t ON t.oid = a.atttypid
 LEFT JOIN custom_type_details custom ON custom.typname = t.typname
 WHERE ns.nspname = $1
     AND cls.relname = $2
-    AND cls.relkind IN ('r','v','m','p')  -- covers tables, normal views, materialized views, & partitioned tables
+    -- covers tables, normal views, materialized views, partitioned tables, &
+    -- foreign tables. Foreign tables carry a full local column definition in
+    -- pg_attribute, so their schema resolves here rather than falling through
+    -- to inferring it from a data query (see `infer_schema_from_data`).
+    AND cls.relkind IN ('r','v','m','p','f')
     AND a.attnum > 0
     AND NOT a.attisdropped
 ORDER BY a.attnum;
