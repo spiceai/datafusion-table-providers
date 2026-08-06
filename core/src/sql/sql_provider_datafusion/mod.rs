@@ -1497,9 +1497,13 @@ mod tests {
 
         #[test]
         fn test_disabled_sort_pushdown_survives_clone() {
-            let exec = make_exec("SELECT \"name\" FROM \"users\"")
+            let exec = make_exec("SELECT \"name\", \"age\" FROM \"users\"")
                 .with_allow_physical_sort_pushdown(false);
-            assert!(!exec.clone().allow_physical_sort_pushdown());
+
+            match exec.clone().try_pushdown_sort(&order_by_name()).unwrap() {
+                SortOrderPushdownResult::Unsupported => {}
+                other => panic!("Expected Unsupported, got {:?}", sort_result_name(&other)),
+            }
         }
 
         #[test]
