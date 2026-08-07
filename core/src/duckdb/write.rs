@@ -24,6 +24,7 @@ use datafusion::catalog::Session;
 use datafusion::common::{Constraints, SchemaExt};
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::logical_expr::dml::InsertOp;
+use datafusion::sql::TableReference;
 use datafusion::{
     datasource::{TableProvider, TableType},
     error::DataFusionError,
@@ -326,7 +327,10 @@ impl DeletionSink for DuckDBDeletionSink {
 
                 let table_name = table_definition.resolve_dml_table_name(&tx)?;
 
-                let delete_sql = delete_statement(&table_name, sql_where.as_deref());
+                // `resolve_dml_table_name` returns the internal relation the accelerator writes
+                // to, which is unqualified.
+                let delete_sql =
+                    delete_statement(&TableReference::bare(table_name), sql_where.as_deref());
                 let count = tx.execute(&delete_sql, [])?;
 
                 tx.commit()?;
@@ -366,7 +370,12 @@ impl UpdateSink for DuckDBUpdateSink {
 
                 let table_name = table_definition.resolve_dml_table_name(&tx)?;
 
-                let sql = update_statement(&table_name, &set_clause, sql_where.as_deref());
+                // As above: the resolved internal relation carries no qualifier.
+                let sql = update_statement(
+                    &TableReference::bare(table_name),
+                    &set_clause,
+                    sql_where.as_deref(),
+                );
                 let count = tx.execute(&sql, [])?;
 
                 tx.commit()?;

@@ -13,6 +13,7 @@ use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{dml::InsertOp, Expr},
     physical_plan::{metrics::MetricsSet, DisplayAs, DisplayFormatType, ExecutionPlan},
+    sql::TableReference,
 };
 use futures::StreamExt;
 use snafu::prelude::*;
@@ -111,13 +112,13 @@ impl TableProvider for PostgresTableWriter {
         } else {
             Some(filters_to_sql(&filters, None)?)
         };
-        let table_name = self.postgres.table_name().to_string();
+        let table = self.postgres.table_reference().clone();
         let postgres = self.postgres();
 
         Ok(Arc::new(DeletionExec::new(Arc::new(
             PostgresDeletionSink {
                 postgres,
-                table_name,
+                table,
                 sql_where,
             },
         ))))
@@ -134,7 +135,6 @@ impl TableProvider for PostgresTableWriter {
         }
 
         let set_clause = assignments_to_sql(&assignments, None)?;
-        let table_name = self.postgres.table_name().to_string();
         let postgres = self.postgres();
 
         let sql_where = if filters.is_empty() {
@@ -142,7 +142,11 @@ impl TableProvider for PostgresTableWriter {
         } else {
             Some(filters_to_sql(&filters, None)?)
         };
-        let sql = update_statement(&table_name, &set_clause, sql_where.as_deref());
+        let sql = update_statement(
+            self.postgres.table_reference(),
+            &set_clause,
+            sql_where.as_deref(),
+        );
 
         Ok(Arc::new(UpdateExec::new(Arc::new(PostgresUpdateSink {
             postgres,
@@ -153,7 +157,7 @@ impl TableProvider for PostgresTableWriter {
 
 struct PostgresDeletionSink {
     postgres: Arc<Postgres>,
-    table_name: String,
+    table: TableReference,
     sql_where: Option<String>,
 }
 
@@ -165,7 +169,7 @@ impl DeletionSink for PostgresDeletionSink {
         let pg_conn = Postgres::postgres_conn(&mut db_conn)?;
         let tx = pg_conn.conn.transaction().await?;
 
-        let sql = delete_statement_returning_count(&self.table_name, self.sql_where.as_deref());
+        let sql = delete_statement_returning_count(&self.table, self.sql_where.as_deref());
         let row = tx.query_one(&sql, &[]).await?;
         let deleted: i64 = row.get(0);
         tx.commit().await?;
