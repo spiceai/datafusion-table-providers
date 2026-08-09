@@ -1,7 +1,8 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use tokio::sync::OnceCell;
 
 use crate::sql::arrow_sql_gen::postgres::rows_to_arrow;
 use crate::sql::arrow_sql_gen::postgres::schema::pg_data_type_to_arrow_type;
@@ -325,7 +326,13 @@ pub struct PostgresConnection {
     /// table and asks once. Sharing the cell with the pool is what makes the
     /// memo effective -- a catalog resolving N tables goes from N `version()`
     /// round trips to one.
-    variant: Arc<OnceLock<PostgresVariant>>,
+    ///
+    /// Async rather than a `OnceLock`, so that concurrent cold callers await one
+    /// shared initialization instead of each issuing its own query before any of
+    /// them stores a result. Discovery resolves tables in parallel, which is
+    /// exactly the case that would otherwise still pay N round trips on the
+    /// first cycle.
+    variant: Arc<OnceCell<PostgresVariant>>,
 }
 
 impl SchemaValidator for PostgresConnection {
@@ -492,7 +499,7 @@ impl PostgresConnection {
     /// this each connection re-runs `SELECT version()`, since a connection is
     /// built per checkout and schema inference takes one per table.
     #[must_use]
-    pub fn with_variant_cache(mut self, variant: Arc<OnceLock<PostgresVariant>>) -> Self {
+    pub fn with_variant_cache(mut self, variant: Arc<OnceCell<PostgresVariant>>) -> Self {
         self.variant = variant;
         self
     }
@@ -586,14 +593,13 @@ impl PostgresConnection {
     }
 
     pub async fn get_variant(&self) -> Result<PostgresVariant, super::Error> {
-        if let Some(variant) = self.variant.get() {
-            return Ok(*variant);
-        }
-
-        let variant = self.query_variant().await?;
-        // A concurrent caller may have won the race; either value is the same
-        // server's, so keep whichever landed first.
-        Ok(*self.variant.get_or_init(|| variant))
+        // One in-flight query is shared by every concurrent caller; a failure is
+        // returned to all of them and leaves the cell empty, so the next call
+        // retries rather than caching an error.
+        self.variant
+            .get_or_try_init(|| self.query_variant())
+            .await
+            .copied()
     }
 
     /// Asks the server which variant it is. Prefer [`PostgresConnection::get_variant`],

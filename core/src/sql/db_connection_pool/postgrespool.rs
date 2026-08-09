@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    path::Path,
-    str::FromStr,
-    sync::{Arc, OnceLock},
-};
+use std::{collections::HashMap, path::Path, str::FromStr, sync::Arc};
 
 use crate::{
     util::{self, ns_lookup::verify_ns_lookup_and_tcp_connect},
@@ -243,7 +238,7 @@ pub struct PostgresConnectionPool {
     /// One `SELECT version()` per pool rather than per connection. The variant
     /// describes the server, so it is the pool -- not a single checkout -- that
     /// it belongs to; see [`PostgresConnection::with_variant_cache`].
-    variant: Arc<OnceLock<PostgresVariant>>,
+    variant: Arc<tokio::sync::OnceCell<PostgresVariant>>,
 }
 
 impl PostgresConnectionPool {
