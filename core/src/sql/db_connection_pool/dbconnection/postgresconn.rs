@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::sql::arrow_sql_gen::postgres::rows_to_arrow;
 use crate::sql::arrow_sql_gen::postgres::schema::pg_data_type_to_arrow_type;
@@ -300,6 +300,15 @@ fn format_postgres_query_error(source: &bb8_postgres::tokio_postgres::Error) -> 
 pub struct PostgresConnection {
     pub conn: PostgresPooledConnection,
     unsupported_type_action: UnsupportedTypeAction,
+    /// Memoizes `SELECT version()` across every connection drawn from one pool.
+    ///
+    /// The variant is a property of the server, not of a connection, but each
+    /// checkout builds a fresh `PostgresConnection`, so a per-connection cache
+    /// would never be read twice: schema inference takes one connection per
+    /// table and asks once. Sharing the cell with the pool is what makes the
+    /// memo effective -- a catalog resolving N tables goes from N `version()`
+    /// round trips to one.
+    variant: Arc<OnceLock<PostgresVariant>>,
 }
 
 impl SchemaValidator for PostgresConnection {
@@ -341,6 +350,7 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
         PostgresConnection {
             conn,
             unsupported_type_action: UnsupportedTypeAction::default(),
+            variant: Arc::default(),
         }
     }
 
@@ -488,7 +498,29 @@ impl PostgresConnection {
         self
     }
 
+    /// Shares one variant memo across every connection from the same pool. Without
+    /// this each connection re-runs `SELECT version()`, since a connection is
+    /// built per checkout and schema inference takes one per table.
+    #[must_use]
+    pub fn with_variant_cache(mut self, variant: Arc<OnceLock<PostgresVariant>>) -> Self {
+        self.variant = variant;
+        self
+    }
+
     pub async fn get_variant(&self) -> Result<PostgresVariant, super::Error> {
+        if let Some(variant) = self.variant.get() {
+            return Ok(*variant);
+        }
+
+        let variant = self.query_variant().await?;
+        // A concurrent caller may have won the race; either value is the same
+        // server's, so keep whichever landed first.
+        Ok(*self.variant.get_or_init(|| variant))
+    }
+
+    /// Asks the server which variant it is. Prefer [`PostgresConnection::get_variant`],
+    /// which memoizes this per pool.
+    async fn query_variant(&self) -> Result<PostgresVariant, super::Error> {
         let row = self
             .conn
             .query_one("SELECT version()", &[])

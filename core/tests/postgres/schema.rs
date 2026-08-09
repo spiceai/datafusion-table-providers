@@ -6,11 +6,12 @@ use datafusion::logical_expr::CreateExternalTable;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::postgres::common;
 use crate::postgres::PostgresTableProviderFactory;
 use datafusion_table_providers::postgres::PostgresTableFactory;
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::postgresconn::PostgresVariant;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use datafusion_table_providers::util::secrets::to_secret_map;
 
@@ -416,4 +417,73 @@ async fn test_postgres_foreign_table_schema_inference() {
         .remove()
         .await
         .expect("to stop postgres container");
+}
+
+/// The `PostgreSQL` variant describes the server, so it is detected once per pool
+/// rather than once per connection.
+///
+/// Each checkout builds a fresh `PostgresConnection`, and schema inference takes
+/// one connection per table, so a per-connection memo would never be read twice:
+/// a catalog resolving N tables would run N `SELECT version()` round trips. The
+/// memo therefore lives on the pool and is shared with every connection it hands
+/// out, including `connect_direct`.
+///
+/// The absence of a round trip is what has to be proven, and a poisoned memo
+/// alone cannot prove it -- `get_or_init` yields the stored value whether or not
+/// the query ran, so the assertion would pass either way. The server is stopped
+/// instead: after that, any attempt to ask it fails, so returning a variant at
+/// all is only possible from the memo.
+#[tokio::test]
+async fn test_postgres_variant_is_detected_once_per_pool() {
+    let port = crate::get_random_port();
+    let container = common::start_postgres_docker_container("postgres:latest", port, None)
+        .await
+        .expect("Postgres container to start");
+
+    let postgres_pool = PostgresConnectionPool::new(to_secret_map(common::get_pg_params(port)))
+        .await
+        .expect("unable to create Postgres connection pool");
+
+    // An empty memo asks the server, and a vanilla server answers `Default`.
+    let detected = postgres_pool
+        .connect_direct()
+        .await
+        .expect("to connect to postgres");
+    assert_eq!(
+        detected.get_variant().await.expect("variant"),
+        PostgresVariant::Default,
+        "a vanilla PostgreSQL server must be detected as Default"
+    );
+
+    // Take a connection while the server is still up, give it a memo that no
+    // query could ever produce, then take the server away.
+    let poisoned = Arc::new(OnceLock::new());
+    poisoned
+        .set(PostgresVariant::Redshift)
+        .expect("cell starts empty");
+    let memoized = postgres_pool
+        .connect_direct()
+        .await
+        .expect("to connect to postgres")
+        .with_variant_cache(Arc::clone(&poisoned));
+
+    container.stop().await.expect("to stop postgres container");
+
+    // With the server gone, `SELECT version()` cannot succeed. Getting an answer
+    // proves the memo short-circuited the round trip rather than merely
+    // overwriting its result.
+    assert_eq!(
+        memoized
+            .get_variant()
+            .await
+            .expect("memo answers without the server"),
+        PostgresVariant::Redshift,
+        "get_variant must read the memo instead of querying the server"
+    );
+
+    // Tear down
+    container
+        .remove()
+        .await
+        .expect("to remove postgres container");
 }

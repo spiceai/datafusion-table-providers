@@ -1,4 +1,9 @@
-use std::{collections::HashMap, path::Path, str::FromStr, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::Path,
+    str::FromStr,
+    sync::{Arc, OnceLock},
+};
 
 use crate::{
     util::{self, ns_lookup::verify_ns_lookup_and_tcp_connect},
@@ -18,7 +23,10 @@ use super::{
     runtime::run_async_with_tokio, DbConnectionPool, PasswordProvider, StaticPasswordProvider,
 };
 use crate::sql::db_connection_pool::{
-    dbconnection::{postgresconn::PostgresConnection, AsyncDbConnection, DbConnection},
+    dbconnection::{
+        postgresconn::{PostgresConnection, PostgresVariant},
+        AsyncDbConnection, DbConnection,
+    },
     JoinPushDown,
 };
 
@@ -232,6 +240,10 @@ pub struct PostgresConnectionPool {
     join_push_down: JoinPushDown,
     unsupported_type_action: UnsupportedTypeAction,
     io_handle: Option<Handle>,
+    /// One `SELECT version()` per pool rather than per connection. The variant
+    /// describes the server, so it is the pool -- not a single checkout -- that
+    /// it belongs to; see [`PostgresConnection::with_variant_cache`].
+    variant: Arc<OnceLock<PostgresVariant>>,
 }
 
 impl PostgresConnectionPool {
@@ -443,6 +455,7 @@ impl PostgresConnectionPool {
             join_push_down,
             unsupported_type_action: UnsupportedTypeAction::default(),
             io_handle: None,
+            variant: Arc::default(),
         })
     }
 
@@ -475,7 +488,10 @@ impl PostgresConnectionPool {
         } else {
             pool.get_owned().await.map_err(map_pool_run_error)?
         };
-        Ok(PostgresConnection::new(conn))
+        // Deliberately does not apply `unsupported_type_action`, matching this
+        // method's existing behavior; only the variant memo is shared, which
+        // changes how often the server is asked, never what is inferred.
+        Ok(PostgresConnection::new(conn).with_variant_cache(Arc::clone(&self.variant)))
     }
 }
 
@@ -685,7 +701,8 @@ impl
         };
         Ok(Box::new(
             PostgresConnection::new(conn)
-                .with_unsupported_type_action(self.unsupported_type_action),
+                .with_unsupported_type_action(self.unsupported_type_action)
+                .with_variant_cache(Arc::clone(&self.variant)),
         ))
     }
 
