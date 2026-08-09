@@ -15,6 +15,7 @@ use datafusion_table_providers::sql::db_connection_pool::dbconnection::postgresc
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::AsyncDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use datafusion_table_providers::util::secrets::to_secret_map;
+use datafusion_table_providers::UnsupportedTypeAction;
 
 const COMPLEX_TABLE_SQL: &str = include_str!("scripts/complex_table_pg.sql");
 
@@ -603,6 +604,91 @@ async fn test_postgres_bulk_schema_matches_per_table_schema() {
             bulk_schema, &per_table,
             "bulk and per-table schemas diverged for {table}"
         );
+    }
+
+    // Tear down
+    container
+        .remove()
+        .await
+        .expect("to stop postgres container");
+}
+
+/// Bulk and per-table resolution must agree under every `unsupported_type_action`,
+/// not just the default.
+///
+/// `schema_from_columns` is shared by both paths precisely so the action cannot
+/// be applied differently depending on which one resolved a table, and a fixture
+/// of fully supported columns cannot show that: it exercises no unsupported type
+/// at all. `jsonb` is the type the mapping rejects, and each action does
+/// something different with it -- `Error` fails the whole schema, `String`
+/// substitutes `Utf8`, `Warn` and `Ignore` drop the column -- so a divergence
+/// would surface as a different error, a different type, or a missing field.
+#[tokio::test]
+async fn test_postgres_bulk_and_per_table_agree_on_unsupported_types() {
+    let port = crate::get_random_port();
+    let container = common::start_postgres_docker_container("postgres:latest", port, None)
+        .await
+        .expect("Postgres container to start");
+
+    let postgres_pool = PostgresConnectionPool::new(to_secret_map(common::get_pg_params(port)))
+        .await
+        .expect("unable to create Postgres connection pool");
+
+    postgres_pool
+        .connect_direct()
+        .await
+        .expect("to connect to postgres")
+        .conn
+        .execute(
+            "CREATE TABLE has_unsupported (id INTEGER NOT NULL, payload JSONB, note TEXT)",
+            &[],
+        )
+        .await
+        .expect("to create table");
+
+    for action in [
+        UnsupportedTypeAction::Error,
+        UnsupportedTypeAction::Warn,
+        UnsupportedTypeAction::Ignore,
+        UnsupportedTypeAction::String,
+    ] {
+        let conn = postgres_pool
+            .connect_direct()
+            .await
+            .expect("to connect to postgres")
+            .with_unsupported_type_action(action);
+
+        let bulk = conn.get_schemas_in("public").await;
+        let per_table = conn
+            .get_schema(&TableReference::partial("public", "has_unsupported"))
+            .await;
+
+        match (bulk, per_table) {
+            (Ok(bulk), Ok(per_table)) => {
+                let bulk_schema = bulk
+                    .get("has_unsupported")
+                    .unwrap_or_else(|| panic!("{action:?}: table missing from bulk result"));
+                assert_eq!(
+                    bulk_schema, &per_table,
+                    "{action:?}: bulk and per-table schemas diverged"
+                );
+            }
+            // `Error` must fail identically on both paths; anything else means
+            // one path applied the action and the other did not.
+            (Err(_), Err(_)) => {
+                assert_eq!(
+                    action,
+                    UnsupportedTypeAction::Error,
+                    "{action:?}: only Error should fail schema resolution"
+                );
+            }
+            (bulk, per_table) => panic!(
+                "{action:?}: paths disagreed on whether resolution succeeds \
+                 (bulk ok={}, per-table ok={})",
+                bulk.is_ok(),
+                per_table.is_ok()
+            ),
+        }
     }
 
     // Tear down

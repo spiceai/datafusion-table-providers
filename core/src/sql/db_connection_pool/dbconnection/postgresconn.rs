@@ -593,9 +593,18 @@ impl PostgresConnection {
     }
 
     pub async fn get_variant(&self) -> Result<PostgresVariant, super::Error> {
-        // One in-flight query is shared by every concurrent caller; a failure is
-        // returned to all of them and leaves the cell empty, so the next call
-        // retries rather than caching an error.
+        // Concurrent callers share one in-flight query on the success path, which
+        // is the case this exists for: parallel discovery would otherwise issue
+        // one `SELECT version()` per table before any of them stored a result.
+        //
+        // Failure is not shared. `get_or_try_init` drops the permit with the cell
+        // still empty, so waiters then attempt it one after another rather than
+        // all receiving the first error. That is deliberate -- it keeps an error
+        // out of the cell, so a transient failure does not pin the wrong answer
+        // for the pool's lifetime -- but it does mean N callers can serialize N
+        // failed attempts. Each runs on a connection the pool already
+        // established, so a dead server fails them fast; a *slow* one would make
+        // them queue.
         self.variant
             .get_or_try_init(|| self.query_variant())
             .await
