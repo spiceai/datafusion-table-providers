@@ -12,6 +12,7 @@ use crate::postgres::common;
 use crate::postgres::PostgresTableProviderFactory;
 use datafusion_table_providers::postgres::PostgresTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::postgresconn::PostgresVariant;
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::AsyncDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use datafusion_table_providers::util::secrets::to_secret_map;
 
@@ -486,4 +487,117 @@ async fn test_postgres_variant_is_detected_once_per_pool() {
         .remove()
         .await
         .expect("to remove postgres container");
+}
+
+/// Resolving a whole schema in one round trip must produce exactly what
+/// resolving each table individually produces.
+///
+/// This is the property the optimization rests on, so it is asserted directly
+/// rather than by sampling: every relation the bulk query returns is compared
+/// field-for-field against `get_schema` for the same table. A divergence here
+/// would mean a catalog's tables silently change shape depending on which path
+/// discovered them.
+///
+/// The fixture deliberately spans the relation kinds and type shapes that make
+/// the two paths most likely to differ: a plain table with arrays and a typmod'd
+/// numeric, a view, a materialized view, a partitioned parent, and a foreign
+/// table (whose NOT NULL is reported nullable -- see the relkind 'f' handling in
+/// `SCHEMA_QUERY`).
+#[tokio::test]
+async fn test_postgres_bulk_schema_matches_per_table_schema() {
+    let port = crate::get_random_port();
+    let container = common::start_postgres_docker_container("postgres:latest", port, None)
+        .await
+        .expect("Postgres container to start");
+
+    let postgres_pool = Arc::new(
+        PostgresConnectionPool::new(to_secret_map(common::get_pg_params(port)))
+            .await
+            .expect("unable to create Postgres connection pool"),
+    );
+    let pg_conn = postgres_pool
+        .connect_direct()
+        .await
+        .expect("to connect to postgres");
+
+    let password = common::get_pg_params(port)
+        .remove("pg_pass")
+        .expect("pg_pass should be present");
+    let fixture = format!(
+        r#"
+        CREATE TABLE plain (
+            id INTEGER NOT NULL,
+            note TEXT,
+            amount NUMERIC(10,2),
+            when_at TIMESTAMP,
+            tags TEXT[]
+        );
+        INSERT INTO plain (id, note, amount) VALUES (1, 'a', 1.50);
+
+        CREATE VIEW plain_view AS SELECT id, amount FROM plain;
+        CREATE MATERIALIZED VIEW plain_matview AS SELECT id, tags FROM plain;
+
+        CREATE TABLE parted (id INTEGER NOT NULL, k DATE NOT NULL)
+            PARTITION BY RANGE (k);
+        CREATE TABLE parted_2026 PARTITION OF parted
+            FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+
+        CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+        CREATE SERVER loop_srv FOREIGN DATA WRAPPER postgres_fdw
+            OPTIONS (host 'localhost', port '5432', dbname 'postgres');
+        CREATE USER MAPPING FOR postgres SERVER loop_srv
+            OPTIONS (user 'postgres', password '{password}');
+        CREATE FOREIGN TABLE foreign_plain (id INTEGER NOT NULL, amount NUMERIC(10,2))
+            SERVER loop_srv OPTIONS (table_name 'plain')
+    "#
+    );
+    for cmd in fixture.split(';') {
+        if cmd.trim().is_empty() {
+            continue;
+        }
+        pg_conn
+            .conn
+            .execute(cmd, &[])
+            .await
+            .expect("executing bulk-schema fixture");
+    }
+
+    let bulk = pg_conn
+        .get_schemas_in("public")
+        .await
+        .expect("bulk schema resolution");
+
+    // The fixture's relations must all be present; a partition leaf must not be,
+    // since `SCHEMA_QUERY` covers the parent and the leaves are its storage.
+    let mut got: Vec<&String> = bulk.keys().collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            "foreign_plain",
+            "parted",
+            "parted_2026",
+            "plain",
+            "plain_matview",
+            "plain_view"
+        ],
+        "bulk resolution must cover every relation kind the catalog query describes"
+    );
+
+    for (table, bulk_schema) in &bulk {
+        let per_table = pg_conn
+            .get_schema(&TableReference::partial("public", table.clone()))
+            .await
+            .unwrap_or_else(|e| panic!("per-table schema for {table}: {e}"));
+        assert_eq!(
+            bulk_schema, &per_table,
+            "bulk and per-table schemas diverged for {table}"
+        );
+    }
+
+    // Tear down
+    container
+        .remove()
+        .await
+        .expect("to stop postgres container");
 }
