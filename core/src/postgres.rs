@@ -137,6 +137,7 @@ impl PostgresTableFactory {
         Self { pool }
     }
 
+    /// A provider for `table_reference`, resolving its schema from the server.
     pub async fn table_provider(
         &self,
         table_reference: TableReference,
@@ -144,17 +145,59 @@ impl PostgresTableFactory {
         let pool = Arc::clone(&self.pool);
         let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
 
-        let table_provider = Arc::new(
-            SqlTable::new(
-                "postgres",
-                &dyn_pool,
-                table_reference,
-                Some(Engine::Postgres),
-            )
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
-            .with_dialect(Arc::new(PostgreSqlDialect {})),
+        let table = SqlTable::new(
+            "postgres",
+            &dyn_pool,
+            table_reference,
+            Some(Engine::Postgres),
+        )
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        Self::finish_table_provider(table)
+    }
+
+    /// A provider for `table_reference` using a schema the caller already has.
+    ///
+    /// Synchronous, which is the point: [`PostgresTableFactory::table_provider`]
+    /// queries the server for the schema, so building providers for a whole
+    /// namespace costs a round trip per table. A caller that resolved them
+    /// together -- see
+    /// [`PostgresConnection::get_schemas_in`](crate::sql::db_connection_pool::dbconnection::postgresconn::PostgresConnection::get_schemas_in)
+    /// -- pays none here.
+    ///
+    /// The schema must be the one the server reports for that table; nothing
+    /// checks it, and a wrong one silently mis-describes the table rather than
+    /// failing. Pair it with a source that derives it from the same catalog
+    /// query `table_provider` would have run.
+    pub fn table_provider_with_schema(
+        &self,
+        table_reference: TableReference,
+        schema: SchemaRef,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        let pool = Arc::clone(&self.pool);
+        let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
+
+        let table = SqlTable::new_with_schema(
+            "postgres",
+            &dyn_pool,
+            schema,
+            table_reference,
+            Some(Engine::Postgres),
         );
+
+        Self::finish_table_provider(table)
+    }
+
+    /// The dialect and federation wrapping both constructors share.
+    ///
+    /// Kept in one place so a provider cannot differ by which constructor built
+    /// it: a table federating on one path and not the other would plan
+    /// differently for no reason the caller could see.
+    fn finish_table_provider(
+        table: SqlTable<PostgresPooledConnection, &'static (dyn ToSql + Sync)>,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        let table_provider = Arc::new(table.with_dialect(Arc::new(PostgreSqlDialect {})));
 
         #[cfg(feature = "postgres-federation")]
         let table_provider = Arc::new(
