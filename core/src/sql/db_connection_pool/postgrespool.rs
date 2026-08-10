@@ -442,8 +442,14 @@ impl PostgresConnectionPool {
         // extra and spares every later caller the round trip.
         let variant = {
             let conn = pool.get().await.map_err(map_pool_run_error)?;
+            // Schema-qualified deliberately. `version()` is resolved through
+            // `search_path`, so a `public.version()` in the target database --
+            // which a user may define for any reason -- would decide how this
+            // pool classifies the server, and a vanilla server misread as
+            // Redshift takes query paths it cannot answer. `pg_catalog` cannot
+            // be shadowed.
             let row = conn
-                .query_one("SELECT version()", &[])
+                .query_one("SELECT pg_catalog.version()", &[])
                 .await
                 .context(ConnectionPoolSnafu)?;
             let version: String = row.try_get(0).context(ConnectionPoolSnafu)?;
