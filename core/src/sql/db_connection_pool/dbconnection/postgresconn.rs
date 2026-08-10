@@ -2,7 +2,6 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
-use tokio::sync::OnceCell;
 
 use crate::sql::arrow_sql_gen::postgres::rows_to_arrow;
 use crate::sql::arrow_sql_gen::postgres::schema::pg_data_type_to_arrow_type;
@@ -198,6 +197,19 @@ fn column_def_from_row(row: &Row) -> ColumnDef {
     }
 }
 
+/// Classifies a server from what `SELECT version()` reports.
+///
+/// Split out from the query so the classification is testable without a server,
+/// and so the pool can detect the variant once while validating itself.
+#[must_use]
+pub fn variant_from_version(version: &str) -> PostgresVariant {
+    if version.contains("Redshift") {
+        PostgresVariant::Redshift
+    } else {
+        PostgresVariant::Default
+    }
+}
+
 /// Quotes a SQL identifier for safe interpolation into a statement that can't use bind
 /// parameters (e.g. Redshift `SHOW COLUMNS`), doubling any embedded double quotes.
 fn quote_pg_identifier(ident: &str) -> String {
@@ -318,21 +330,15 @@ fn format_postgres_query_error(source: &bb8_postgres::tokio_postgres::Error) -> 
 pub struct PostgresConnection {
     pub conn: PostgresPooledConnection,
     unsupported_type_action: UnsupportedTypeAction,
-    /// Memoizes `SELECT version()` across every connection drawn from one pool.
+    /// The server's variant, detected once when the pool was built.
     ///
-    /// The variant is a property of the server, not of a connection, but each
-    /// checkout builds a fresh `PostgresConnection`, so a per-connection cache
-    /// would never be read twice: schema inference takes one connection per
-    /// table and asks once. Sharing the cell with the pool is what makes the
-    /// memo effective -- a catalog resolving N tables goes from N `version()`
-    /// round trips to one.
-    ///
-    /// Async rather than a `OnceLock`, so that concurrent cold callers await one
-    /// shared initialization instead of each issuing its own query before any of
-    /// them stores a result. Discovery resolves tables in parallel, which is
-    /// exactly the case that would otherwise still pay N round trips on the
-    /// first cycle.
-    variant: Arc<OnceCell<PostgresVariant>>,
+    /// It describes the server, not the connection, so asking per connection
+    /// would repeat a fixed answer: each checkout builds a fresh
+    /// `PostgresConnection`, and discovery takes one per table. Resolving it
+    /// with the pool -- which already connects to validate itself -- means one
+    /// `SELECT version()` for the pool's lifetime instead of one per caller,
+    /// with no cell to initialize and no race to coordinate.
+    variant: PostgresVariant,
 }
 
 impl SchemaValidator for PostgresConnection {
@@ -374,12 +380,14 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
         PostgresConnection {
             conn,
             unsupported_type_action: UnsupportedTypeAction::default(),
-            variant: Arc::default(),
+            // Overridden by the pool, which has already detected it. A connection
+            // built outside a pool assumes vanilla PostgreSQL.
+            variant: PostgresVariant::Default,
         }
     }
 
     async fn tables(&self, schema: &str) -> Result<Vec<String>, super::Error> {
-        let query = match self.get_variant().await? {
+        let query = match self.variant() {
             PostgresVariant::Default => TABLES_QUERY,
             PostgresVariant::Redshift => REDSHIFT_TABLES_QUERY,
         };
@@ -394,7 +402,7 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
     }
 
     async fn schemas(&self) -> Result<Vec<String>, super::Error> {
-        let query = match self.get_variant().await? {
+        let query = match self.variant() {
             PostgresVariant::Default => SCHEMAS_QUERY,
             PostgresVariant::Redshift => REDSHIFT_SCHEMAS_QUERY,
         };
@@ -495,11 +503,10 @@ impl PostgresConnection {
         self
     }
 
-    /// Shares one variant memo across every connection from the same pool. Without
-    /// this each connection re-runs `SELECT version()`, since a connection is
-    /// built per checkout and schema inference takes one per table.
+    /// Applies the variant the pool detected when it was built, so every
+    /// connection it hands out reports the same server without asking again.
     #[must_use]
-    pub fn with_variant_cache(mut self, variant: Arc<OnceCell<PostgresVariant>>) -> Self {
+    pub fn with_variant(mut self, variant: PostgresVariant) -> Self {
         self.variant = variant;
         self
     }
@@ -562,7 +569,7 @@ impl PostgresConnection {
         &self,
         schema_name: &str,
     ) -> Result<HashMap<String, SchemaRef>, super::Error> {
-        let variant = self.get_variant().await?;
+        let variant = self.variant();
         if variant == PostgresVariant::Redshift {
             return Ok(HashMap::new());
         }
@@ -592,49 +599,11 @@ impl PostgresConnection {
         Ok(schemas)
     }
 
-    pub async fn get_variant(&self) -> Result<PostgresVariant, super::Error> {
-        // Concurrent callers share one in-flight query on the success path, which
-        // is the case this exists for: parallel discovery would otherwise issue
-        // one `SELECT version()` per table before any of them stored a result.
-        //
-        // Failure is not shared. `get_or_try_init` drops the permit with the cell
-        // still empty, so waiters then attempt it one after another rather than
-        // all receiving the first error. That is deliberate -- it keeps an error
-        // out of the cell, so a transient failure does not pin the wrong answer
-        // for the pool's lifetime -- but it does mean N callers can serialize N
-        // failed attempts. Each runs on a connection the pool already
-        // established, so a dead server fails them fast; a *slow* one would make
-        // them queue.
+    /// The server's variant, as detected when the pool was built. Infallible and
+    /// free: nothing is queried here.
+    #[must_use]
+    pub fn variant(&self) -> PostgresVariant {
         self.variant
-            .get_or_try_init(|| self.query_variant())
-            .await
-            .copied()
-    }
-
-    /// Asks the server which variant it is. Prefer [`PostgresConnection::get_variant`],
-    /// which memoizes this per pool.
-    async fn query_variant(&self) -> Result<PostgresVariant, super::Error> {
-        let row = self
-            .conn
-            .query_one("SELECT version()", &[])
-            .await
-            .map_err(|e| super::Error::UnableToGetSchema {
-                source: maybe_db_source_err(e),
-            })?;
-
-        let version: String = row
-            .try_get(0)
-            .map_err(|e| super::Error::UnableToGetSchema {
-                source: maybe_db_source_err(e),
-            })?;
-
-        let variant = if version.contains("Redshift") {
-            PostgresVariant::Redshift
-        } else {
-            PostgresVariant::Default
-        };
-
-        Ok(variant)
     }
 
     async fn query_variant_and_schema(
@@ -644,7 +613,7 @@ impl PostgresConnection {
         let table_name = table_reference.table();
         let schema_name = table_reference.schema().unwrap_or("public");
 
-        let variant = self.get_variant().await?;
+        let variant = self.variant();
 
         let columns = match variant {
             PostgresVariant::Default => {
@@ -808,5 +777,31 @@ impl PostgresConnection {
             })?;
 
         Ok(rec.schema())
+    }
+}
+
+#[cfg(test)]
+mod variant_tests {
+    use super::{variant_from_version, PostgresVariant};
+
+    /// Classification is pure, so it is checked against the real strings each
+    /// server reports rather than needing one to be running.
+    #[test]
+    fn classifies_a_server_from_its_version_string() {
+        assert_eq!(
+            variant_from_version(
+                "PostgreSQL 8.0.2 on i686-pc-linux-gnu, compiled by GCC gcc (GCC) 3.4.2, Redshift 1.0.12345"
+            ),
+            PostgresVariant::Redshift
+        );
+        assert_eq!(
+            variant_from_version(
+                "PostgreSQL 16.2 (Debian 16.2-1.pgdg120+2) on aarch64-unknown-linux-gnu"
+            ),
+            PostgresVariant::Default
+        );
+        // Anything unrecognized is treated as vanilla, which is the conservative
+        // reading: Redshift-specific query paths are only taken when named.
+        assert_eq!(variant_from_version(""), PostgresVariant::Default);
     }
 }

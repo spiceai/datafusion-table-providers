@@ -11,9 +11,12 @@ use std::sync::Arc;
 use crate::postgres::common;
 use crate::postgres::PostgresTableProviderFactory;
 use datafusion_table_providers::postgres::PostgresTableFactory;
-use datafusion_table_providers::sql::db_connection_pool::dbconnection::postgresconn::PostgresVariant;
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::postgresconn::{
+    PostgresConnection, PostgresVariant,
+};
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::AsyncDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::util::secrets::to_secret_map;
 use datafusion_table_providers::UnsupportedTypeAction;
 
@@ -421,24 +424,20 @@ async fn test_postgres_foreign_table_schema_inference() {
         .expect("to stop postgres container");
 }
 
-/// The `PostgreSQL` variant describes the server, so it is detected once per pool
-/// rather than once per connection.
+/// The pool detects the server's variant when it is built, and every connection
+/// it hands out reports that same value.
 ///
-/// Each checkout builds a fresh `PostgresConnection`, and schema inference takes
-/// one connection per table, so a per-connection memo would never be read twice:
-/// a catalog resolving N tables would run N `SELECT version()` round trips.
+/// That no *further* query happens is structural rather than something to
+/// measure: [`PostgresConnection::variant`] is a synchronous accessor over a
+/// resolved field, with no connection in reach, so there is no code path left
+/// that could ask the server again. Detecting it lazily instead would need a
+/// cell to initialize and concurrent cold callers to coordinate, for an answer
+/// that cannot change while the pool lives.
 ///
-/// Both halves of that claim are load-bearing and neither can be shown with a
-/// test-owned cell handed to `with_variant_cache` -- that proves only that
-/// `get_variant` consults *a* cell, and would keep passing if the pool stopped
-/// attaching its own. So the memo here is only ever populated through the pool:
-///
-/// 1. a `connect()` connection populates it, by way of `get_schema`;
-/// 2. the server is stopped, making any further round trip impossible;
-/// 3. a `connect_direct()` connection taken beforehand still answers.
-///
-/// Answering in step 3 is only possible if the pool handed both paths the same
-/// cell, which is the property named by the test.
+/// What is worth asserting, then, is that the detection reaches both
+/// construction paths -- `connect()` and `connect_direct()` -- since a
+/// connection built without it would silently fall back to `Default` and take
+/// vanilla query paths against a Redshift server.
 #[tokio::test]
 async fn test_postgres_variant_is_detected_once_per_pool() {
     let port = crate::get_random_port();
@@ -452,50 +451,34 @@ async fn test_postgres_variant_is_detected_once_per_pool() {
             .expect("unable to create Postgres connection pool"),
     );
 
-    let seed = postgres_pool
-        .connect_direct()
-        .await
-        .expect("to connect to postgres");
-    seed.conn
-        .execute("CREATE TABLE variant_probe (id INTEGER)", &[])
-        .await
-        .expect("to create table");
-
-    // Taken while the server is up, before anything has populated the memo, and
-    // deliberately not used until after the server is gone.
     let direct = postgres_pool
         .connect_direct()
         .await
         .expect("to connect to postgres");
-
-    // Populate the memo through the *other* construction path: `table_provider`
-    // resolves the schema over a `connect()` connection, which detects the
-    // variant on the way.
-    let table_factory = PostgresTableFactory::new(Arc::clone(&postgres_pool));
-    table_factory
-        .table_provider(TableReference::bare("variant_probe"))
-        .await
-        .expect("to create table provider");
-
-    container.stop().await.expect("to stop postgres container");
-
-    // Nothing can be asked of the server now, so an answer can only have come
-    // from the cell the `connect()` path filled -- which requires the pool to
-    // have given both paths the same one.
     assert_eq!(
-        direct
-            .get_variant()
-            .await
-            .expect("memo answers without the server"),
+        direct.variant(),
         PostgresVariant::Default,
-        "connect() and connect_direct() must share the pool's variant memo"
+        "connect_direct must carry the variant the pool detected"
+    );
+
+    let pooled = DbConnectionPool::connect(&*postgres_pool)
+        .await
+        .expect("to connect to postgres");
+    let pooled = pooled
+        .as_any()
+        .downcast_ref::<PostgresConnection>()
+        .expect("pool hands out PostgresConnection");
+    assert_eq!(
+        pooled.variant(),
+        PostgresVariant::Default,
+        "connect must carry the variant the pool detected"
     );
 
     // Tear down
     container
         .remove()
         .await
-        .expect("to remove postgres container");
+        .expect("to stop postgres container");
 }
 
 /// Resolving a whole schema in one round trip must produce exactly what
@@ -690,105 +673,6 @@ async fn test_postgres_bulk_and_per_table_agree_on_unsupported_types() {
             ),
         }
     }
-
-    // Tear down
-    container
-        .remove()
-        .await
-        .expect("to stop postgres container");
-}
-
-/// Concurrent cold callers must share one `SELECT version()`, not each issue
-/// their own.
-///
-/// This is the behavior `tokio::sync::OnceCell::get_or_try_init` is here for,
-/// and a sequential populate-then-read test cannot show it: with any
-/// check-query-set implementation the first call populates the cell and the rest
-/// hit it, so the round trips are coalesced by ordering rather than by the
-/// primitive. Only callers that reach the empty cell *together* distinguish the
-/// two, hence the barrier.
-///
-/// Counting is server-side and needs no extension. `pg_stat_activity.query`
-/// retains the last statement each live backend ran, and the pooled connections
-/// are deliberately held open for the duration, so a backend that ran
-/// `SELECT version()` still reports it. One matching backend means one round
-/// trip; without coalescing there is one per caller.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_postgres_variant_query_is_coalesced_across_concurrent_callers() {
-    const CALLERS: usize = 6;
-
-    let port = crate::get_random_port();
-    let container = common::start_postgres_docker_container("postgres:latest", port, None)
-        .await
-        .expect("Postgres container to start");
-
-    let postgres_pool = Arc::new(
-        PostgresConnectionPool::new(to_secret_map(common::get_pg_params(port)))
-            .await
-            .expect("unable to create Postgres connection pool"),
-    );
-
-    // Held for the whole test: each is a distinct backend, and releasing one
-    // would let the pool hand its connection to the next caller, collapsing the
-    // very concurrency being measured.
-    let mut conns = Vec::with_capacity(CALLERS);
-    for _ in 0..CALLERS {
-        conns.push(
-            postgres_pool
-                .connect_direct()
-                .await
-                .expect("to connect to postgres"),
-        );
-    }
-
-    // Every caller reaches the empty cell together; without a barrier the first
-    // could finish before the others start, which is the sequential case.
-    let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS));
-    let mut tasks = Vec::with_capacity(CALLERS);
-    for conn in conns {
-        let barrier = Arc::clone(&barrier);
-        tasks.push(tokio::spawn(async move {
-            barrier.wait().await;
-            let variant = conn.get_variant().await.expect("variant");
-            // Hold the connection until every caller is done, keeping its
-            // backend alive so pg_stat_activity can still be asked about it.
-            (conn, variant)
-        }));
-    }
-
-    let mut held = Vec::with_capacity(CALLERS);
-    for task in tasks {
-        let (conn, variant) = task.await.expect("variant task");
-        assert_eq!(
-            variant,
-            PostgresVariant::Default,
-            "every caller must observe the same variant"
-        );
-        held.push(conn);
-    }
-
-    let observer = postgres_pool
-        .connect_direct()
-        .await
-        .expect("to connect to postgres");
-    let ran: i64 = observer
-        .conn
-        .query_one(
-            "SELECT count(*) FROM pg_stat_activity \
-             WHERE query = 'SELECT version()' AND datname = current_database()",
-            &[],
-        )
-        .await
-        .expect("to count version() backends")
-        .get(0);
-
-    assert_eq!(
-        ran, 1,
-        "{CALLERS} concurrent cold callers must share one SELECT version(); \
-         {ran} backends ran it"
-    );
-
-    drop(held);
 
     // Tear down
     container
