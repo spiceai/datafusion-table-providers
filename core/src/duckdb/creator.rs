@@ -7,7 +7,6 @@ use arrow::{
     datatypes::SchemaRef,
     ffi_stream::FFI_ArrowArrayStream,
 };
-use datafusion::common::utils::quote_identifier;
 use datafusion::common::Constraints;
 use datafusion::sql::TableReference;
 use duckdb::Transaction;
@@ -18,6 +17,7 @@ use std::fmt::Display;
 use std::sync::{Arc, Mutex};
 
 use super::DuckDB;
+use crate::sql::sql_provider_datafusion::expr;
 use crate::util::{
     column_reference::ColumnReference, constraints::get_primary_keys_from_constraints,
     indexes::IndexType,
@@ -37,6 +37,21 @@ impl RelationName {
     #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
+    }
+
+    #[must_use]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Renders the name as a double-quoted DuckDB identifier, doubling any embedded quote.
+    ///
+    /// Every statement this module builds by hand names its relation through here rather than
+    /// interpolating [`Display`], so that a quote in a dataset name cannot close the identifier
+    /// early and widen the statement.
+    #[must_use]
+    pub(crate) fn quoted(&self) -> String {
+        expr::quoted_identifier(&self.0)
     }
 }
 
@@ -370,7 +385,7 @@ impl TableManager {
     fn drop_table(&self, tx: &Transaction<'_>) -> super::Result<()> {
         // drop this table
         tx.execute(
-            &format!(r#"DROP TABLE IF EXISTS "{}""#, self.table_name()),
+            &format!("DROP TABLE IF EXISTS {}", self.table_name().quoted()),
             [],
         )
         .context(super::UnableToDropDuckDBTableSnafu)?;
@@ -389,9 +404,9 @@ impl TableManager {
     ) -> super::Result<u64> {
         // insert from this table, into the target table
         let mut insert_sql = format!(
-            r#"INSERT INTO "{}" SELECT * FROM "{}""#,
-            table.table_name(),
-            self.table_name()
+            "INSERT INTO {} SELECT * FROM {}",
+            table.table_name().quoted(),
+            self.table_name().quoted()
         );
 
         if let Some(on_conflict) = on_conflict {
@@ -450,7 +465,10 @@ impl TableManager {
         let table_name = self.table_name();
         let index_name = TableManager::get_index_name(table_name, &index);
 
-        let sql = format!(r#"DROP INDEX IF EXISTS "{index_name}""#);
+        let sql = format!(
+            "DROP INDEX IF EXISTS {}",
+            expr::quoted_identifier(&index_name)
+        );
         tracing::debug!("{sql}");
 
         tx.execute(&sql, [])
@@ -493,16 +511,24 @@ impl TableManager {
         tx.register_arrow_scan_view(&view_name, &stream)
             .context(super::UnableToRegisterArrowScanViewForTableCreationSnafu)?;
 
-        let sql =
-            format!(r#"CREATE TABLE IF NOT EXISTS "{table_name}" AS SELECT * FROM "{view_name}""#,);
+        let sql = format!(
+            "CREATE TABLE IF NOT EXISTS {} AS SELECT * FROM {}",
+            table_name.quoted(),
+            expr::quoted_identifier(&view_name)
+        );
         tracing::debug!("{sql}");
 
         tx.execute(&sql, [])
             .context(super::UnableToCreateDuckDBTableSnafu)?;
 
+        // `duckdb_tables()` matches on the table's *name*, so the name is a string literal here
+        // rather than an identifier, and needs the literal escape instead of the quoted one.
         let create_stmt = tx
             .query_row(
-                &format!("select sql from duckdb_tables() where table_name = '{table_name}'",),
+                &format!(
+                    "select sql from duckdb_tables() where table_name = {}",
+                    expr::string_literal(table_name.as_str(), Some(expr::Engine::DuckDB))
+                ),
                 [],
                 |r| r.get::<usize, String>(0),
             )
@@ -554,8 +580,8 @@ impl TableManager {
         tx.execute(
             &format!(
                 "CREATE OR REPLACE VIEW {base_table} AS SELECT * FROM {internal_table}",
-                base_table = quote_identifier(&self.definition_name().to_string()),
-                internal_table = quote_identifier(&self.table_name().to_string())
+                base_table = self.definition_name().quoted(),
+                internal_table = self.table_name().quoted()
             ),
             [],
         )
@@ -570,12 +596,20 @@ impl TableManager {
         &self,
         tx: &Transaction<'_>,
     ) -> super::Result<HashSet<String>> {
-        // DuckDB provides convenient queryable 'pragma_table_info' table function
-        // Complex table name with schema as part of the name must be quoted as
-        // '"<name>"', otherwise it will be parsed to schema and table name
+        // DuckDB provides convenient queryable 'pragma_table_info' table function.
+        // A complex table name with a schema as part of the name must be quoted as
+        // '"<name>"', otherwise it will be parsed to schema and table name — so the
+        // quoted identifier is nested inside a string literal here, and needs the
+        // literal escape as well as the identifier one.
+        //
+        // A name holding a double quote still cannot be looked up this way: DuckDB parses the
+        // argument with its own qualified-name parser, which rejects the doubled quote
+        // ("Unterminated quote in qualified name"). Escaping cannot reach that; see
+        // https://github.com/spiceai/spiceai/issues/12677.
         let sql = format!(
-            "SELECT name FROM pragma_table_info('{table_name}') WHERE pk = true",
-            table_name = quote_identifier(&self.table_name().to_string())
+            "SELECT name FROM pragma_table_info({table_name}) WHERE pk = true",
+            table_name =
+                expr::string_literal(&self.table_name().quoted(), Some(expr::Engine::DuckDB))
         );
         tracing::debug!("{sql}");
 
@@ -598,9 +632,12 @@ impl TableManager {
     /// Returns the current indexes in database for this table.
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn current_indexes(&self, tx: &Transaction<'_>) -> super::Result<HashSet<String>> {
+        // `duckdb_indexes.table_name` holds the table's name, so it is matched as a string
+        // literal here rather than named as an identifier.
         let sql = format!(
-            "SELECT index_name FROM duckdb_indexes WHERE table_name = '{table_name}'",
-            table_name = &self.table_name().to_string()
+            "SELECT index_name FROM duckdb_indexes WHERE table_name = {table_name}",
+            table_name =
+                expr::string_literal(self.table_name().as_str(), Some(expr::Engine::DuckDB))
         );
 
         tracing::debug!("{sql}");
@@ -753,7 +790,7 @@ impl TableManager {
     pub fn current_schema(&self, tx: &Transaction<'_>) -> super::Result<SchemaRef> {
         let sql = format!(
             "SELECT * FROM {table_name} LIMIT 0",
-            table_name = quote_identifier(&self.table_name().to_string())
+            table_name = self.table_name().quoted()
         );
         let mut stmt = tx.prepare(&sql).context(super::UnableToQueryDataSnafu)?;
         let result: duckdb::Arrow<'_> = stmt
@@ -765,7 +802,7 @@ impl TableManager {
     pub fn get_row_count(&self, tx: &Transaction<'_>) -> super::Result<u64> {
         let sql = format!(
             "SELECT COUNT(1) FROM {table_name}",
-            table_name = quote_identifier(&self.table_name().to_string())
+            table_name = self.table_name().quoted()
         );
         let count = tx
             .query_row(&sql, [], |r| r.get::<usize, u64>(0))
@@ -800,9 +837,9 @@ impl ViewCreator {
     ) -> super::Result<u64> {
         // insert from this view, into the target table
         let mut insert_sql = format!(
-            r#"INSERT INTO "{table_name}" SELECT * FROM "{view_name}""#,
-            view_name = self.name,
-            table_name = table.table_name()
+            "INSERT INTO {table_name} SELECT * FROM {view_name}",
+            view_name = self.name.quoted(),
+            table_name = table.table_name().quoted()
         );
 
         if let Some(on_conflict) = on_conflict {
@@ -821,14 +858,8 @@ impl ViewCreator {
 
     pub fn drop(&self, tx: &Transaction<'_>) -> super::Result<()> {
         // drop this view
-        tx.execute(
-            &format!(
-                r#"DROP VIEW IF EXISTS "{view_name}""#,
-                view_name = self.name
-            ),
-            [],
-        )
-        .context(super::UnableToDropDuckDBTableSnafu)?;
+        tx.execute(&format!("DROP VIEW IF EXISTS {}", self.name.quoted()), [])
+            .context(super::UnableToDropDuckDBTableSnafu)?;
 
         Ok(())
     }
@@ -1630,6 +1661,156 @@ pub(crate) mod tests {
             .expect("to verify indexes match");
 
         assert!(indexes_match);
+
+        tx.rollback().expect("should rollback transaction");
+    }
+
+    #[test]
+    fn test_relation_name_quoted_escapes_an_embedded_quote() {
+        assert_eq!(RelationName::new("plain").quoted(), r#""plain""#);
+        // A dot must stay inside the identifier rather than splitting it into schema.table.
+        assert_eq!(RelationName::new("sch.tbl").quoted(), r#""sch.tbl""#);
+        // The whole point: the quote is doubled, so it cannot close the identifier early.
+        assert_eq!(RelationName::new(r#"wi"th"#).quoted(), r#""wi""th""#);
+        assert_eq!(RelationName::new(r#"a"b"c"#).quoted(), r#""a""b""c""#);
+        // A backslash carries no meaning inside a quoted identifier and must pass through.
+        assert_eq!(RelationName::new(r"back\slash").quoted(), r#""back\slash""#);
+        assert_eq!(RelationName::new("").quoted(), r#""""#);
+    }
+
+    /// Every statement `TableManager` and `ViewCreator` build by hand names their relation by
+    /// interpolation, so a quote in the dataset name used to close the identifier early and
+    /// leave a statement that either fails to parse or names a different table. Drives the whole
+    /// lifecycle against real DuckDB with a name carrying both a quote and a dot.
+    #[tokio::test]
+    async fn test_quote_bearing_table_name_survives_the_creator_lifecycle() {
+        let _guard = init_tracing(None);
+        let pool = get_mem_duckdb();
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("name", arrow::datatypes::DataType::Utf8, false),
+        ]));
+        let table_definition = Arc::new(
+            TableDefinition::new(RelationName::new(r#"we"ird.tbl"#), Arc::clone(&schema))
+                .with_indexes(vec![(
+                    ColumnReference::try_from("name").expect("valid column reference"),
+                    IndexType::Enabled,
+                )]),
+        );
+
+        let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
+        let conn = pool_conn
+            .as_any_mut()
+            .downcast_mut::<DuckDbConnection>()
+            .expect("to downcast to duckdb connection");
+        let tx = conn
+            .get_underlying_conn_mut()
+            .transaction()
+            .expect("should begin transaction");
+
+        // `create_table` runs `get_table_create_statement`, which names the table as an
+        // identifier in the `CREATE TABLE` and as a string literal in the `duckdb_tables()`
+        // lookup — two different escapes on the same name.
+        let table = TableManager::new(Arc::clone(&table_definition))
+            .with_internal(true)
+            .expect("to create table manager");
+        table
+            .create_table(Arc::clone(&pool), &tx)
+            .expect("to create a table whose name holds a quote");
+
+        assert_eq!(table.get_row_count(&tx).expect("to count rows"), 0);
+        assert!(table
+            .current_schema(&tx)
+            .expect("to read the schema back")
+            .fields()
+            .iter()
+            .any(|f| f.name() == "id"));
+        table.create_indexes(&tx).expect("to create indexes");
+        table.create_view(&tx).expect("to create the view");
+
+        // Insert through a `ViewCreator`, which names both the view and the target table.
+        tx.execute(
+            &format!(
+                "CREATE OR REPLACE VIEW {} AS SELECT 1::BIGINT AS id, 'a' AS name",
+                RelationName::new(r#"src"view"#).quoted()
+            ),
+            [],
+        )
+        .expect("to create the source view");
+        let rows = ViewCreator::from_name(RelationName::new(r#"src"view"#))
+            .insert_into(&table, &tx, None)
+            .expect("to insert through a quote-bearing view name");
+        assert_eq!(rows, 1);
+        assert_eq!(table.get_row_count(&tx).expect("to count rows"), 1);
+
+        ViewCreator::from_name(RelationName::new(r#"src"view"#))
+            .drop(&tx)
+            .expect("to drop the source view");
+
+        // `delete_table` drops the indexes (whose names embed the table name) then the table.
+        table.delete_table(&tx).expect("to drop indexes and table");
+        assert!(
+            table.get_row_count(&tx).is_err(),
+            "the table should be gone after delete_table"
+        );
+
+        tx.rollback().expect("should rollback transaction");
+    }
+
+    /// Two sites name the table inside a *string literal* rather than as an identifier: the
+    /// `duckdb_tables()` lookup in `get_table_create_statement`, and the `pragma_table_info`
+    /// argument in `current_primary_keys`. An apostrophe closed those literals early and the
+    /// statement failed to parse.
+    #[tokio::test]
+    async fn test_apostrophe_table_name_reaches_the_catalog_lookups() {
+        let _guard = init_tracing(None);
+        let pool = get_mem_duckdb();
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let table_definition = Arc::new(
+            TableDefinition::new(RelationName::new("o'brien"), Arc::clone(&schema))
+                .with_constraints(get_pk_constraints(&["id"], Arc::clone(&schema)))
+                .with_indexes(vec![(
+                    ColumnReference::try_from("id").expect("valid column reference"),
+                    IndexType::Enabled,
+                )]),
+        );
+
+        let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
+        let conn = pool_conn
+            .as_any_mut()
+            .downcast_mut::<DuckDbConnection>()
+            .expect("to downcast to duckdb connection");
+        let tx = conn
+            .get_underlying_conn_mut()
+            .transaction()
+            .expect("should begin transaction");
+
+        let table = TableManager::new(Arc::clone(&table_definition))
+            .with_internal(true)
+            .expect("to create table manager");
+        table
+            .create_table(Arc::clone(&pool), &tx)
+            .expect("to create a table whose name holds an apostrophe");
+
+        assert_eq!(table.get_row_count(&tx).expect("to count rows"), 0);
+        assert!(table
+            .current_primary_keys(&tx)
+            .expect("to read primary keys back through pragma_table_info")
+            .contains("id"));
+
+        // `current_indexes` matches `duckdb_indexes.table_name` as a literal too.
+        table.create_indexes(&tx).expect("to create indexes");
+        assert_eq!(
+            table
+                .current_indexes(&tx)
+                .expect("to read indexes back through duckdb_indexes")
+                .len(),
+            1
+        );
 
         tx.rollback().expect("should rollback transaction");
     }

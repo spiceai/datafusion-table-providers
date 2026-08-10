@@ -20,7 +20,7 @@ use crate::sql::db_connection_pool::dbconnection::mysqlconn::MySQLConnection;
 use crate::sql::db_connection_pool::dbconnection::DbConnection;
 use crate::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
 use crate::sql::db_connection_pool::{self, mysqlpool, DbConnectionPool};
-use crate::sql::sql_provider_datafusion::{self, expr::Engine, SqlTable};
+use crate::sql::sql_provider_datafusion::{self, expr, expr::Engine, SqlTable};
 use crate::util::supported_functions::FunctionSupport;
 use crate::util::{
     self, column_reference::ColumnReference, constraints::get_primary_keys_from_constraints,
@@ -380,13 +380,15 @@ impl MySQL {
     }
 
     async fn table_exists(&self, mysql_connection: &MySQLConnection) -> bool {
+        // `information_schema.tables.table_name` holds the table's name, so it is matched as a
+        // string literal here rather than named as an identifier.
         let sql = format!(
             "SELECT EXISTS (
           SELECT 1
           FROM information_schema.tables
-          WHERE table_name = '{name}'
+          WHERE table_name = {name}
         )",
-            name = self.table_name
+            name = expr::string_literal(&self.table_name, Some(expr::Engine::MySQL))
         );
         tracing::trace!("{sql}");
         let Ok(Some((exists,))) = mysql_connection

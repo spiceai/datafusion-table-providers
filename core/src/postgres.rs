@@ -8,7 +8,7 @@ use crate::sql::db_connection_pool::{
     postgrespool::{self, PostgresConnectionPool},
     DbConnectionPool,
 };
-use crate::sql::sql_provider_datafusion::{expr::Engine, SqlTable};
+use crate::sql::sql_provider_datafusion::{expr, expr::Engine, SqlTable};
 use crate::util::schema::SchemaValidator;
 use crate::util::supported_functions::FunctionSupport;
 use crate::UnsupportedTypeAction;
@@ -407,15 +407,17 @@ impl Postgres {
     }
 
     async fn table_exists(&self, postgres_conn: &PostgresConnection) -> bool {
+        // `information_schema.tables` holds the table and schema names as data, so they are
+        // matched as string literals here rather than named as identifiers.
         let sql = match self.table.schema() {
             Some(schema) => format!(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '{name}' AND table_schema = '{schema}')",
-                name = self.table.table(),
-                schema = schema
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = {name} AND table_schema = {schema})",
+                name = expr::string_literal(self.table.table(), Some(expr::Engine::Postgres)),
+                schema = expr::string_literal(schema, Some(expr::Engine::Postgres))
             ),
             None => format!(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '{name}')",
-                name = self.table.table()
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = {name})",
+                name = expr::string_literal(self.table.table(), Some(expr::Engine::Postgres))
             ),
         };
 
