@@ -680,3 +680,99 @@ async fn test_postgres_bulk_and_per_table_agree_on_unsupported_types() {
         .await
         .expect("to stop postgres container");
 }
+
+/// A server detected as something other than `Default` is what makes the
+/// variant's propagation observable.
+///
+/// `PostgresConnection::new` falls back to `Default`, and a vanilla server is
+/// detected as `Default`, so a test against one cannot tell a wired connection
+/// from an unwired one -- removing `.with_variant(..)` from either construction
+/// path would still pass. Only a non-default detection separates them.
+///
+/// Redshift is simulated rather than provisioned: detection reads `SELECT
+/// version()`, and a `public.version()` shadowing `pg_catalog`'s (via a
+/// database-level `search_path`) makes an ordinary server answer as one. That
+/// exercises the real detection code against the real string a Redshift server
+/// reports.
+///
+/// It also covers the Redshift branch of `get_schemas_in`, which returns an
+/// empty map because `SHOW COLUMNS` is per-table and cannot be batched, leaving
+/// every table to the per-table fallback.
+#[tokio::test]
+async fn test_postgres_redshift_variant_propagates_and_disables_bulk_schema() {
+    let port = crate::get_random_port();
+    let container = common::start_postgres_docker_container("postgres:latest", port, None)
+        .await
+        .expect("Postgres container to start");
+
+    // Shadow `version()` before building the pool under test: detection happens
+    // once, while the pool validates itself.
+    {
+        let setup_pool = PostgresConnectionPool::new(to_secret_map(common::get_pg_params(port)))
+            .await
+            .expect("unable to create setup pool");
+        let setup = setup_pool
+            .connect_direct()
+            .await
+            .expect("to connect to postgres");
+        setup
+            .conn
+            .batch_execute(
+                "CREATE TABLE bulk_probe (id INTEGER, note TEXT); \
+                 CREATE FUNCTION public.version() RETURNS text LANGUAGE sql IMMUTABLE AS \
+                   $$ SELECT 'PostgreSQL 8.0.2 on i686-pc-linux-gnu, Redshift 1.0.12345'::text $$; \
+                 ALTER DATABASE postgres SET search_path = public, pg_catalog;",
+            )
+            .await
+            .expect("to shadow version()");
+    }
+
+    let redshift_pool = Arc::new(
+        PostgresConnectionPool::new(to_secret_map(common::get_pg_params(port)))
+            .await
+            .expect("unable to create Postgres connection pool"),
+    );
+
+    // Both construction paths must carry the detected variant; neither can fall
+    // back to `Default` without this failing.
+    let direct = redshift_pool
+        .connect_direct()
+        .await
+        .expect("to connect to postgres");
+    assert_eq!(
+        direct.variant(),
+        PostgresVariant::Redshift,
+        "connect_direct must carry the variant the pool detected"
+    );
+
+    let pooled = DbConnectionPool::connect(&*redshift_pool)
+        .await
+        .expect("to connect to postgres");
+    let pooled = pooled
+        .as_any()
+        .downcast_ref::<PostgresConnection>()
+        .expect("pool hands out PostgresConnection");
+    assert_eq!(
+        pooled.variant(),
+        PostgresVariant::Redshift,
+        "connect must carry the variant the pool detected"
+    );
+
+    // Redshift cannot answer in bulk, so the map is empty and every table is
+    // left to the per-table path rather than being reported as column-less.
+    let bulk = direct
+        .get_schemas_in("public")
+        .await
+        .expect("bulk resolution must succeed, empty");
+    assert!(
+        bulk.is_empty(),
+        "Redshift must decline bulk resolution, got {} entries",
+        bulk.len()
+    );
+
+    // Tear down
+    container
+        .remove()
+        .await
+        .expect("to stop postgres container");
+}
