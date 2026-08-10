@@ -5,6 +5,7 @@ use datafusion::common::ToDFSchema;
 use datafusion::logical_expr::CreateExternalTable;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -805,6 +806,88 @@ async fn test_postgres_redshift_declines_bulk_schema_resolution() {
         as_redshift.is_empty(),
         "Redshift must decline bulk resolution, got {} entries",
         as_redshift.len()
+    );
+
+    // Tear down
+    container
+        .remove()
+        .await
+        .expect("to stop postgres container");
+}
+
+/// A provider built from an already-resolved schema must be indistinguishable
+/// from one that asked the server itself.
+///
+/// This is what makes bulk resolution usable: `get_schemas_in` answers a whole
+/// namespace in one round trip, but the saving only materializes if the
+/// resulting schema can be turned into a provider without a second one. The two
+/// constructors must therefore agree on more than the schema -- the dialect and
+/// the federation wrapping decide how a table plans, and a provider that
+/// federated on one path but not the other would behave differently for no
+/// reason the caller could see.
+#[tokio::test]
+async fn test_postgres_table_provider_with_schema_matches_the_querying_constructor() {
+    let port = crate::get_random_port();
+    let container = common::start_postgres_docker_container("postgres:latest", port, None)
+        .await
+        .expect("Postgres container to start");
+
+    let postgres_pool = Arc::new(
+        PostgresConnectionPool::new(to_secret_map(common::get_pg_params(port)))
+            .await
+            .expect("unable to create Postgres connection pool"),
+    );
+    let conn = postgres_pool
+        .connect_direct()
+        .await
+        .expect("to connect to postgres");
+    conn.conn
+        .execute(
+            "CREATE TABLE precomputed (id INTEGER NOT NULL, note TEXT, amount NUMERIC(10,2), tags TEXT[])",
+            &[],
+        )
+        .await
+        .expect("to create table");
+
+    let factory = PostgresTableFactory::new(Arc::clone(&postgres_pool));
+    let table = TableReference::partial("public", "precomputed");
+
+    let queried = factory
+        .table_provider(table.clone())
+        .await
+        .expect("provider that resolves its own schema");
+
+    // The schema a bulk resolution would hand the caller.
+    let bulk = conn
+        .get_schemas_in("public")
+        .await
+        .expect("bulk schema resolution");
+    let precomputed = Arc::clone(
+        bulk.get("precomputed")
+            .expect("bulk resolution must cover the table"),
+    );
+
+    let supplied = factory
+        .table_provider_with_schema(table, precomputed)
+        .expect("provider from an already-resolved schema");
+
+    assert_eq!(
+        supplied.schema(),
+        queried.schema(),
+        "a supplied schema must produce the same table schema as a queried one"
+    );
+    assert_eq!(
+        format!("{:?}", supplied.table_type()),
+        format!("{:?}", queried.table_type()),
+        "both constructors must produce the same table type"
+    );
+    // Federation is what decides whether a scan is pushed down; differing here
+    // would change plans, not just types. The concrete provider type is the
+    // observable trace of which wrappers were applied.
+    assert_eq!(
+        (*supplied).type_id(),
+        (*queried).type_id(),
+        "both constructors must produce the same provider type, so they plan alike"
     );
 
     // Tear down
