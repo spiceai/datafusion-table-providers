@@ -18,7 +18,10 @@ use super::{
     runtime::run_async_with_tokio, DbConnectionPool, PasswordProvider, StaticPasswordProvider,
 };
 use crate::sql::db_connection_pool::{
-    dbconnection::{postgresconn::PostgresConnection, AsyncDbConnection, DbConnection},
+    dbconnection::{
+        postgresconn::{variant_from_version, PostgresConnection, PostgresVariant},
+        AsyncDbConnection, DbConnection,
+    },
     JoinPushDown,
 };
 
@@ -232,6 +235,10 @@ pub struct PostgresConnectionPool {
     join_push_down: JoinPushDown,
     unsupported_type_action: UnsupportedTypeAction,
     io_handle: Option<Handle>,
+    /// Detected once while validating the pool. The variant describes the
+    /// server, so every connection this pool hands out reports it without
+    /// asking again; see [`PostgresConnection::with_variant`].
+    variant: PostgresVariant,
 }
 
 impl PostgresConnectionPool {
@@ -430,19 +437,31 @@ impl PostgresConnectionPool {
             .await
             .map_err(map_pool_build_error)?;
 
-        // Verify the pool by executing a simple query
-        {
+        // Verify the pool, and take the server's variant from the same connection:
+        // it is fixed for the pool's lifetime, so detecting it here costs nothing
+        // extra and spares every later caller the round trip.
+        let variant = {
             let conn = pool.get().await.map_err(map_pool_run_error)?;
-            conn.execute("SELECT 1", &[])
+            // Schema-qualified deliberately. `version()` is resolved through
+            // `search_path`, so a `public.version()` in the target database --
+            // which a user may define for any reason -- would decide how this
+            // pool classifies the server, and a vanilla server misread as
+            // Redshift takes query paths it cannot answer. `pg_catalog` cannot
+            // be shadowed.
+            let row = conn
+                .query_one("SELECT pg_catalog.version()", &[])
                 .await
                 .context(ConnectionPoolSnafu)?;
-        }
+            let version: String = row.try_get(0).context(ConnectionPoolSnafu)?;
+            variant_from_version(&version)
+        };
 
         Ok(PostgresConnectionPool {
             pool: Arc::new(pool),
             join_push_down,
             unsupported_type_action: UnsupportedTypeAction::default(),
             io_handle: None,
+            variant,
         })
     }
 
@@ -475,7 +494,10 @@ impl PostgresConnectionPool {
         } else {
             pool.get_owned().await.map_err(map_pool_run_error)?
         };
-        Ok(PostgresConnection::new(conn))
+        // Deliberately does not apply `unsupported_type_action`, matching this
+        // method's existing behavior; only the variant memo is shared, which
+        // changes how often the server is asked, never what is inferred.
+        Ok(PostgresConnection::new(conn).with_variant(self.variant))
     }
 }
 
@@ -685,7 +707,8 @@ impl
         };
         Ok(Box::new(
             PostgresConnection::new(conn)
-                .with_unsupported_type_action(self.unsupported_type_action),
+                .with_unsupported_type_action(self.unsupported_type_action)
+                .with_variant(self.variant),
         ))
     }
 

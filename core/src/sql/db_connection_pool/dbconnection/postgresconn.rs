@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 
@@ -83,6 +84,7 @@ JOIN pg_namespace n ON t.typnamespace = n.oid
 WHERE n.nspname = $1
 )
 SELECT
+    cls.relname AS table_name,
     a.attname AS column_name,
     CASE
     -- when an array type is encountered, label as 'array'
@@ -141,7 +143,9 @@ JOIN pg_attribute a ON a.attrelid = cls.oid
 LEFT JOIN pg_type t ON t.oid = a.atttypid
 LEFT JOIN custom_type_details custom ON custom.typname = t.typname
 WHERE ns.nspname = $1
-    AND cls.relname = $2
+    -- $2 NULL selects every relation in the schema, for callers
+    -- resolving a whole namespace in one round trip.
+    AND ($2::text IS NULL OR cls.relname = $2)
     -- covers tables, normal views, materialized views, partitioned tables, &
     -- foreign tables. Foreign tables carry a full local column definition in
     -- pg_attribute, so their schema resolves here rather than falling through
@@ -149,7 +153,7 @@ WHERE ns.nspname = $1
     AND cls.relkind IN ('r','v','m','p','f')
     AND a.attnum > 0
     AND NOT a.attisdropped
-ORDER BY a.attnum;
+ORDER BY cls.relname, a.attnum;
 ";
 
 // Redshift schema inference uses `SHOW COLUMNS FROM TABLE <db>.<schema>.<table>` rather
@@ -178,6 +182,32 @@ struct ColumnDef {
     data_type: String,
     nullable: bool,
     type_details: Option<serde_json::Value>,
+}
+
+/// One `SCHEMA_QUERY` row as a [`ColumnDef`], read by column name so that adding
+/// to the projection cannot silently shift a field onto the wrong column.
+fn column_def_from_row(row: &Row) -> ColumnDef {
+    ColumnDef {
+        name: row.get("column_name"),
+        // `data_type` is already a formatted type string via
+        // `pg_catalog.format_type` (e.g. `numeric(10,2)`).
+        data_type: row.get("data_type"),
+        nullable: row.get::<_, String>("is_nullable") == "YES",
+        type_details: row.get("type_details"),
+    }
+}
+
+/// Classifies a server from what `SELECT version()` reports.
+///
+/// Split out from the query so the classification is testable without a server,
+/// and so the pool can detect the variant once while validating itself.
+#[must_use]
+pub fn variant_from_version(version: &str) -> PostgresVariant {
+    if version.contains("Redshift") {
+        PostgresVariant::Redshift
+    } else {
+        PostgresVariant::Default
+    }
 }
 
 /// Quotes a SQL identifier for safe interpolation into a statement that can't use bind
@@ -300,6 +330,15 @@ fn format_postgres_query_error(source: &bb8_postgres::tokio_postgres::Error) -> 
 pub struct PostgresConnection {
     pub conn: PostgresPooledConnection,
     unsupported_type_action: UnsupportedTypeAction,
+    /// The server's variant, detected once when the pool was built.
+    ///
+    /// It describes the server, not the connection, so asking per connection
+    /// would repeat a fixed answer: each checkout builds a fresh
+    /// `PostgresConnection`, and discovery takes one per table. Resolving it
+    /// with the pool -- which already connects to validate itself -- means one
+    /// `SELECT version()` for the pool's lifetime instead of one per caller,
+    /// with no cell to initialize and no race to coordinate.
+    variant: PostgresVariant,
 }
 
 impl SchemaValidator for PostgresConnection {
@@ -341,11 +380,14 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
         PostgresConnection {
             conn,
             unsupported_type_action: UnsupportedTypeAction::default(),
+            // Overridden by the pool, which has already detected it. A connection
+            // built outside a pool assumes vanilla PostgreSQL.
+            variant: PostgresVariant::Default,
         }
     }
 
     async fn tables(&self, schema: &str) -> Result<Vec<String>, super::Error> {
-        let query = match self.get_variant().await? {
+        let query = match self.variant() {
             PostgresVariant::Default => TABLES_QUERY,
             PostgresVariant::Redshift => REDSHIFT_TABLES_QUERY,
         };
@@ -360,7 +402,7 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
     }
 
     async fn schemas(&self) -> Result<Vec<String>, super::Error> {
-        let query = match self.get_variant().await? {
+        let query = match self.variant() {
             PostgresVariant::Default => SCHEMAS_QUERY,
             PostgresVariant::Redshift => REDSHIFT_SCHEMAS_QUERY,
         };
@@ -392,34 +434,7 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
             return self.infer_schema_from_data(table_reference).await;
         }
 
-        let mut fields = Vec::new();
-        for column in columns {
-            let mut context =
-                ParseContext::new().with_unsupported_type_action(self.unsupported_type_action);
-
-            if let Some(type_details) = column.type_details {
-                context = context.with_type_details(type_details);
-            };
-
-            let Ok(arrow_type) =
-                pg_data_type_to_arrow_type(&column.data_type, &context, Some(variant))
-            else {
-                handle_unsupported_type_error(
-                    self.unsupported_type_action,
-                    super::Error::UnsupportedDataType {
-                        data_type: column.data_type.clone(),
-                        field_name: column.name.clone(),
-                    },
-                )?;
-
-                continue;
-            };
-
-            fields.push(Field::new(column.name, arrow_type, column.nullable));
-        }
-
-        let schema = Arc::new(Schema::new(fields));
-        Ok(schema)
+        self.schema_from_columns(columns, variant)
     }
 
     async fn query_arrow(
@@ -488,28 +503,122 @@ impl PostgresConnection {
         self
     }
 
-    pub async fn get_variant(&self) -> Result<PostgresVariant, super::Error> {
-        let row = self
+    /// Applies the variant the pool detected when it was built, so every
+    /// connection it hands out reports the same server without asking again.
+    #[must_use]
+    pub fn with_variant(mut self, variant: PostgresVariant) -> Self {
+        self.variant = variant;
+        self
+    }
+
+    /// Builds the Arrow schema for one relation's [`ColumnDef`]s.
+    ///
+    /// Shared by the single-table and whole-schema paths so the type mapping and
+    /// `unsupported_type_action` handling cannot drift between them.
+    fn schema_from_columns(
+        &self,
+        columns: Vec<ColumnDef>,
+        variant: PostgresVariant,
+    ) -> Result<SchemaRef, super::Error> {
+        let mut fields = Vec::new();
+        for column in columns {
+            let mut context =
+                ParseContext::new().with_unsupported_type_action(self.unsupported_type_action);
+
+            if let Some(type_details) = column.type_details {
+                context = context.with_type_details(type_details);
+            };
+
+            let Ok(arrow_type) =
+                pg_data_type_to_arrow_type(&column.data_type, &context, Some(variant))
+            else {
+                handle_unsupported_type_error(
+                    self.unsupported_type_action,
+                    super::Error::UnsupportedDataType {
+                        data_type: column.data_type.clone(),
+                        field_name: column.name.clone(),
+                    },
+                )?;
+
+                continue;
+            };
+
+            fields.push(Field::new(column.name, arrow_type, column.nullable));
+        }
+
+        Ok(Arc::new(Schema::new(fields)))
+    }
+
+    /// Every relation in `schema_name` with its Arrow schema, resolved in one
+    /// round trip instead of one per table.
+    ///
+    /// A catalog discovering a schema otherwise calls `get_schema` per table,
+    /// and each call is its own query. This answers the whole namespace at once,
+    /// turning `T` round trips into one.
+    ///
+    /// The result is deliberately *incomplete rather than wrong*: a relation the
+    /// catalog query cannot describe is simply absent, and the caller resolves it
+    /// with `get_schema`, which keeps the `infer_schema_from_data` fallback that
+    /// Redshift datashare objects rely on. Redshift itself answers with an empty
+    /// map, since `SHOW COLUMNS` is per-table and cannot be batched -- so every
+    /// table falls back, exactly as before.
+    ///
+    /// Callers must therefore treat a missing entry as "ask per table", never as
+    /// "this relation has no columns".
+    pub async fn get_schemas_in(
+        &self,
+        schema_name: &str,
+    ) -> Result<HashMap<String, SchemaRef>, super::Error> {
+        let variant = self.variant();
+        if variant == PostgresVariant::Redshift {
+            return Ok(HashMap::new());
+        }
+
+        let all: Option<&str> = None;
+        let rows = self
             .conn
-            .query_one("SELECT version()", &[])
+            .query(SCHEMA_QUERY, &[&schema_name, &all])
             .await
             .map_err(|e| super::Error::UnableToGetSchema {
                 source: maybe_db_source_err(e),
             })?;
 
-        let version: String = row
-            .try_get(0)
-            .map_err(|e| super::Error::UnableToGetSchema {
-                source: maybe_db_source_err(e),
-            })?;
+        let mut columns_by_table: HashMap<String, Vec<ColumnDef>> = HashMap::new();
+        for row in &rows {
+            columns_by_table
+                .entry(row.get("table_name"))
+                .or_default()
+                .push(column_def_from_row(row));
+        }
 
-        let variant = if version.contains("Redshift") {
-            PostgresVariant::Redshift
-        } else {
-            PostgresVariant::Default
-        };
+        let mut schemas = HashMap::with_capacity(columns_by_table.len());
+        for (table, columns) in columns_by_table {
+            schemas.insert(table, self.schema_from_columns(columns, variant)?);
+        }
 
-        Ok(variant)
+        Ok(schemas)
+    }
+
+    /// The server's variant, as detected when the pool was built. Infallible and
+    /// free: nothing is queried here.
+    #[must_use]
+    pub fn variant(&self) -> PostgresVariant {
+        self.variant
+    }
+
+    /// The server's variant. Kept for callers written against the earlier
+    /// signature.
+    ///
+    /// This no longer queries the server and cannot fail: the variant is
+    /// detected once when the pool is built, so this returns the stored field
+    /// and the `Result` is always `Ok`. Prefer [`PostgresConnection::variant`],
+    /// which says so in its type.
+    #[expect(
+        clippy::unused_async,
+        reason = "kept async so existing `get_variant().await` call sites still compile"
+    )]
+    pub async fn get_variant(&self) -> Result<PostgresVariant, super::Error> {
+        Ok(self.variant)
     }
 
     async fn query_variant_and_schema(
@@ -519,26 +628,18 @@ impl PostgresConnection {
         let table_name = table_reference.table();
         let schema_name = table_reference.schema().unwrap_or("public");
 
-        let variant = self.get_variant().await?;
+        let variant = self.variant();
 
         let columns = match variant {
             PostgresVariant::Default => {
+                let only: Option<&str> = Some(table_name);
                 let rows = self
                     .conn
-                    .query(SCHEMA_QUERY, &[&schema_name, &table_name])
+                    .query(SCHEMA_QUERY, &[&schema_name, &only])
                     .await
                     .map_err(|e| map_schema_query_error(e, table_reference))?;
 
-                rows.iter()
-                    .map(|row| ColumnDef {
-                        name: row.get::<usize, String>(0),
-                        // `data_type` is already a formatted type string via
-                        // `pg_catalog.format_type` (e.g. `numeric(10,2)`).
-                        data_type: row.get::<usize, String>(1),
-                        nullable: row.get::<usize, String>(2) == "YES",
-                        type_details: row.get::<usize, Option<serde_json::Value>>(3),
-                    })
-                    .collect()
+                rows.iter().map(column_def_from_row).collect()
             }
             PostgresVariant::Redshift => {
                 self.redshift_columns(table_reference.catalog(), schema_name, table_name)
@@ -691,5 +792,31 @@ impl PostgresConnection {
             })?;
 
         Ok(rec.schema())
+    }
+}
+
+#[cfg(test)]
+mod variant_tests {
+    use super::{variant_from_version, PostgresVariant};
+
+    /// Classification is pure, so it is checked against the real strings each
+    /// server reports rather than needing one to be running.
+    #[test]
+    fn classifies_a_server_from_its_version_string() {
+        assert_eq!(
+            variant_from_version(
+                "PostgreSQL 8.0.2 on i686-pc-linux-gnu, compiled by GCC gcc (GCC) 3.4.2, Redshift 1.0.12345"
+            ),
+            PostgresVariant::Redshift
+        );
+        assert_eq!(
+            variant_from_version(
+                "PostgreSQL 16.2 (Debian 16.2-1.pgdg120+2) on aarch64-unknown-linux-gnu"
+            ),
+            PostgresVariant::Default
+        );
+        // Anything unrecognized is treated as vanilla, which is the conservative
+        // reading: Redshift-specific query paths are only taken when named.
+        assert_eq!(variant_from_version(""), PostgresVariant::Default);
     }
 }
