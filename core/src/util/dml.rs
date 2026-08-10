@@ -9,6 +9,7 @@ use datafusion::{
         stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan,
         PlanProperties,
     },
+    sql::TableReference,
 };
 
 use super::count_exec::{count_schema, count_to_record_batch};
@@ -56,6 +57,48 @@ pub fn assignments_to_sql(
     parts
         .map(|p| p.join(", "))
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
+}
+
+/// Renders `DELETE FROM <table> [WHERE <sql_where>]`, quoting each part of `table` so that a quote
+/// in it cannot close the identifier and leave the rest of the name to be read as statement text.
+///
+/// Doubling is the whole escape here, unlike in a string literal: none of `DuckDB`, `SQLite` and
+/// `PostgreSQL` give `\` any meaning inside a delimited identifier.
+///
+/// The statement addresses the reference in full rather than its bare table part, so that a
+/// qualified dataset's `DELETE` reaches the table its truncate path already reaches instead of
+/// whatever the session's `search_path` resolves the bare name to.
+pub fn delete_statement(table: &TableReference, sql_where: Option<&str>) -> String {
+    let table = expr::quoted_table_reference(table);
+    match sql_where {
+        Some(sql_where) => format!("DELETE FROM {table} WHERE {sql_where}"),
+        None => format!("DELETE FROM {table}"),
+    }
+}
+
+/// Renders [`delete_statement`] wrapped in a CTE that returns the removed rows, so the count comes
+/// back as a result row: `WITH deleted AS (DELETE ... RETURNING *) SELECT COUNT(*) FROM deleted`.
+///
+/// This is for a caller that reads the count from a query rather than from the driver's
+/// affected-row tag — the `PostgreSQL` deletion sink runs this with `query_one` inside its
+/// transaction, so the count and the delete stay one statement.
+pub fn delete_statement_returning_count(table: &TableReference, sql_where: Option<&str>) -> String {
+    let delete = delete_statement(table, sql_where);
+    format!("WITH deleted AS ({delete} RETURNING *) SELECT COUNT(*) FROM deleted")
+}
+
+/// Renders `UPDATE <table> SET <set_clause> [WHERE <sql_where>]`, naming the table as
+/// [`delete_statement`] describes.
+pub fn update_statement(
+    table: &TableReference,
+    set_clause: &str,
+    sql_where: Option<&str>,
+) -> String {
+    let table = expr::quoted_table_reference(table);
+    match sql_where {
+        Some(sql_where) => format!("UPDATE {table} SET {set_clause} WHERE {sql_where}"),
+        None => format!("UPDATE {table} SET {set_clause}"),
+    }
 }
 
 #[async_trait]
@@ -308,6 +351,153 @@ mod tests {
         assert_eq!(sql, r#""name" = "other""#);
     }
 
+    /// A name needing no escape must render exactly as the interpolated form did, so that quoting
+    /// the table name cannot change the statement built for any ordinary dataset.
+    #[test]
+    fn test_statements_render_an_ordinary_table_name_unchanged() {
+        assert_eq!(
+            delete_statement(&TableReference::bare("orders"), Some(r#""id" = 1"#)),
+            r#"DELETE FROM "orders" WHERE "id" = 1"#
+        );
+        assert_eq!(
+            delete_statement(&TableReference::bare("orders"), None),
+            r#"DELETE FROM "orders""#
+        );
+        assert_eq!(
+            update_statement(
+                &TableReference::bare("orders"),
+                r#""qty" = 2"#,
+                Some(r#""id" = 1"#)
+            ),
+            r#"UPDATE "orders" SET "qty" = 2 WHERE "id" = 1"#
+        );
+        assert_eq!(
+            update_statement(&TableReference::bare("orders"), r#""qty" = 2"#, None),
+            r#"UPDATE "orders" SET "qty" = 2"#
+        );
+        assert_eq!(
+            delete_statement_returning_count(&TableReference::bare("orders"), Some(r#""id" = 1"#)),
+            r#"WITH deleted AS (DELETE FROM "orders" WHERE "id" = 1 RETURNING *) SELECT COUNT(*) FROM deleted"#
+        );
+        assert_eq!(
+            delete_statement_returning_count(&TableReference::bare("orders"), None),
+            r#"WITH deleted AS (DELETE FROM "orders" RETURNING *) SELECT COUNT(*) FROM deleted"#
+        );
+    }
+
+    /// A quote in the table name closes its identifier early when interpolated, so the rest of the
+    /// name becomes statement text — the identifier counterpart of an unescaped string literal.
+    #[test]
+    fn test_statements_escape_a_quote_bearing_table_name() {
+        assert_eq!(
+            delete_statement(&TableReference::bare(r#"we"ird"#), Some(r#""id" = 1"#)),
+            r#"DELETE FROM "we""ird" WHERE "id" = 1"#
+        );
+        assert_eq!(
+            update_statement(&TableReference::bare(r#"we"ird"#), r#""qty" = 2"#, None),
+            r#"UPDATE "we""ird" SET "qty" = 2"#
+        );
+        assert_eq!(
+            delete_statement_returning_count(&TableReference::bare(r#"we"ird"#), None),
+            r#"WITH deleted AS (DELETE FROM "we""ird" RETURNING *) SELECT COUNT(*) FROM deleted"#
+        );
+
+        // A quote at either end has no ordinary character beside it to make the doubling obvious.
+        assert_eq!(
+            delete_statement(&TableReference::bare(r#"trailing""#), None),
+            r#"DELETE FROM "trailing""""#
+        );
+        assert_eq!(
+            delete_statement(&TableReference::bare(r#""leading"#), None),
+            r#"DELETE FROM """leading""#
+        );
+    }
+
+    /// A name carrying SQL of its own is what the missing escape actually costs: interpolated, the
+    /// `WHERE` below escapes the identifier and widens the statement to the whole table. Quoted, the
+    /// name stays one identifier and the statement can only ever name that table.
+    #[test]
+    fn test_a_table_name_carrying_sql_stays_one_identifier() {
+        assert_eq!(
+            delete_statement(
+                &TableReference::bare(r#"t" WHERE 1=1 --"#),
+                Some(r#""id" = 1"#)
+            ),
+            r#"DELETE FROM "t"" WHERE 1=1 --" WHERE "id" = 1"#
+        );
+    }
+
+    /// Doubling a delimiter is only a complete escape where nothing else escapes: a backslash next
+    /// to the quote is the composition that defeats it for a *string literal* on a backslash-reading
+    /// engine. Inside a delimited identifier none of the engines here give `\` any meaning, so it
+    /// must pass through untouched — asserted so that adding an engine which does has to face it.
+    #[test]
+    fn test_a_backslash_in_a_table_name_is_not_escaped() {
+        assert_eq!(
+            delete_statement(&TableReference::bare(r#"back\slash"quote"#), None),
+            r#"DELETE FROM "back\slash""quote""#
+        );
+    }
+
+    /// A qualified dataset must be addressed by the name it was given. Naming only the bare table
+    /// part leaves the schema to the session's `search_path`, which is how a `DELETE`/`UPDATE`
+    /// came to address a different schema's table than the truncate path on the same provider.
+    #[test]
+    fn test_statements_address_a_qualified_table_in_full() {
+        let qualified = TableReference::partial("myschema", "orders");
+
+        assert_eq!(
+            delete_statement(&qualified, Some(r#""id" = 1"#)),
+            r#"DELETE FROM "myschema"."orders" WHERE "id" = 1"#
+        );
+        assert_eq!(
+            update_statement(&qualified, r#""qty" = 2"#, None),
+            r#"UPDATE "myschema"."orders" SET "qty" = 2"#
+        );
+        assert_eq!(
+            delete_statement_returning_count(&qualified, None),
+            r#"WITH deleted AS (DELETE FROM "myschema"."orders" RETURNING *) SELECT COUNT(*) FROM deleted"#
+        );
+
+        let full = TableReference::full("mycatalog", "myschema", "orders");
+        assert_eq!(
+            delete_statement(&full, None),
+            r#"DELETE FROM "mycatalog"."myschema"."orders""#
+        );
+    }
+
+    /// Each part is a separate identifier, so a quote in one may not leak into another and a dot
+    /// inside a part may not split it.
+    #[test]
+    fn test_a_qualified_name_escapes_each_part_separately() {
+        assert_eq!(
+            delete_statement(&TableReference::partial(r#"we"ird"#, r#"ta"ble"#), None),
+            r#"DELETE FROM "we""ird"."ta""ble""#
+        );
+
+        // A dot inside a part names a table whose name contains a dot, not two identifiers.
+        assert_eq!(
+            delete_statement(&TableReference::bare("has.dot"), None),
+            r#"DELETE FROM "has.dot""#
+        );
+    }
+
+    /// Every part is quoted unconditionally, so a table named for a reserved word stays a name.
+    /// `TableReference::to_quoted_string` leaves an all-lowercase part bare, which would render
+    /// this as syntax.
+    #[test]
+    fn test_a_reserved_word_table_name_is_still_quoted() {
+        assert_eq!(
+            delete_statement(&TableReference::partial("public", "order"), None),
+            r#"DELETE FROM "public"."order""#
+        );
+        assert_eq!(
+            TableReference::partial("public", "order").to_quoted_string(),
+            "public.order",
+            "the assertion above is only load-bearing while to_quoted_string leaves these bare"
+        );
+    }
+
     /// A SET clause carries both a value and a column name, and interpolates the name itself.
     #[test]
     fn test_assignments_to_sql_escapes_value_and_column_name() {
@@ -441,6 +631,195 @@ mod duckdb_execution_tests {
         assert_eq!(surviving, vec![99], "the wrong row was deleted");
     }
 
+    /// The table name is a delimited identifier, and doubling is only the right escape if the engine
+    /// reads it that way. This creates a table whose name holds a quote, runs the `DELETE` the DML
+    /// path builds for it, and asserts the row selected is the row that goes.
+    #[test]
+    fn a_quote_bearing_table_name_deletes_by_the_table_it_names() {
+        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+        conn.execute_batch(r#"CREATE TABLE "we""ird" (id INTEGER)"#)
+            .expect("create");
+        conn.execute_batch(r#"INSERT INTO "we""ird" VALUES (1), (2), (3)"#)
+            .expect("insert");
+
+        conn.execute_batch(&delete_statement(
+            &TableReference::bare(r#"we"ird"#),
+            Some(r#""id" = 2"#),
+        ))
+        .expect("the rendered DELETE must be valid SQL for DuckDB");
+
+        let mut stmt = conn
+            .prepare(r#"SELECT id FROM "we""ird" ORDER BY id"#)
+            .expect("prepare");
+        let surviving: Vec<i32> = stmt
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<duckdb::Result<Vec<i32>>>()
+            .expect("rows");
+        assert_eq!(surviving, vec![1, 3]);
+
+        // Interpolated instead of quoted, the name closes its identifier early and DuckDB cannot
+        // parse what follows — which is why the delete could not run at all before.
+        assert!(
+            conn.execute_batch(r#"DELETE FROM "we"ird" WHERE "id" = 2"#)
+                .is_err(),
+            "the interpolated form must not be valid SQL"
+        );
+    }
+
+    /// The same for an `UPDATE`, which names the table and carries a SET clause.
+    /// The wrong-table case the qualifier exists to prevent: two tables share a name in different
+    /// schemas, so a statement naming only the bare part is still valid SQL and still reports a
+    /// count — it just empties the wrong one. Asserting on the surviving rows of *both* tables is
+    /// what distinguishes addressing the right table from merely running.
+    #[test]
+    fn a_qualified_delete_empties_its_own_schemas_table_and_leaves_the_other() {
+        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+        conn.execute_batch(
+            "CREATE SCHEMA myschema;
+             CREATE TABLE myschema.orders (id INTEGER);
+             INSERT INTO myschema.orders VALUES (1), (2);
+             CREATE TABLE orders (id INTEGER);
+             INSERT INTO orders VALUES (3), (4);",
+        )
+        .expect("create both tables");
+
+        conn.execute_batch(&delete_statement(
+            &TableReference::partial("myschema", "orders"),
+            None,
+        ))
+        .expect("the rendered DELETE must be valid SQL for DuckDB");
+
+        let count = |sql: &str| -> i64 {
+            conn.query_row(sql, [], |row| row.get(0))
+                .expect("count query")
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM myschema.orders"),
+            0,
+            "the qualified table is the one the statement names"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM main.orders"),
+            2,
+            "the bare name resolves to this table, which the statement must not touch"
+        );
+    }
+
+    /// The same for `UPDATE`, whose wrong-table form also succeeds and reports a count.
+    #[test]
+    fn a_qualified_update_writes_to_its_own_schemas_table() {
+        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+        conn.execute_batch(
+            "CREATE SCHEMA myschema;
+             CREATE TABLE myschema.orders (id INTEGER, qty INTEGER);
+             INSERT INTO myschema.orders VALUES (1, 10);
+             CREATE TABLE orders (id INTEGER, qty INTEGER);
+             INSERT INTO orders VALUES (1, 10);",
+        )
+        .expect("create both tables");
+
+        conn.execute_batch(&update_statement(
+            &TableReference::partial("myschema", "orders"),
+            r#""qty" = 99"#,
+            None,
+        ))
+        .expect("the rendered UPDATE must be valid SQL for DuckDB");
+
+        let qty = |sql: &str| -> i32 {
+            conn.query_row(sql, [], |row| row.get(0))
+                .expect("qty query")
+        };
+        assert_eq!(qty("SELECT qty FROM myschema.orders"), 99);
+        assert_eq!(
+            qty("SELECT qty FROM main.orders"),
+            10,
+            "the bare name resolves to this table, which the statement must not touch"
+        );
+    }
+
+    #[test]
+    fn a_quote_bearing_table_name_updates_by_the_table_it_names() {
+        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+        conn.execute_batch(r#"CREATE TABLE "we""ird" (id INTEGER, qty INTEGER)"#)
+            .expect("create");
+        conn.execute_batch(r#"INSERT INTO "we""ird" VALUES (1, 10), (2, 20)"#)
+            .expect("insert");
+
+        conn.execute_batch(&update_statement(
+            &TableReference::bare(r#"we"ird"#),
+            r#""qty" = 99"#,
+            Some(r#""id" = 2"#),
+        ))
+        .expect("the rendered UPDATE must be valid SQL for DuckDB");
+
+        let mut stmt = conn
+            .prepare(r#"SELECT qty FROM "we""ird" ORDER BY id"#)
+            .expect("prepare");
+        let quantities: Vec<i32> = stmt
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<duckdb::Result<Vec<i32>>>()
+            .expect("rows");
+        assert_eq!(quantities, vec![10, 99]);
+    }
+
+    /// What the escape is worth: a name carrying a `WHERE` of its own widens an interpolated
+    /// `DELETE` to the whole table, because the name's quote ends the identifier and the rest is
+    /// read as statement text. Quoted, the statement can only name a table — and no table by that
+    /// name exists, so it is refused rather than silently widened.
+    #[test]
+    fn a_table_name_carrying_sql_cannot_widen_a_delete() {
+        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+        conn.execute_batch("CREATE TABLE t (id INTEGER)")
+            .expect("create");
+        conn.execute_batch("INSERT INTO t VALUES (1), (2), (3)")
+            .expect("insert");
+
+        let name = r#"t" WHERE 1=1 --"#;
+        assert!(
+            conn.execute_batch(&delete_statement(
+                &TableReference::bare(name),
+                Some(r#""id" = 1"#)
+            ))
+            .is_err(),
+            "the quoted name must not resolve to table t"
+        );
+        let remaining: i64 = conn
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(remaining, 3, "no row may be removed from t");
+
+        // What the interpolated rendering meant instead.
+        conn.execute_batch(&format!(r#"DELETE FROM "{name}" WHERE "id" = 1"#))
+            .expect("the interpolated rendering is valid SQL");
+        let remaining: i64 = conn
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(remaining, 0, "the interpolated name emptied the table");
+    }
+
+    /// A name that needs no escape has to reach the engine as the same table it always did.
+    #[test]
+    fn an_ordinary_table_name_still_names_its_table() {
+        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+        conn.execute_batch("CREATE TABLE orders (id INTEGER)")
+            .expect("create");
+        conn.execute_batch("INSERT INTO orders VALUES (1), (2)")
+            .expect("insert");
+
+        conn.execute_batch(&delete_statement(
+            &TableReference::bare("orders"),
+            Some(r#""id" = 1"#),
+        ))
+        .expect("the rendered DELETE must be valid SQL for DuckDB");
+
+        let remaining: i64 = conn
+            .query_row("SELECT count(*) FROM orders", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(remaining, 1);
+    }
+
     /// The reason a cross-relation predicate must be refused rather than rendered by column name:
     /// erased to `"id" = "id"` it is a tautology, and the `DELETE` built from it empties the table.
     #[test]
@@ -468,5 +847,65 @@ mod duckdb_execution_tests {
             .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
             .expect("count");
         assert_eq!(remaining, 0, "the erased predicate is a tautology");
+    }
+}
+
+/// `SQLite` is the second engine these statements are built for, and it reads a delimited
+/// identifier by its own rules. Postgres, the third, needs a running server and so has no
+/// in-process equivalent to assert against.
+#[cfg(all(test, feature = "sqlite"))]
+mod sqlite_execution_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    #[test]
+    fn a_quote_bearing_table_name_deletes_by_the_table_it_names() {
+        let conn = Connection::open_in_memory().expect("in-memory SQLite");
+        conn.execute_batch(r#"CREATE TABLE "we""ird" (id INTEGER)"#)
+            .expect("create");
+        conn.execute_batch(r#"INSERT INTO "we""ird" VALUES (1), (2), (3)"#)
+            .expect("insert");
+
+        conn.execute_batch(&delete_statement(
+            &TableReference::bare(r#"we"ird"#),
+            Some(r#""id" = 2"#),
+        ))
+        .expect("the rendered DELETE must be valid SQL for SQLite");
+
+        let mut stmt = conn
+            .prepare(r#"SELECT id FROM "we""ird" ORDER BY id"#)
+            .expect("prepare");
+        let surviving: Vec<i32> = stmt
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<i32>>>()
+            .expect("rows");
+        assert_eq!(surviving, vec![1, 3]);
+    }
+
+    #[test]
+    fn a_quote_bearing_table_name_updates_by_the_table_it_names() {
+        let conn = Connection::open_in_memory().expect("in-memory SQLite");
+        conn.execute_batch(r#"CREATE TABLE "we""ird" (id INTEGER, qty INTEGER)"#)
+            .expect("create");
+        conn.execute_batch(r#"INSERT INTO "we""ird" VALUES (1, 10), (2, 20)"#)
+            .expect("insert");
+
+        conn.execute_batch(&update_statement(
+            &TableReference::bare(r#"we"ird"#),
+            r#""qty" = 99"#,
+            Some(r#""id" = 2"#),
+        ))
+        .expect("the rendered UPDATE must be valid SQL for SQLite");
+
+        let mut stmt = conn
+            .prepare(r#"SELECT qty FROM "we""ird" ORDER BY id"#)
+            .expect("prepare");
+        let quantities: Vec<i32> = stmt
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<i32>>>()
+            .expect("rows");
+        assert_eq!(quantities, vec![10, 99]);
     }
 }

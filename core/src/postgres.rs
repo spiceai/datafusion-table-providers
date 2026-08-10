@@ -35,6 +35,7 @@ use crate::util::{
     self,
     column_reference::{self, ColumnReference},
     constraints::{self, get_primary_keys_from_constraints},
+    dml::delete_statement,
     indexes::IndexType,
     on_conflict::{self, OnConflict},
     secrets::to_secret_map,
@@ -377,6 +378,16 @@ impl Postgres {
         self.table.table()
     }
 
+    /// The table this provider writes to, qualified as the caller named it.
+    ///
+    /// A statement that addresses the table must use this rather than [`Self::table_name`], which
+    /// drops any schema qualifier and so names whatever the session's `search_path` resolves the
+    /// bare name to.
+    #[must_use]
+    pub fn table_reference(&self) -> &TableReference {
+        &self.table
+    }
+
     #[must_use]
     pub fn constraints(&self) -> &Constraints {
         &self.constraints
@@ -456,10 +467,7 @@ impl Postgres {
 
     async fn delete_all_table_data(&self, transaction: &Transaction<'_>) -> Result<()> {
         transaction
-            .execute(
-                format!("DELETE FROM {}", self.table.to_quoted_string()).as_str(),
-                &[],
-            )
+            .execute(delete_statement(&self.table, None).as_str(), &[])
             .await
             .context(UnableToDeleteAllTableDataSnafu)?;
 

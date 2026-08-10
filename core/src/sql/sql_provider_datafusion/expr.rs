@@ -7,6 +7,7 @@ use datafusion::{
     sql::unparser::dialect::{
         DefaultDialect, Dialect, DuckDBDialect, MySqlDialect, PostgreSqlDialect, SqliteDialect,
     },
+    sql::TableReference,
 };
 
 pub const SECONDS_IN_DAY: i32 = 86_400;
@@ -91,6 +92,31 @@ pub(crate) fn string_literal(value: &str, engine: Option<Engine>) -> String {
 /// quote in a column name cannot close the identifier early.
 pub(crate) fn quoted_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Renders `table` as a qualified SQL identifier chain, quoting each part with
+/// [`quoted_identifier`] so that a statement addresses the same table the reference names.
+///
+/// Every part is quoted unconditionally, unlike [`TableReference::to_quoted_string`], which leaves
+/// an all-lowercase part bare and so renders a reserved word (`order`, `user`) as syntax rather
+/// than as a name.
+pub(crate) fn quoted_table_reference(table: &TableReference) -> String {
+    match table {
+        TableReference::Bare { table } => quoted_identifier(table),
+        TableReference::Partial { schema, table } => {
+            format!("{}.{}", quoted_identifier(schema), quoted_identifier(table))
+        }
+        TableReference::Full {
+            catalog,
+            schema,
+            table,
+        } => format!(
+            "{}.{}.{}",
+            quoted_identifier(catalog),
+            quoted_identifier(schema),
+            quoted_identifier(table)
+        ),
+    }
 }
 
 /// Renders `expr` as a SQL fragment for `engine`.
