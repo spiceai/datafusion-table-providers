@@ -460,6 +460,16 @@ async fn test_postgres_variant_is_detected_once_per_pool() {
         PostgresVariant::Default,
         "connect_direct must carry the variant the pool detected"
     );
+    // The compatibility method must keep reporting what the accessor does, and
+    // must not have reacquired a way to fail.
+    assert_eq!(
+        direct
+            .get_variant()
+            .await
+            .expect("get_variant no longer queries, so it cannot fail"),
+        direct.variant(),
+        "get_variant must agree with variant()"
+    );
 
     let pooled = DbConnectionPool::connect(&*postgres_pool)
         .await

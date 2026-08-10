@@ -606,6 +606,21 @@ impl PostgresConnection {
         self.variant
     }
 
+    /// The server's variant. Kept for callers written against the earlier
+    /// signature.
+    ///
+    /// This no longer queries the server and cannot fail: the variant is
+    /// detected once when the pool is built, so this returns the stored field
+    /// and the `Result` is always `Ok`. Prefer [`PostgresConnection::variant`],
+    /// which says so in its type.
+    #[expect(
+        clippy::unused_async,
+        reason = "kept async so existing `get_variant().await` call sites still compile"
+    )]
+    pub async fn get_variant(&self) -> Result<PostgresVariant, super::Error> {
+        Ok(self.variant)
+    }
+
     async fn query_variant_and_schema(
         &self,
         table_reference: &TableReference,
