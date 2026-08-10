@@ -697,3 +697,102 @@ async fn test_postgres_bulk_and_per_table_agree_on_unsupported_types() {
         .await
         .expect("to stop postgres container");
 }
+
+/// Concurrent cold callers must share one `SELECT version()`, not each issue
+/// their own.
+///
+/// This is the behavior `tokio::sync::OnceCell::get_or_try_init` is here for,
+/// and a sequential populate-then-read test cannot show it: with any
+/// check-query-set implementation the first call populates the cell and the rest
+/// hit it, so the round trips are coalesced by ordering rather than by the
+/// primitive. Only callers that reach the empty cell *together* distinguish the
+/// two, hence the barrier.
+///
+/// Counting is server-side and needs no extension. `pg_stat_activity.query`
+/// retains the last statement each live backend ran, and the pooled connections
+/// are deliberately held open for the duration, so a backend that ran
+/// `SELECT version()` still reports it. One matching backend means one round
+/// trip; without coalescing there is one per caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_postgres_variant_query_is_coalesced_across_concurrent_callers() {
+    const CALLERS: usize = 6;
+
+    let port = crate::get_random_port();
+    let container = common::start_postgres_docker_container("postgres:latest", port, None)
+        .await
+        .expect("Postgres container to start");
+
+    let postgres_pool = Arc::new(
+        PostgresConnectionPool::new(to_secret_map(common::get_pg_params(port)))
+            .await
+            .expect("unable to create Postgres connection pool"),
+    );
+
+    // Held for the whole test: each is a distinct backend, and releasing one
+    // would let the pool hand its connection to the next caller, collapsing the
+    // very concurrency being measured.
+    let mut conns = Vec::with_capacity(CALLERS);
+    for _ in 0..CALLERS {
+        conns.push(
+            postgres_pool
+                .connect_direct()
+                .await
+                .expect("to connect to postgres"),
+        );
+    }
+
+    // Every caller reaches the empty cell together; without a barrier the first
+    // could finish before the others start, which is the sequential case.
+    let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS));
+    let mut tasks = Vec::with_capacity(CALLERS);
+    for conn in conns {
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let variant = conn.get_variant().await.expect("variant");
+            // Hold the connection until every caller is done, keeping its
+            // backend alive so pg_stat_activity can still be asked about it.
+            (conn, variant)
+        }));
+    }
+
+    let mut held = Vec::with_capacity(CALLERS);
+    for task in tasks {
+        let (conn, variant) = task.await.expect("variant task");
+        assert_eq!(
+            variant,
+            PostgresVariant::Default,
+            "every caller must observe the same variant"
+        );
+        held.push(conn);
+    }
+
+    let observer = postgres_pool
+        .connect_direct()
+        .await
+        .expect("to connect to postgres");
+    let ran: i64 = observer
+        .conn
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE query = 'SELECT version()' AND datname = current_database()",
+            &[],
+        )
+        .await
+        .expect("to count version() backends")
+        .get(0);
+
+    assert_eq!(
+        ran, 1,
+        "{CALLERS} concurrent cold callers must share one SELECT version(); \
+         {ran} backends ran it"
+    );
+
+    drop(held);
+
+    // Tear down
+    container
+        .remove()
+        .await
+        .expect("to stop postgres container");
+}
