@@ -24,7 +24,20 @@ pub fn filters_to_sql(
         .map(|f| expr::to_sql_with_engine(f, engine))
         .collect();
     sql_parts
-        .map(|parts| parts.join(" AND "))
+        .map(|parts| match parts.as_slice() {
+            [] => String::new(),
+            // Nothing is composed with a lone filter, so it needs no parentheses.
+            [only] => only.clone(),
+            // Every filter is parenthesized before being joined, because `AND` binds tighter
+            // than `OR`: a filter that is itself a disjunction would otherwise be re-grouped by
+            // the join. `[a OR b, c]` has to mean `(a OR b) AND c`, not `a OR (b AND c)`, which
+            // matches different rows.
+            _ => parts
+                .iter()
+                .map(|part| format!("({part})"))
+                .collect::<Vec<String>>()
+                .join(" AND "),
+        })
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
 }
 
@@ -216,7 +229,21 @@ mod tests {
         let f1 = col("id").eq(lit(1i32));
         let f2 = col("name").eq(lit("foo"));
         let sql = filters_to_sql(&[f1, f2], None).expect("filters_to_sql should succeed");
-        assert_eq!(sql, r#""id" = 1 AND "name" = 'foo'"#);
+        assert_eq!(sql, r#"("id" = 1) AND ("name" = 'foo')"#);
+    }
+
+    /// A filter that is itself a disjunction must keep its grouping when joined with the others:
+    /// `AND` binds tighter than `OR`, so joining the fragments bare turns `(a OR b) AND c` into
+    /// `a OR (b AND c)`, which matches a different set of rows.
+    #[test]
+    fn test_filters_to_sql_parenthesizes_a_disjunction() {
+        let disjunction = col("a").eq(lit(1i32)).or(col("b").eq(lit(1i32)));
+        let conjunct = col("c").eq(lit(1i32));
+
+        let sql =
+            filters_to_sql(&[disjunction, conjunct], None).expect("filters_to_sql should succeed");
+
+        assert_eq!(sql, r#"(("a" = 1) OR ("b" = 1)) AND ("c" = 1)"#);
     }
 
     #[test]
