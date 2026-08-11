@@ -143,9 +143,10 @@ JOIN pg_attribute a ON a.attrelid = cls.oid
 LEFT JOIN pg_type t ON t.oid = a.atttypid
 LEFT JOIN custom_type_details custom ON custom.typname = t.typname
 WHERE ns.nspname = $1
-    -- $2 NULL selects every relation in the schema, for callers
-    -- resolving a whole namespace in one round trip.
-    AND ($2::text IS NULL OR cls.relname = $2)
+    -- Named rather than optional: a caller resolving many relations at once
+    -- lists exactly the ones it will use, so the query never describes a
+    -- relation nobody asked about.
+    AND cls.relname = ANY($2)
     -- covers tables, normal views, materialized views, partitioned tables, &
     -- foreign tables. Foreign tables carry a full local column definition in
     -- pg_attribute, so their schema resolves here rather than falling through
@@ -549,35 +550,46 @@ impl PostgresConnection {
         Ok(Arc::new(Schema::new(fields)))
     }
 
-    /// Every relation in `schema_name` with its Arrow schema, resolved in one
-    /// round trip instead of one per table.
+    /// The Arrow schemas of `relations` in `schema_name`, resolved in one round
+    /// trip instead of one per table.
     ///
-    /// A catalog discovering a schema otherwise calls `get_schema` per table,
-    /// and each call is its own query. This answers the whole namespace at once,
-    /// turning `T` round trips into one.
+    /// A caller otherwise calls `get_schema` per table, and each call is its own
+    /// query. This answers all of them at once, turning `T` round trips into one.
+    ///
+    /// `relations` is named rather than implied so the query describes exactly
+    /// what the caller will use. A catalog's discovered set is narrower than the
+    /// namespace -- it excludes inheritance children and relations the role
+    /// cannot read, along with anything `include`/`exclude` withhold -- and
+    /// resolving the namespace instead would fetch columns that are then
+    /// discarded, which for a partitioned table means every leaf.
     ///
     /// The result is deliberately *incomplete rather than wrong*: a relation the
     /// catalog query cannot describe is simply absent, and the caller resolves it
     /// with `get_schema`, which keeps the `infer_schema_from_data` fallback that
     /// Redshift datashare objects rely on. Redshift itself answers with an empty
-    /// map, since `SHOW COLUMNS` is per-table and cannot be batched -- so every
-    /// table falls back, exactly as before.
+    /// map, since `SHOW COLUMNS` is per-table and cannot be batched, so every
+    /// table falls back to that path.
     ///
     /// Callers must therefore treat a missing entry as "ask per table", never as
     /// "this relation has no columns".
     pub async fn get_schemas_in(
         &self,
         schema_name: &str,
+        relations: &[String],
     ) -> Result<HashMap<String, SchemaRef>, super::Error> {
+        // Nothing to describe, and `= ANY('{}')` would match nothing anyway.
+        if relations.is_empty() {
+            return Ok(HashMap::new());
+        }
+
         let variant = self.variant();
         if variant == PostgresVariant::Redshift {
             return Ok(HashMap::new());
         }
 
-        let all: Option<&str> = None;
         let rows = self
             .conn
-            .query(SCHEMA_QUERY, &[&schema_name, &all])
+            .query(SCHEMA_QUERY, &[&schema_name, &relations])
             .await
             .map_err(|e| super::Error::UnableToGetSchema {
                 source: maybe_db_source_err(e),
@@ -632,10 +644,10 @@ impl PostgresConnection {
 
         let columns = match variant {
             PostgresVariant::Default => {
-                let only: Option<&str> = Some(table_name);
+                let only = [table_name];
                 let rows = self
                     .conn
-                    .query(SCHEMA_QUERY, &[&schema_name, &only])
+                    .query(SCHEMA_QUERY, &[&schema_name, &&only[..]])
                     .await
                     .map_err(|e| map_schema_query_error(e, table_reference))?;
 
