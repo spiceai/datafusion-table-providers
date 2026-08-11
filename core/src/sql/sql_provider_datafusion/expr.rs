@@ -7,6 +7,7 @@ use datafusion::{
     sql::unparser::dialect::{
         DefaultDialect, Dialect, DuckDBDialect, MySqlDialect, PostgreSqlDialect, SqliteDialect,
     },
+    sql::TableReference,
 };
 
 pub const SECONDS_IN_DAY: i32 = 86_400;
@@ -93,6 +94,31 @@ pub(crate) fn quoted_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// Renders `table` as a qualified SQL identifier chain, quoting each part with
+/// [`quoted_identifier`] so that a statement addresses the same table the reference names.
+///
+/// Every part is quoted unconditionally, unlike [`TableReference::to_quoted_string`], which leaves
+/// an all-lowercase part bare and so renders a reserved word (`order`, `user`) as syntax rather
+/// than as a name.
+pub(crate) fn quoted_table_reference(table: &TableReference) -> String {
+    match table {
+        TableReference::Bare { table } => quoted_identifier(table),
+        TableReference::Partial { schema, table } => {
+            format!("{}.{}", quoted_identifier(schema), quoted_identifier(table))
+        }
+        TableReference::Full {
+            catalog,
+            schema,
+            table,
+        } => format!(
+            "{}.{}.{}",
+            quoted_identifier(catalog),
+            quoted_identifier(schema),
+            quoted_identifier(table)
+        ),
+    }
+}
+
 /// Renders `expr` as a SQL fragment for `engine`.
 ///
 /// The fragment goes into a statement that names exactly one table, so every qualified column in
@@ -138,11 +164,15 @@ fn render_expr(expr: &Expr, engine: Option<Engine>) -> Result<String> {
                 // TODO: DuckDB doesn't support comparison between timestamp_s /timestamp_ms with timestampz as of v1
                 // Revisit in future DuckDB versions
                 //
-                // Only a comparison can have a timestamp operand to normalize. Without this
-                // guard the rewrite also fires on `AND`/`OR`, whose left operand is a
-                // predicate, not a timestamp: it then emits `EPOCH_MS(<predicate>)` and
-                // DuckDB rejects the statement with `Binder Error: epoch_ms(BOOLEAN)`.
-                let is_timestamp_comparison = matches!(
+                // Which operand is a timestamp is decided by its `Expr` shape, never by whether
+                // its rendered SQL starts with `TO_TIMESTAMP`. A nested comparison is itself
+                // normalized, so it renders as `TO_TIMESTAMP(..)` while being a boolean, and
+                // normalizing it emits `EPOCH_MS(<predicate>)`, for which DuckDB has no overload.
+                //
+                // `Minus` is included because subtraction is the only arithmetic DuckDB defines
+                // between two timestamps. `+`, `*` and `/` have no timestamp/timestamp overload
+                // at all, so normalizing their operands could not make them bind.
+                let normalizes_timestamp_operands = matches!(
                     binary_expr.op,
                     Operator::Eq
                         | Operator::NotEq
@@ -152,14 +182,27 @@ fn render_expr(expr: &Expr, engine: Option<Engine>) -> Result<String> {
                         | Operator::GtEq
                         | Operator::IsDistinctFrom
                         | Operator::IsNotDistinctFrom
+                        | Operator::Minus
                 );
-                if is_timestamp_comparison
-                    && right.starts_with("TO_TIMESTAMP")
-                    && !left.starts_with("TO_TIMESTAMP")
+                // Only the left operand is normalized, and only when the right is a timestamp
+                // and the left is not. `EPOCH_MS` yields whole milliseconds, so normalizing an
+                // operand costs sub-millisecond precision: that is worth it for the
+                // `TIMESTAMP_S`/`TIMESTAMP_MS` columns the rewrite exists for, which carry no
+                // finer precision to lose, but not for a microsecond `TIMESTAMPTZ` column,
+                // which compares exactly without it. Normalizing a bare *right* operand would
+                // extend that truncation to comparisons that bind correctly today, trading a
+                // loud binder error for a silently shifted result, so the mismatch is left to
+                // fail loudly in that direction.
+                if normalizes_timestamp_operands
+                    && is_duckdb_timestamp_operand(&binary_expr.right)
+                    && !is_duckdb_timestamp_operand(&binary_expr.left)
                 {
+                    // `EPOCH_MS(..)` parenthesizes the left operand on its own.
                     return Ok(format!(
                         "TO_TIMESTAMP(EPOCH_MS({}) / 1000) {} {}",
-                        left, binary_expr.op, right
+                        left,
+                        binary_expr.op,
+                        group_if_binary(&binary_expr.right, &right)
                     ));
                 }
             }
@@ -168,7 +211,14 @@ fn render_expr(expr: &Expr, engine: Option<Engine>) -> Result<String> {
                 Operator::And | Operator::Or => {
                     Ok(format!("({}) {} ({})", left, binary_expr.op, right))
                 }
-                _ => Ok(format!("{} {} {}", left, binary_expr.op, right)),
+                // The `AND`/`OR` arm above parenthesizes its own operands; every other
+                // operator needs a nested operand grouped so precedence cannot regroup it.
+                _ => Ok(format!(
+                    "{} {} {}",
+                    group_if_binary(&binary_expr.left, &left),
+                    binary_expr.op,
+                    group_if_binary(&binary_expr.right, &right)
+                )),
             }
         }
         Expr::Column(column) => {
@@ -352,6 +402,69 @@ fn render_expr(expr: &Expr, engine: Option<Engine>) -> Result<String> {
 
 pub fn to_sql(expr: &Expr) -> Result<String> {
     to_sql_with_engine(expr, None)
+}
+
+/// Parenthesize `rendered` when `expr` is itself a binary expression, so that composing it into a
+/// larger expression cannot lose the grouping the `Expr` tree carries.
+///
+/// Left to SQL operator precedence, the grouping is re-derived and can differ: `a * (b + c)`
+/// rendered as `a * b + c` is a different value that binds and returns silently; `x - (t + d)`
+/// rendered as `x - t + d` means `(x - t) + d`, since `-` and `+` share a precedence level and
+/// associate left; and `flag = (ts < t)` rendered as `flag = ts < t` is a chained comparison,
+/// which DuckDB rejects outright.
+fn group_if_binary(expr: &Expr, rendered: &str) -> String {
+    if matches!(expr, Expr::BinaryExpr(_)) {
+        format!("({rendered})")
+    } else {
+        rendered.to_string()
+    }
+}
+
+/// Whether `expr` is a timestamp-valued operand under [`Engine::DuckDB`] — that is, whether it
+/// renders as a term DuckDB types as `TIMESTAMPTZ`.
+///
+/// This is deliberately a test of what the expression *is*, not of what its SQL looks like. A
+/// nested comparison the normalization has already rewritten also renders with a `TO_TIMESTAMP`
+/// prefix, yet it is a boolean; conflating the two is what made the normalization emit
+/// `EPOCH_MS(<predicate>)`.
+///
+/// The leaf shapes mirror the arms that produce a `TIMESTAMPTZ` rendering — the date and
+/// timestamp [`ScalarValue`] literals, and [`handle_cast`]'s DuckDB arm for a cast to a
+/// timestamp. Keep them in step with those arms.
+///
+/// Timestamp arithmetic is timestamp-valued in turn, following DuckDB's own typing: adding an
+/// interval to a timestamp yields a timestamp either way round, and subtracting one does too,
+/// while subtracting a timestamp *from* a timestamp yields an interval instead. Both operands
+/// can be columns, whose type is not visible here, so this is decided from the operator and the
+/// operands' own shapes.
+fn is_duckdb_timestamp_operand(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(value, _) => matches!(
+            value,
+            ScalarValue::Date32(Some(_))
+                | ScalarValue::Date64(Some(_))
+                | ScalarValue::TimestampSecond(Some(_), _)
+                | ScalarValue::TimestampMillisecond(Some(_), _)
+                | ScalarValue::TimestampMicrosecond(Some(_), _)
+                | ScalarValue::TimestampNanosecond(Some(_), _)
+        ),
+        Expr::Cast(cast) => matches!(
+            cast.field.data_type(),
+            arrow::datatypes::DataType::Timestamp(_, _)
+        ),
+        Expr::BinaryExpr(binary_expr) => match binary_expr.op {
+            Operator::Plus => {
+                is_duckdb_timestamp_operand(&binary_expr.left)
+                    || is_duckdb_timestamp_operand(&binary_expr.right)
+            }
+            Operator::Minus => {
+                is_duckdb_timestamp_operand(&binary_expr.left)
+                    && !is_duckdb_timestamp_operand(&binary_expr.right)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 fn handle_cast(cast: &Cast, engine: Option<Engine>, expr: &Expr) -> Result<String> {
@@ -1276,6 +1389,201 @@ mod tests {
             assert_eq!(
                 to_sql_with_engine(filter, None).expect("the probed predicate must render"),
                 "\"name\" LIKE '%x%'"
+            );
+        }
+    }
+
+    fn cast_to_timestamp(expr: Expr) -> Expr {
+        Expr::Cast(Cast::new(
+            Box::new(expr),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+        ))
+    }
+
+    /// A comparison whose right operand is itself a normalized comparison renders as
+    /// `TO_TIMESTAMP(..)` without being a timestamp. Deciding by rendered text wrapped that
+    /// boolean in `EPOCH_MS`, which has no `BOOLEAN` overload; deciding by `Expr` shape does
+    /// not. Verified against DuckDB v1.5.5: the asserted SQL evaluates, and the text-sniffed
+    /// form is rejected at parse time as a chained comparison, before the binder is reached.
+    #[test]
+    fn test_duckdb_predicate_compared_to_a_timestamp_comparison_is_not_normalized() {
+        let expr = col("flag").eq(col("ts").lt(ts_lit()));
+
+        let sql = to_sql_with_engine(&expr, Some(Engine::DuckDB)).expect("to unparse");
+
+        assert!(
+            !sql.contains("EPOCH_MS(\"flag\""),
+            "a boolean operand must not be wrapped in EPOCH_MS: {sql}"
+        );
+        assert_eq!(
+            sql,
+            "\"flag\" = (TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < TO_TIMESTAMP(1767225600))"
+        );
+    }
+
+    /// Subtraction between a timestamp column and a timestamp literal is normalized: DuckDB
+    /// v1.5.5 rejects `"ts" - TO_TIMESTAMP(..)` with
+    /// `No function matches '-(TIMESTAMP_MS, TIMESTAMP WITH TIME ZONE)'`, and accepts the
+    /// normalized form, returning the interval between the two instants.
+    #[test]
+    fn test_duckdb_timestamp_subtraction_is_normalized() {
+        let expr = col("ts") - ts_lit();
+
+        let sql = to_sql_with_engine(&expr, Some(Engine::DuckDB)).expect("to unparse");
+
+        assert_eq!(
+            sql,
+            "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) - TO_TIMESTAMP(1767225600)"
+        );
+    }
+
+    /// A bare *right* operand is deliberately not normalized. Doing so would apply `EPOCH_MS`'s
+    /// whole-millisecond truncation to a microsecond `TIMESTAMPTZ` column that compares exactly
+    /// without it, turning a loud binder error into a silently shifted comparison. DuckDB
+    /// rejects this shape, which is the safe outcome.
+    #[test]
+    fn test_duckdb_timestamp_literal_on_the_left_is_not_normalized() {
+        let expr = ts_lit().gt(col("ts"));
+
+        let sql = to_sql_with_engine(&expr, Some(Engine::DuckDB)).expect("to unparse");
+
+        assert_eq!(sql, "TO_TIMESTAMP(1767225600) > \"ts\"");
+    }
+
+    /// Two timestamp operands are already comparable and must be left alone. This is the shape
+    /// retention emits — a cast to a timestamp against a timestamp literal.
+    #[test]
+    fn test_duckdb_two_timestamp_operands_are_not_normalized() {
+        let expr = cast_to_timestamp(col("ts")).lt(ts_lit());
+
+        let sql = to_sql_with_engine(&expr, Some(Engine::DuckDB)).expect("to unparse");
+
+        assert_eq!(
+            sql,
+            "TO_TIMESTAMP(EPOCH(CAST(\"ts\" AS TIMESTAMP))) < TO_TIMESTAMP(1767225600)"
+        );
+    }
+
+    /// Adding an interval to a timestamp is itself timestamp-valued, so a comparison against it
+    /// still normalizes the bare side. `"delta"` is an interval column, whose type is invisible
+    /// here — the operand is recognised from the operator and the literal's shape. Verified
+    /// against DuckDB v1.5.5: the asserted SQL evaluates, while leaving `"ts"` bare fails with
+    /// `Cannot compare values of type TIMESTAMP_MS and type TIMESTAMP WITH TIME ZONE`.
+    #[test]
+    fn test_duckdb_comparison_against_timestamp_plus_interval_is_normalized() {
+        let expr = col("ts").lt(ts_lit() + col("delta"));
+
+        let sql = to_sql_with_engine(&expr, Some(Engine::DuckDB)).expect("to unparse");
+
+        assert_eq!(
+            sql,
+            "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < (TO_TIMESTAMP(1767225600) + \"delta\")"
+        );
+    }
+
+    /// Subtracting an interval from a timestamp is timestamp-valued too, and the operands may be
+    /// the other way round for `+`, since DuckDB accepts `INTERVAL + TIMESTAMPTZ` as well.
+    #[test]
+    fn test_duckdb_timestamp_interval_arithmetic_is_timestamp_valued() {
+        for (expr, expected) in [
+            (
+                col("ts").lt(ts_lit() - col("delta")),
+                "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < (TO_TIMESTAMP(1767225600) - \"delta\")",
+            ),
+            (
+                col("ts").lt(col("delta") + ts_lit()),
+                "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < (\"delta\" + TO_TIMESTAMP(1767225600))",
+            ),
+        ] {
+            let sql = to_sql_with_engine(&expr, Some(Engine::DuckDB)).expect("to unparse");
+
+            assert_eq!(sql, expected);
+        }
+    }
+
+    /// The normalized rendering must group its right operand too. `-` and `+` share a precedence
+    /// level and associate left, so `x - (t + d)` rendered flat as `x - t + d` means
+    /// `(x - t) + d` — a different value, silently.
+    #[test]
+    fn test_duckdb_normalized_subtraction_groups_its_right_operand() {
+        let expr = col("x") - (ts_lit() + col("delta"));
+
+        let sql = to_sql_with_engine(&expr, Some(Engine::DuckDB)).expect("to unparse");
+
+        assert_eq!(
+            sql,
+            "TO_TIMESTAMP(EPOCH_MS(\"x\") / 1000) - (TO_TIMESTAMP(1767225600) + \"delta\")"
+        );
+    }
+
+    /// Subtracting a timestamp *from* a timestamp yields an interval, not a timestamp, so the
+    /// bare operand opposite it must not be normalized — DuckDB would then be asked to compare a
+    /// timestamp against an interval.
+    #[test]
+    fn test_duckdb_difference_of_two_timestamps_is_not_timestamp_valued() {
+        let expr = col("ts").lt(ts_lit() - ts_lit());
+
+        let sql = to_sql_with_engine(&expr, Some(Engine::DuckDB)).expect("to unparse");
+
+        assert_eq!(
+            sql,
+            "\"ts\" < (TO_TIMESTAMP(1767225600) - TO_TIMESTAMP(1767225600))"
+        );
+    }
+
+    /// `Minus` is in the normalization's operator set, but neither operand here is a timestamp,
+    /// so ordinary arithmetic must not be pulled into the rewrite.
+    #[test]
+    fn test_duckdb_subtraction_without_a_timestamp_operand_is_not_normalized() {
+        let expr = col("a") - col("b");
+
+        let sql = to_sql_with_engine(&expr, Some(Engine::DuckDB)).expect("to unparse");
+
+        assert_eq!(sql, "\"a\" - \"b\"");
+    }
+
+    /// A nested binary operand keeps its parentheses so the SQL means what the `Expr` meant.
+    /// Rendered flat, `a * (b + c)` becomes `a * b + c` — a different value that binds and
+    /// returns silently (10 rather than 14 for a=2, b=3, c=4).
+    #[test]
+    fn test_nested_arithmetic_keeps_its_grouping() {
+        let expr = col("a") * (col("b") + col("c"));
+
+        for engine in [
+            None,
+            Some(Engine::DuckDB),
+            Some(Engine::Postgres),
+            Some(Engine::SQLite),
+            Some(Engine::MySQL),
+        ] {
+            let sql = to_sql_with_engine(&expr, engine).expect("to unparse");
+
+            assert_eq!(sql, "\"a\" * (\"b\" + \"c\")", "engine {engine:?}");
+        }
+    }
+
+    /// Subtraction is not associative, so grouping is load-bearing for `-` as well:
+    /// `a - (b - c)` rendered flat is `(a - b) - c`.
+    #[test]
+    fn test_nested_subtraction_keeps_its_grouping() {
+        let expr = col("a") - (col("b") - col("c"));
+
+        let sql = to_sql(&expr).expect("to unparse");
+
+        assert_eq!(sql, "\"a\" - (\"b\" - \"c\")");
+    }
+
+    /// The normalization is DuckDB-specific and must not leak into other engines.
+    #[test]
+    fn test_non_duckdb_engines_do_not_normalize_timestamps() {
+        let expr = col("ts").lt(ts_lit());
+
+        for engine in [None, Some(Engine::Postgres), Some(Engine::MySQL)] {
+            let sql = to_sql_with_engine(&expr, engine).expect("to unparse");
+
+            assert!(
+                !sql.contains("EPOCH_MS"),
+                "engine {engine:?} must not normalize: {sql}"
             );
         }
     }

@@ -12,6 +12,7 @@ use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{dml::InsertOp, Expr},
     physical_plan::{metrics::MetricsSet, DisplayAs, DisplayFormatType, ExecutionPlan},
+    sql::TableReference,
 };
 use futures::StreamExt;
 use snafu::prelude::*;
@@ -21,7 +22,10 @@ use crate::sql::sql_provider_datafusion::expr;
 use crate::util::{
     constraints,
     count_exec::make_count_exec,
-    dml::{assignments_to_sql, filters_to_sql, DeletionExec, DeletionSink, UpdateExec, UpdateSink},
+    dml::{
+        assignments_to_sql, delete_statement, filters_to_sql, update_statement, DeletionExec,
+        DeletionSink, UpdateExec, UpdateSink,
+    },
     on_conflict::OnConflict,
     retriable_error::{check_and_mark_retriable_error, to_retriable_data_write_error},
 };
@@ -124,12 +128,12 @@ impl TableProvider for SqliteTableWriter {
         } else {
             Some(filters_to_sql(&filters, Some(expr::Engine::SQLite))?)
         };
-        let table_name = self.sqlite().table_name().to_string();
+        let table = self.sqlite().table_reference().clone();
         let sqlite = self.sqlite();
 
         Ok(Arc::new(DeletionExec::new(Arc::new(SqliteDeletionSink {
             sqlite,
-            table_name,
+            table,
             sql_where,
         }))))
     }
@@ -145,15 +149,18 @@ impl TableProvider for SqliteTableWriter {
         }
 
         let set_clause = assignments_to_sql(&assignments, Some(expr::Engine::SQLite))?;
-        let table_name = self.sqlite().table_name().to_string();
         let sqlite = self.sqlite();
 
-        let sql = if filters.is_empty() {
-            format!(r#"UPDATE "{table_name}" SET {set_clause}"#)
+        let sql_where = if filters.is_empty() {
+            None
         } else {
-            let sql_where = filters_to_sql(&filters, Some(expr::Engine::SQLite))?;
-            format!(r#"UPDATE "{table_name}" SET {set_clause} WHERE {sql_where}"#)
+            Some(filters_to_sql(&filters, Some(expr::Engine::SQLite))?)
         };
+        let sql = update_statement(
+            self.sqlite().table_reference(),
+            &set_clause,
+            sql_where.as_deref(),
+        );
 
         Ok(Arc::new(UpdateExec::new(Arc::new(SqliteUpdateSink {
             sqlite,
@@ -164,7 +171,7 @@ impl TableProvider for SqliteTableWriter {
 
 struct SqliteDeletionSink {
     sqlite: Arc<Sqlite>,
-    table_name: String,
+    table: TableReference,
     sql_where: Option<String>,
 }
 
@@ -173,18 +180,14 @@ impl DeletionSink for SqliteDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let mut db_conn = self.sqlite.connect().await?;
         let sqlite_conn = Sqlite::sqlite_conn(&mut db_conn)?;
-        let table_name = self.table_name.clone();
+        let table = self.table.clone();
         let sql_where = self.sql_where.clone();
 
         let count = sqlite_conn
             .conn
             .call(move |conn| -> Result<u64, rusqlite::Error> {
                 let tx = conn.transaction()?;
-                let delete_sql = if let Some(sql_where) = &sql_where {
-                    format!(r#"DELETE FROM "{table_name}" WHERE {sql_where}"#)
-                } else {
-                    format!(r#"DELETE FROM "{table_name}""#)
-                };
+                let delete_sql = delete_statement(&table, sql_where.as_deref());
                 tx.execute(&delete_sql, [])?;
                 // rusqlite 0.40 removed FromSql for u64; changes() is always non-negative.
                 let count: i64 = tx.query_row("SELECT changes()", [], |row| row.get(0))?;

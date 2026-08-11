@@ -13,6 +13,7 @@ use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{dml::InsertOp, Expr},
     physical_plan::{metrics::MetricsSet, DisplayAs, DisplayFormatType, ExecutionPlan},
+    sql::TableReference,
 };
 use futures::StreamExt;
 use snafu::prelude::*;
@@ -20,7 +21,10 @@ use snafu::prelude::*;
 use crate::util::{
     constraints::{self},
     count_exec::make_count_exec,
-    dml::{assignments_to_sql, filters_to_sql, DeletionExec, DeletionSink, UpdateExec, UpdateSink},
+    dml::{
+        assignments_to_sql, delete_statement_returning_count, filters_to_sql, update_statement,
+        DeletionExec, DeletionSink, UpdateExec, UpdateSink,
+    },
     on_conflict::OnConflict,
     retriable_error::check_and_mark_retriable_error,
 };
@@ -108,13 +112,13 @@ impl TableProvider for PostgresTableWriter {
         } else {
             Some(filters_to_sql(&filters, None)?)
         };
-        let table_name = self.postgres.table_name().to_string();
+        let table = self.postgres.table_reference().clone();
         let postgres = self.postgres();
 
         Ok(Arc::new(DeletionExec::new(Arc::new(
             PostgresDeletionSink {
                 postgres,
-                table_name,
+                table,
                 sql_where,
             },
         ))))
@@ -131,15 +135,18 @@ impl TableProvider for PostgresTableWriter {
         }
 
         let set_clause = assignments_to_sql(&assignments, None)?;
-        let table_name = self.postgres.table_name().to_string();
         let postgres = self.postgres();
 
-        let sql = if filters.is_empty() {
-            format!(r#"UPDATE "{table_name}" SET {set_clause}"#)
+        let sql_where = if filters.is_empty() {
+            None
         } else {
-            let sql_where = filters_to_sql(&filters, None)?;
-            format!(r#"UPDATE "{table_name}" SET {set_clause} WHERE {sql_where}"#)
+            Some(filters_to_sql(&filters, None)?)
         };
+        let sql = update_statement(
+            self.postgres.table_reference(),
+            &set_clause,
+            sql_where.as_deref(),
+        );
 
         Ok(Arc::new(UpdateExec::new(Arc::new(PostgresUpdateSink {
             postgres,
@@ -150,7 +157,7 @@ impl TableProvider for PostgresTableWriter {
 
 struct PostgresDeletionSink {
     postgres: Arc<Postgres>,
-    table_name: String,
+    table: TableReference,
     sql_where: Option<String>,
 }
 
@@ -162,16 +169,7 @@ impl DeletionSink for PostgresDeletionSink {
         let pg_conn = Postgres::postgres_conn(&mut db_conn)?;
         let tx = pg_conn.conn.transaction().await?;
 
-        let table_name = &self.table_name;
-        let sql = if let Some(sql_where) = &self.sql_where {
-            format!(
-                r#"WITH deleted AS (DELETE FROM "{table_name}" WHERE {sql_where} RETURNING *) SELECT COUNT(*) FROM deleted"#,
-            )
-        } else {
-            format!(
-                r#"WITH deleted AS (DELETE FROM "{table_name}" RETURNING *) SELECT COUNT(*) FROM deleted"#,
-            )
-        };
+        let sql = delete_statement_returning_count(&self.table, self.sql_where.as_deref());
         let row = tx.query_one(&sql, &[]).await?;
         let deleted: i64 = row.get(0);
         tx.commit().await?;
