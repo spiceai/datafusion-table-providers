@@ -565,28 +565,35 @@ async fn test_postgres_bulk_schema_matches_per_table_schema() {
             .expect("executing bulk-schema fixture");
     }
 
+    // One of each relation kind the catalog query is expected to describe,
+    // including a partition leaf: a leaf is `relkind = 'r'`, so it is describable
+    // even though a catalog connector may choose not to register it.
+    let requested: Vec<String> = [
+        "foreign_plain",
+        "parted",
+        "parted_2026",
+        "plain",
+        "plain_matview",
+        "plain_view",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
     let bulk = pg_conn
-        .get_schemas_in("public")
+        .get_schemas_in("public", &requested)
         .await
         .expect("bulk schema resolution");
 
-    // Every relation the catalog query describes must be present, the partition
-    // leaf included: a leaf is `relkind = 'r'`, so `SCHEMA_QUERY` returns it
-    // alongside its `relkind = 'p'` parent. Deciding that a leaf should not be
-    // *registered* belongs to the catalog connector, not to schema resolution.
+    // Every requested relation must come back; one the query cannot describe
+    // would be silently absent, which is the caller's cue to resolve it alone.
     let mut got: Vec<&String> = bulk.keys().collect();
     got.sort();
+    let mut want: Vec<&String> = requested.iter().collect();
+    want.sort();
     assert_eq!(
-        got,
-        vec![
-            "foreign_plain",
-            "parted",
-            "parted_2026",
-            "plain",
-            "plain_matview",
-            "plain_view"
-        ],
-        "bulk resolution must cover every relation kind the catalog query describes"
+        got, want,
+        "every relation kind asked for should be described"
     );
 
     for (table, bulk_schema) in &bulk {
@@ -652,7 +659,9 @@ async fn test_postgres_bulk_and_per_table_agree_on_unsupported_types() {
             .expect("to connect to postgres")
             .with_unsupported_type_action(action);
 
-        let bulk = conn.get_schemas_in("public").await;
+        let bulk = conn
+            .get_schemas_in("public", &["has_unsupported".to_string()])
+            .await;
         let per_table = conn
             .get_schema(&TableReference::partial("public", "has_unsupported"))
             .await;
@@ -785,7 +794,7 @@ async fn test_postgres_redshift_declines_bulk_schema_resolution() {
 
     // Vanilla resolves the table in bulk...
     let as_postgres = setup
-        .get_schemas_in("public")
+        .get_schemas_in("public", &["bulk_probe".to_string()])
         .await
         .expect("bulk resolution");
     assert!(
@@ -799,7 +808,7 @@ async fn test_postgres_redshift_declines_bulk_schema_resolution() {
         .await
         .expect("to connect to postgres")
         .with_variant(PostgresVariant::Redshift)
-        .get_schemas_in("public")
+        .get_schemas_in("public", &["bulk_probe".to_string()])
         .await
         .expect("bulk resolution must succeed, empty");
     assert!(
@@ -859,7 +868,7 @@ async fn test_postgres_table_provider_with_schema_matches_the_querying_construct
 
     // The schema a bulk resolution would hand the caller.
     let bulk = conn
-        .get_schemas_in("public")
+        .get_schemas_in("public", &["precomputed".to_string()])
         .await
         .expect("bulk schema resolution");
     let precomputed = Arc::clone(
@@ -889,6 +898,84 @@ async fn test_postgres_table_provider_with_schema_matches_the_querying_construct
         (*queried).type_id(),
         "both constructors must produce the same provider type, so they plan alike"
     );
+
+    // Tear down
+    container
+        .remove()
+        .await
+        .expect("to stop postgres container");
+}
+
+/// Only the named relations are described, whatever else the namespace holds.
+///
+/// This is the property that makes bulk resolution unconditionally worth taking.
+/// A catalog's discovered set is narrower than the namespace — `pg_inherits`
+/// children and relations the role cannot read are excluded before any
+/// `include`/`exclude` is applied — so a query scoped to the namespace would
+/// return columns for relations the caller has already decided to skip. For a
+/// partitioned table that is every leaf, which can cost more than the per-table
+/// queries it replaces.
+///
+/// The fixture makes that concrete: a partitioned parent with leaves, plus an
+/// unrelated table, of which only the parent is asked for.
+#[tokio::test]
+async fn test_postgres_bulk_schema_describes_only_the_named_relations() {
+    let port = crate::get_random_port();
+    let container = common::start_postgres_docker_container("postgres:latest", port, None)
+        .await
+        .expect("Postgres container to start");
+
+    let postgres_pool = Arc::new(
+        PostgresConnectionPool::new(to_secret_map(common::get_pg_params(port)))
+            .await
+            .expect("unable to create Postgres connection pool"),
+    );
+    let conn = postgres_pool
+        .connect_direct()
+        .await
+        .expect("to connect to postgres");
+
+    let fixture = r#"
+        CREATE TABLE events (id INTEGER NOT NULL, at DATE NOT NULL)
+            PARTITION BY RANGE (at);
+        CREATE TABLE events_2025 PARTITION OF events
+            FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+        CREATE TABLE events_2026 PARTITION OF events
+            FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+        CREATE TABLE unrelated (id INTEGER, note TEXT)
+    "#;
+    for cmd in fixture.split(';') {
+        if cmd.trim().is_empty() {
+            continue;
+        }
+        conn.conn
+            .execute(cmd, &[])
+            .await
+            .expect("executing partitioned fixture");
+    }
+
+    // What a catalog would discover here: the parent, not its leaves.
+    let discovered = vec!["events".to_string()];
+    let schemas = conn
+        .get_schemas_in("public", &discovered)
+        .await
+        .expect("bulk schema resolution");
+
+    let mut got: Vec<&String> = schemas.keys().collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["events"],
+        "only the named relation should be described; the leaves and the \
+         unrelated table were not asked for"
+    );
+
+    // Asking for nothing describes nothing, and needs no query to say so.
+    let none = conn
+        .get_schemas_in("public", &[])
+        .await
+        .expect("empty request");
+    assert!(none.is_empty(), "an empty request should describe nothing");
 
     // Tear down
     container
