@@ -1730,8 +1730,10 @@ mod tests {
 
     /// `EPOCH_MS(<integer>)` is DuckDB's *constructor*, so normalizing a non-temporal operand
     /// produced `No function matches '/(TIMESTAMP, INTEGER_LITERAL)'` — an error naming neither
-    /// the column nor the comparison. Rendered bare, DuckDB reports the mismatch that is actually
-    /// there.
+    /// the column nor the comparison. Rendered bare it still does not bind, which is the right
+    /// outcome for a comparison that has no meaning, but DuckDB v1.5.5 now names the mismatch that
+    /// is actually there: *"Cannot compare values of type BIGINT and type TIMESTAMP WITH TIME
+    /// ZONE"*.
     #[test]
     fn test_duckdb_does_not_normalize_a_non_temporal_column() {
         let expr = col("other").lt(ts_lit());

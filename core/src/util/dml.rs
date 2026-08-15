@@ -1081,6 +1081,44 @@ mod duckdb_timestamp_precision_tests {
         );
     }
 
+    /// Subtraction is the one non-comparison operator the rewrite covers, and the type test now
+    /// takes it off a timezone-aware column too. DuckDB v1.5.5 refuses `TIMESTAMP_MS - TIMESTAMPTZ`
+    /// — which is why the rewrite reaches subtraction at all — but subtracts two `TIMESTAMPTZ`
+    /// values happily, returning the same interval the normalized form does.
+    #[test]
+    fn subtracting_a_timestamp_from_a_timezone_aware_column_still_binds() {
+        let schema = schema(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ));
+        let difference = col("ts") - ts_literal(TimeUnit::Microsecond, EPOCH_US, Some("UTC"));
+
+        let rendered = assignments_to_sql_with_schema(
+            &[("d".to_string(), difference)],
+            Some(Engine::DuckDB),
+            Some(&schema),
+        )
+        .expect("assignments_to_sql should succeed");
+        assert_eq!(rendered, "\"d\" = \"ts\" - TO_TIMESTAMP(1767225600)");
+
+        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+        conn.execute_batch("CREATE TABLE t (ts TIMESTAMPTZ)")
+            .expect("create");
+        conn.execute_batch("INSERT INTO t VALUES ('2026-01-01 00:00:01.5+00')")
+            .expect("insert");
+
+        let mut stmt = conn
+            .prepare("SELECT (\"ts\" - TO_TIMESTAMP(1767225600))::VARCHAR FROM t")
+            .expect("the rendered subtraction must be valid SQL for DuckDB");
+        let difference: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<duckdb::Result<Vec<String>>>()
+            .expect("rows");
+
+        assert_eq!(difference, vec!["00:00:01.5".to_string()]);
+    }
+
     /// A `SET` value carries the same literal rendering as a filter, so an `UPDATE` writing a
     /// sub-second instant has to store the instant it was given.
     #[test]
