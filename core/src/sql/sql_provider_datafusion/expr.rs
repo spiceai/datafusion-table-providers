@@ -308,7 +308,8 @@ fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> 
                 // exceeds the 2^53 an `f64` represents exactly, which would round the value by a
                 // few hundred nanoseconds and could carry that into the microsecond DuckDB keeps.
                 // `div_euclid` floors, so the truncation goes the same way either side of the
-                // epoch.
+                // epoch. The microsecond value is then subject to the same year-2255 bound as the
+                // arm below.
                 Some(Engine::DuckDB) => {
                     let seconds = value.div_euclid(1_000) as f64 / 1_000_000.0;
                     Ok(format!("TO_TIMESTAMP({seconds})"))
@@ -331,8 +332,13 @@ fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> 
                     Some(Engine::MySQL) => Ok(format!("FROM_UNIXTIME({seconds})")),
                     // Integer division, as the catch-all arm does it, would round the literal
                     // down to a whole second, moving which rows a comparison against it selects.
-                    // A microsecond count stays under the 2^53 an `f64` holds exactly until the
-                    // year 2255, and DuckDB recovers the same microsecond from the quotient.
+                    //
+                    // `TO_TIMESTAMP` takes a `DOUBLE`, so microsecond resolution is exact only
+                    // while the epoch-second value keeps 16 significant digits — up to about the
+                    // year 2255. Past that the instant can land a microsecond out, and rendering
+                    // the fraction from integer arithmetic does not help: DuckDB's own parse is
+                    // what rounds. Verified at 2260, where both forms land on the same wrong
+                    // microsecond.
                     Some(Engine::DuckDB) => Ok(format!("TO_TIMESTAMP({seconds})")),
                     _ => Ok(format!("TO_TIMESTAMP({})", value / 1_000_000)),
                 }
@@ -509,11 +515,21 @@ fn is_duckdb_timestamp_operand(expr: &Expr) -> bool {
 /// DuckDB read it as a `TIMESTAMPTZ` fixed to UTC. Whether the operand carries a timezone is what
 /// decides it; the unit does not.
 ///
-/// A **naive** timestamp needs it, at every unit, and loses nothing it holds. DuckDB v1.5.5 refuses
-/// to compare `TIMESTAMP_S`, `TIMESTAMP_MS` or `TIMESTAMP_NS` with a `TIMESTAMPTZ` at all —
-/// *"Cannot compare values of type `TIMESTAMP_S` and type `TIMESTAMP WITH TIME ZONE`"* — and a
-/// microsecond `TIMESTAMP`, which does compare, would be read in the session's `TimeZone` where the
-/// rendered literal is a UTC instant.
+/// A **naive** timestamp needs it, at every unit. DuckDB v1.5.5 refuses to compare `TIMESTAMP_S`,
+/// `TIMESTAMP_MS` or `TIMESTAMP_NS` with a `TIMESTAMPTZ` at all — *"Cannot compare values of type
+/// `TIMESTAMP_S` and type `TIMESTAMP WITH TIME ZONE`"* — and a microsecond `TIMESTAMP`, which does
+/// compare, would be read in the session's `TimeZone` where the rendered literal is a UTC instant.
+///
+/// It is not free for all of them: `EPOCH_MS` yields whole milliseconds, so a naive `TIMESTAMP` or
+/// `TIMESTAMP_NS` is still truncated to the millisecond by the very rewrite that makes it compare
+/// in the right frame. `TIMESTAMP_S` and `TIMESTAMP_MS` carry nothing finer and lose nothing. The
+/// remaining truncation is <https://github.com/spiceai/spiceai/issues/13146>; pinning UTC losslessly
+/// needs `AT TIME ZONE`, which is an ICU-extension dependency this rendering does not take.
+///
+/// A **date** needs it for the reference frame alone. DuckDB promotes a bare `DATE` to a
+/// `TIMESTAMPTZ` at midnight in the *session's* `TimeZone`, while `EPOCH_MS` pins the same midnight
+/// UTC the rendered literal is in — measured against v1.5.5, `"dt" = TO_TIMESTAMP(..)` and its
+/// normalized form disagree under `America/Los_Angeles` and agree under `UTC`.
 ///
 /// A **timezone-aware** timestamp needs neither: it is already the type and the reference frame the
 /// literal renders as, so normalizing only truncates it to whole milliseconds. That is the case this
@@ -540,7 +556,10 @@ fn duckdb_normalizes_timestamp_operand(expr: &Expr, schema: Option<&Schema>) -> 
         return true;
     };
 
-    matches!(field.data_type(), DataType::Timestamp(_, None))
+    matches!(
+        field.data_type(),
+        DataType::Timestamp(_, None) | DataType::Date32 | DataType::Date64
+    )
 }
 
 fn handle_cast(
@@ -1725,6 +1744,27 @@ mod tests {
             assert_eq!(
                 sql, "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < TO_TIMESTAMP(1767225600)",
                 "a naive timestamp column ({unit:?}) must still be normalized"
+            );
+        }
+    }
+
+    /// A `Date32`/`Date64` column keeps the normalization too, and for the reference frame rather
+    /// than to bind: DuckDB promotes a bare `DATE` to a `TIMESTAMPTZ` at midnight in the *session's*
+    /// `TimeZone`, while the rendered literal is a UTC instant. Declining it here would make a date
+    /// comparison depend on the host's timezone.
+    #[test]
+    fn test_duckdb_still_normalizes_a_date_column() {
+        let expr = col("ts").lt(ts_lit());
+
+        for date in [DataType::Date32, DataType::Date64] {
+            let schema = schema_with_ts(date.clone());
+
+            let sql = to_sql_with_engine_and_schema(&expr, Some(Engine::DuckDB), Some(&schema))
+                .expect("to unparse");
+
+            assert_eq!(
+                sql, "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < TO_TIMESTAMP(1767225600)",
+                "a {date:?} column must still be normalized"
             );
         }
     }

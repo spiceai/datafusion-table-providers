@@ -1108,6 +1108,43 @@ mod duckdb_timestamp_precision_tests {
         assert_eq!(difference, vec!["00:00:01.5".to_string()]);
     }
 
+    /// A `DATE` column is the case where the normalization is load-bearing for the *reference
+    /// frame* rather than for binding. DuckDB promotes a bare `DATE` to a `TIMESTAMPTZ` at midnight
+    /// in the session's `TimeZone`; the rendered literal is midnight UTC. Under a session west of
+    /// UTC the two are different instants, so declining the rewrite for a resolved date type would
+    /// make a `DELETE` remove different rows depending on the host.
+    #[test]
+    fn a_date_column_is_compared_in_utc_whatever_the_session_timezone_is() {
+        let schema = schema(DataType::Date32);
+        let filters = vec![col("ts").eq(ts_literal(ScalarValue::TimestampMicrosecond(
+            Some(EPOCH_US),
+            Some("UTC".into()),
+        )))];
+
+        let where_clause =
+            filters_to_sql_with_schema(&filters, Some(Engine::DuckDB), Some(&schema))
+                .expect("filters_to_sql should succeed");
+        assert_eq!(
+            where_clause,
+            "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) = TO_TIMESTAMP(1767225600)"
+        );
+
+        // Row 1 is the date the filter names. It must go under either session timezone.
+        for timezone in ["UTC", "America/Los_Angeles"] {
+            let surviving: Vec<i32> = one_column(
+                &[
+                    format!("SET TimeZone='{timezone}'"),
+                    "CREATE TABLE t (id INTEGER, ts DATE)".to_string(),
+                    "INSERT INTO t VALUES (1, '2026-01-01'), (2, '2026-01-02')".to_string(),
+                    format!("DELETE FROM t WHERE {where_clause}"),
+                ],
+                "SELECT id FROM t ORDER BY id",
+            );
+
+            assert_eq!(surviving, vec![2], "session TimeZone {timezone}");
+        }
+    }
+
     /// A `SET` value carries the same literal rendering as a filter, so an `UPDATE` writing a
     /// sub-second instant has to store the instant it was given.
     #[test]
