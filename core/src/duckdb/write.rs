@@ -9,8 +9,8 @@ use crate::util::{
     constraints,
     count_exec::make_count_exec,
     dml::{
-        assignments_to_sql, delete_statement, filters_to_sql, update_statement, DeletionExec,
-        DeletionSink, UpdateExec, UpdateSink,
+        assignments_to_sql_with_schema, delete_statement, filters_to_sql_with_schema,
+        update_statement, DeletionExec, DeletionSink, UpdateExec, UpdateSink,
     },
     on_conflict::OnConflict,
     retriable_error::{check_and_mark_retriable_error, to_retriable_data_write_error},
@@ -261,7 +261,11 @@ impl TableProvider for DuckDBTableWriter {
         let sql_where = if filters.is_empty() {
             None
         } else {
-            Some(filters_to_sql(&filters, Some(expr::Engine::DuckDB))?)
+            Some(filters_to_sql_with_schema(
+                &filters,
+                Some(expr::Engine::DuckDB),
+                Some(&self.schema()),
+            )?)
         };
         let table_definition = Arc::clone(&self.table_definition);
         let pool = Arc::clone(&self.pool);
@@ -283,11 +287,19 @@ impl TableProvider for DuckDBTableWriter {
             return make_count_exec(0);
         }
 
-        let set_clause = assignments_to_sql(&assignments, Some(expr::Engine::DuckDB))?;
+        let set_clause = assignments_to_sql_with_schema(
+            &assignments,
+            Some(expr::Engine::DuckDB),
+            Some(&self.schema()),
+        )?;
         let sql_where = if filters.is_empty() {
             None
         } else {
-            Some(filters_to_sql(&filters, Some(expr::Engine::DuckDB))?)
+            Some(filters_to_sql_with_schema(
+                &filters,
+                Some(expr::Engine::DuckDB),
+                Some(&self.schema()),
+            )?)
         };
         let table_definition = Arc::clone(&self.table_definition);
         let pool = Arc::clone(&self.pool);
