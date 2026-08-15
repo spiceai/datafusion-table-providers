@@ -462,3 +462,84 @@ mod composite_delete_stack_overflow {
         handle.join().unwrap();
     }
 }
+
+/// Regression tests for empty-projection scans (`COUNT(*)` / `COUNT(1)`) on the
+/// non-federated DuckDB scan path.
+///
+/// A row-count-only aggregate pushes an empty projection (`Some([])`) into the
+/// scan. Before the fix, the physical scan returned the table's full schema
+/// while the logical plan expected zero fields, so DataFusion rejected the plan
+/// with "Physical input schema should be the same as the one converted from
+/// logical input schema ... (physical) N vs (logical) 0". These queries must now
+/// run and return the correct counts.
+mod empty_projection {
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::execution::context::SessionContext;
+    use datafusion::sql::TableReference;
+    use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
+    use datafusion_table_providers::sql::db_connection_pool::dbconnection::DbConnection;
+    use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+    use datafusion_table_providers::duckdb::DuckDBTableFactory;
+    use std::sync::Arc;
+
+    async fn count_of(ctx: &SessionContext, sql: &str) -> i64 {
+        let batches = ctx
+            .sql(sql)
+            .await
+            .expect("plan query")
+            .collect()
+            .await
+            .expect("collect");
+        assert_eq!(batches.len(), 1, "count returns a single batch");
+        assert_eq!(batches[0].num_rows(), 1, "count returns a single row");
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count column is Int64")
+            .value(0)
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn count_star_and_count_one_empty_projection() {
+        let pool = Arc::new(DuckDbConnectionPool::new_memory().expect("pool created"));
+        {
+            let mut conn = Arc::clone(&pool).connect_sync().expect("connection");
+            let duckdb_conn = conn
+                .as_any_mut()
+                .downcast_mut::<DuckDbConnection>()
+                .expect("downcast to DuckDbConnection");
+            duckdb_conn
+                .conn
+                .execute_batch(
+                    "CREATE TABLE orders (id INTEGER, amount DOUBLE);
+                     INSERT INTO orders VALUES (1, 1.5), (2, 2.5), (3, 3.5);",
+                )
+                .expect("setup SQL");
+        }
+
+        let factory = DuckDBTableFactory::new(Arc::clone(&pool));
+        let provider = factory
+            .table_provider(TableReference::bare("orders"))
+            .await
+            .expect("table_provider");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("orders", provider).expect("register");
+
+        // The empty-projection cases the fix targets.
+        assert_eq!(count_of(&ctx, "SELECT count(1) AS n FROM orders").await, 3);
+        assert_eq!(count_of(&ctx, "SELECT count(*) AS n FROM orders").await, 3);
+        // Empty projection combined with a pushed-down filter.
+        assert_eq!(
+            count_of(&ctx, "SELECT count(*) AS n FROM orders WHERE id > 1").await,
+            2
+        );
+        // A non-empty projection still works (guards against regressing the
+        // normal scan path).
+        assert_eq!(
+            count_of(&ctx, "SELECT count(id) AS n FROM orders").await,
+            3
+        );
+    }
+}

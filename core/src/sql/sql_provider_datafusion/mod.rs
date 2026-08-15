@@ -22,12 +22,13 @@ use datafusion::{
     },
 };
 use expr::Engine;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use snafu::prelude::*;
 use std::fmt::Display;
 use std::{fmt, sync::Arc};
 
 use datafusion::{
+    arrow::array::{RecordBatch, RecordBatchOptions},
     arrow::datatypes::SchemaRef,
     config::ConfigOptions,
     datasource::TableProvider,
@@ -221,12 +222,20 @@ impl<T, P> SqlTable<T, P> {
             None => identifier.to_string(),
         };
 
-        let columns = projected_schema
-            .fields()
-            .iter()
-            .map(|f| quote_identifier(f.name()))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let columns = if projected_schema.fields().is_empty() {
+            // Empty projection (e.g. `COUNT(*)`): `SELECT  FROM t` is invalid SQL,
+            // so select a constant placeholder to keep the query valid and return
+            // the right row count. `get_stream` discards the placeholder column
+            // and yields zero-width batches.
+            "1".to_string()
+        } else {
+            projected_schema
+                .fields()
+                .iter()
+                .map(|f| quote_identifier(f.name()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
 
         let limit_expr = match limit {
             Some(limit) => format!("LIMIT {limit}"),
@@ -396,14 +405,15 @@ pub fn project_schema_safe(
     schema: &SchemaRef,
     projection: Option<&Vec<usize>>,
 ) -> DataFusionResult<SchemaRef> {
+    // An empty projection (`Some([])`) is emitted for row-count-only scans such
+    // as `COUNT(*)` / `COUNT(1)` and semi-joins: the scan needs zero columns.
+    // `Schema::project(&[])` yields an empty schema (keeping schema-level
+    // metadata), which is what the logical plan expects. Returning the full
+    // schema here instead makes the physical scan schema disagree with the
+    // logical plan ("physical N vs logical 0"). The empty-column SQL and
+    // zero-width batches are handled in `scan_to_sql` and `get_stream`.
     let schema = match projection {
-        Some(columns) => {
-            if columns.is_empty() {
-                Arc::clone(schema)
-            } else {
-                Arc::new(schema.project(columns)?)
-            }
-        }
+        Some(columns) => Arc::new(schema.project(columns)?),
         None => Arc::clone(schema),
     };
     Ok(schema)
@@ -866,6 +876,33 @@ pub async fn get_stream<T: 'static, P: 'static>(
     projected_schema: SchemaRef,
 ) -> DataFusionResult<SendableRecordBatchStream> {
     let conn = pool.connect().await.map_err(to_execution_error)?;
+
+    // Empty projection (e.g. `COUNT(*)`/`COUNT(1)`, semi-joins): the scan needs
+    // zero columns, only the row count. `scan_to_sql` emitted a placeholder
+    // column (`SELECT 1 FROM ...`) so the query is valid; here we run it with no
+    // projected schema (the placeholder's type is irrelevant) and map each batch
+    // to a zero-width batch that preserves its row count. This is done once, in
+    // the path every backend shares, so the physical scan schema (0 fields)
+    // matches the logical plan without a per-backend cast or a wrapper node.
+    if projected_schema.fields().is_empty() {
+        let stream = query_arrow(conn, sql, None)
+            .await
+            .map_err(to_execution_error)?;
+        let out_schema = Arc::clone(&projected_schema);
+        let mapped = stream.map(move |batch| {
+            let batch = batch?;
+            RecordBatch::try_new_with_options(
+                Arc::clone(&out_schema),
+                vec![],
+                &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+            )
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        });
+        return Ok(Box::pin(RecordBatchStreamAdapter::new(
+            projected_schema,
+            mapped,
+        )));
+    }
 
     query_arrow(conn, sql, Some(projected_schema))
         .await
