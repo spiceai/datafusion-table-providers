@@ -287,10 +287,13 @@ impl TableProvider for DuckDBTableWriter {
             return make_count_exec(0);
         }
 
+        // Bound once so the SET clause and the WHERE clause are visibly rendered against the
+        // same schema.
+        let schema = self.schema();
         let set_clause = assignments_to_sql_with_schema(
             &assignments,
             Some(expr::Engine::DuckDB),
-            Some(&self.schema()),
+            Some(&schema),
         )?;
         let sql_where = if filters.is_empty() {
             None
@@ -298,7 +301,7 @@ impl TableProvider for DuckDBTableWriter {
             Some(filters_to_sql_with_schema(
                 &filters,
                 Some(expr::Engine::DuckDB),
-                Some(&self.schema()),
+                Some(&schema),
             )?)
         };
         let table_definition = Arc::clone(&self.table_definition);

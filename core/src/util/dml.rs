@@ -29,8 +29,7 @@ pub fn filters_to_sql(
 ///
 /// The schema is what lets the DuckDB rendering tell a column that needs its timestamp
 /// normalization from one the normalization would only truncate — see
-/// [`expr::to_sql_with_engine_and_schema`]. Every DML path has one; passing it is what keeps a
-/// `DELETE`'s `WHERE` clause selecting the rows the caller asked for.
+/// [`expr::to_sql_with_engine_and_schema`].
 pub fn filters_to_sql_with_schema(
     filters: &[Expr],
     engine: Option<expr::Engine>,
@@ -951,6 +950,14 @@ mod duckdb_timestamp_precision_tests {
     /// `2026-01-01 00:00:00` UTC, in microseconds.
     const EPOCH_US: i64 = 1_767_225_600_000_000;
 
+    /// Row 1 sits 999µs past the second, row 2 sits on it. A filter naming any instant between
+    /// the two must remove exactly row 1 — and cannot, once both operands collapse onto the
+    /// second.
+    const MICROSECOND_APART: [&str; 2] = [
+        "2026-01-01 00:00:00.000999+00",
+        "2026-01-01 00:00:00.000000+00",
+    ];
+
     fn schema(ts: DataType) -> Schema {
         Schema::new(vec![
             Field::new("id", DataType::Int32, true),
@@ -958,41 +965,42 @@ mod duckdb_timestamp_precision_tests {
         ])
     }
 
-    fn ts_literal(unit: TimeUnit, value: i64, tz: Option<&str>) -> Expr {
-        let tz = tz.map(Into::into);
-        Expr::Literal(
-            match unit {
-                TimeUnit::Second => ScalarValue::TimestampSecond(Some(value), tz),
-                TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(Some(value), tz),
-                TimeUnit::Microsecond => ScalarValue::TimestampMicrosecond(Some(value), tz),
-                TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(Some(value), tz),
-            },
-            None,
-        )
+    fn ts_literal(value: ScalarValue) -> Expr {
+        Expr::Literal(value, None)
     }
 
-    /// Runs the `DELETE` the DML path builds for `filters` over a two-row table of `column_type`,
-    /// and returns the ids that survive it.
-    fn surviving_ids(column_type: &str, values: [&str; 2], where_clause: &str) -> Vec<i32> {
+    /// Runs `setup` against a fresh in-memory DuckDB, then returns the single column `query`
+    /// selects. Every test here asserts on rows that survived a statement, so the statement and
+    /// the read have to share one connection.
+    fn one_column<T: duckdb::types::FromSql>(setup: &[String], query: &str) -> Vec<T> {
         let conn = Connection::open_in_memory().expect("in-memory DuckDB");
-        conn.execute_batch(&format!("CREATE TABLE t (id INTEGER, ts {column_type})"))
-            .expect("create");
-        conn.execute_batch(&format!(
-            "INSERT INTO t VALUES (1, '{}'), (2, '{}')",
-            values[0], values[1]
-        ))
-        .expect("insert");
+        for statement in setup {
+            conn.execute_batch(statement).unwrap_or_else(|e| {
+                panic!("the rendered statement must be valid DuckDB SQL: {statement}: {e}")
+            });
+        }
 
-        conn.execute_batch(&format!("DELETE FROM t WHERE {where_clause}"))
-            .expect("the rendered DELETE must be valid SQL for DuckDB");
-
-        let mut stmt = conn
-            .prepare("SELECT id FROM t ORDER BY id")
-            .expect("prepare");
+        let mut stmt = conn.prepare(query).expect("prepare");
         stmt.query_map([], |row| row.get(0))
             .expect("query")
-            .collect::<duckdb::Result<Vec<i32>>>()
+            .collect::<duckdb::Result<Vec<T>>>()
             .expect("rows")
+    }
+
+    /// Runs the `DELETE` the DML path builds for `where_clause` over a two-row table of
+    /// `column_type`, and returns the ids that survive it.
+    fn surviving_ids(column_type: &str, values: [&str; 2], where_clause: &str) -> Vec<i32> {
+        one_column(
+            &[
+                format!("CREATE TABLE t (id INTEGER, ts {column_type})"),
+                format!(
+                    "INSERT INTO t VALUES (1, '{}'), (2, '{}')",
+                    values[0], values[1]
+                ),
+                format!("DELETE FROM t WHERE {where_clause}"),
+            ],
+            "SELECT id FROM t ORDER BY id",
+        )
     }
 
     /// The reported defect, end to end. Row 1 sits 999µs past the second and row 2 sits on it;
@@ -1006,24 +1014,16 @@ mod duckdb_timestamp_precision_tests {
             TimeUnit::Microsecond,
             Some("UTC".into()),
         ));
-        let filters = vec![col("ts").gt(ts_literal(
-            TimeUnit::Microsecond,
-            EPOCH_US + 500,
-            Some("UTC"),
-        ))];
+        let filters = vec![col("ts").gt(ts_literal(ScalarValue::TimestampMicrosecond(
+            Some(EPOCH_US + 500),
+            Some("UTC".into()),
+        )))];
 
         let with_schema = filters_to_sql_with_schema(&filters, Some(Engine::DuckDB), Some(&schema))
             .expect("filters_to_sql should succeed");
         assert_eq!(with_schema, "\"ts\" > TO_TIMESTAMP(1767225600.0005)");
         assert_eq!(
-            surviving_ids(
-                "TIMESTAMPTZ",
-                [
-                    "2026-01-01 00:00:00.000999+00",
-                    "2026-01-01 00:00:00.000000+00"
-                ],
-                &with_schema,
-            ),
+            surviving_ids("TIMESTAMPTZ", MICROSECOND_APART, &with_schema),
             vec![2],
             "the row past the filter's instant must be the one removed"
         );
@@ -1038,14 +1038,7 @@ mod duckdb_timestamp_precision_tests {
             "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) > TO_TIMESTAMP(1767225600.0005)"
         );
         assert_eq!(
-            surviving_ids(
-                "TIMESTAMPTZ",
-                [
-                    "2026-01-01 00:00:00.000999+00",
-                    "2026-01-01 00:00:00.000000+00"
-                ],
-                &without_schema,
-            ),
+            surviving_ids("TIMESTAMPTZ", MICROSECOND_APART, &without_schema),
             vec![1, 2],
             "this is the defect being fixed: the truncated comparison removes nothing"
         );
@@ -1058,11 +1051,10 @@ mod duckdb_timestamp_precision_tests {
     #[test]
     fn a_naive_millisecond_column_is_still_normalized_and_still_binds() {
         let schema = schema(DataType::Timestamp(TimeUnit::Millisecond, None));
-        let filters = vec![col("ts").gt(ts_literal(
-            TimeUnit::Millisecond,
-            EPOCH_US / 1_000 + 1,
+        let filters = vec![col("ts").gt(ts_literal(ScalarValue::TimestampMillisecond(
+            Some(1_767_225_600_001),
             None,
-        ))];
+        )))];
 
         let where_clause =
             filters_to_sql_with_schema(&filters, Some(Engine::DuckDB), Some(&schema))
@@ -1091,7 +1083,11 @@ mod duckdb_timestamp_precision_tests {
             TimeUnit::Microsecond,
             Some("UTC".into()),
         ));
-        let difference = col("ts") - ts_literal(TimeUnit::Microsecond, EPOCH_US, Some("UTC"));
+        let difference = col("ts")
+            - ts_literal(ScalarValue::TimestampMicrosecond(
+                Some(EPOCH_US),
+                Some("UTC".into()),
+            ));
 
         let rendered = assignments_to_sql_with_schema(
             &[("d".to_string(), difference)],
@@ -1101,20 +1097,13 @@ mod duckdb_timestamp_precision_tests {
         .expect("assignments_to_sql should succeed");
         assert_eq!(rendered, "\"d\" = \"ts\" - TO_TIMESTAMP(1767225600)");
 
-        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
-        conn.execute_batch("CREATE TABLE t (ts TIMESTAMPTZ)")
-            .expect("create");
-        conn.execute_batch("INSERT INTO t VALUES ('2026-01-01 00:00:01.5+00')")
-            .expect("insert");
-
-        let mut stmt = conn
-            .prepare("SELECT (\"ts\" - TO_TIMESTAMP(1767225600))::VARCHAR FROM t")
-            .expect("the rendered subtraction must be valid SQL for DuckDB");
-        let difference: Vec<String> = stmt
-            .query_map([], |row| row.get(0))
-            .expect("query")
-            .collect::<duckdb::Result<Vec<String>>>()
-            .expect("rows");
+        let difference: Vec<String> = one_column(
+            &[
+                "CREATE TABLE t (ts TIMESTAMPTZ)".to_string(),
+                "INSERT INTO t VALUES ('2026-01-01 00:00:01.5+00')".to_string(),
+            ],
+            "SELECT (\"ts\" - TO_TIMESTAMP(1767225600))::VARCHAR FROM t",
+        );
 
         assert_eq!(difference, vec!["00:00:01.5".to_string()]);
     }
@@ -1129,7 +1118,10 @@ mod duckdb_timestamp_precision_tests {
         ));
         let assignments = vec![(
             "ts".to_string(),
-            ts_literal(TimeUnit::Microsecond, EPOCH_US + 999, Some("UTC")),
+            ts_literal(ScalarValue::TimestampMicrosecond(
+                Some(EPOCH_US + 999),
+                Some("UTC".into()),
+            )),
         )];
 
         let set_clause =
@@ -1137,25 +1129,17 @@ mod duckdb_timestamp_precision_tests {
                 .expect("assignments_to_sql should succeed");
         assert_eq!(set_clause, "\"ts\" = TO_TIMESTAMP(1767225600.000999)");
 
-        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
-        conn.execute_batch("SET TimeZone='UTC'").expect("timezone");
-        conn.execute_batch("CREATE TABLE t (id INTEGER, ts TIMESTAMPTZ)")
-            .expect("create");
-        conn.execute_batch("INSERT INTO t VALUES (1, '2020-01-01 00:00:00+00')")
-            .expect("insert");
-        conn.execute_batch(&update_statement(
-            &TableReference::bare("t"),
-            &set_clause,
-            None,
-        ))
-        .expect("the rendered UPDATE must be valid SQL for DuckDB");
-
-        let mut stmt = conn.prepare("SELECT ts::VARCHAR FROM t").expect("prepare");
-        let stored: Vec<String> = stmt
-            .query_map([], |row| row.get(0))
-            .expect("query")
-            .collect::<duckdb::Result<Vec<String>>>()
-            .expect("rows");
+        // Pinned so the rendered instant is read back in the frame it was written in, rather
+        // than in whatever zone the host happens to be set to.
+        let stored: Vec<String> = one_column(
+            &[
+                "SET TimeZone='UTC'".to_string(),
+                "CREATE TABLE t (id INTEGER, ts TIMESTAMPTZ)".to_string(),
+                "INSERT INTO t VALUES (1, '2020-01-01 00:00:00+00')".to_string(),
+                update_statement(&TableReference::bare("t"), &set_clause, None),
+            ],
+            "SELECT ts::VARCHAR FROM t",
+        );
 
         assert_eq!(stored, vec!["2026-01-01 00:00:00.000999+00".to_string()]);
     }
