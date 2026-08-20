@@ -45,6 +45,16 @@ pub enum Error {
     #[snafu(display("No builder found for index {index}"))]
     NoBuilderForIndex { index: usize },
 
+    #[snafu(display(
+        "Failed to read column '{column}': a value has {value_scale} decimal places but the column carries {column_scale}, so returning it would drop digits it actually holds. \
+        Declare the column as NUMERIC(38, {value_scale}) or wider at the source."
+    ))]
+    NumericScaleTooWide {
+        column: String,
+        value_scale: u32,
+        column_scale: u32,
+    },
+
     #[snafu(display("Failed to downcast builder for {postgres_type}"))]
     FailedToDowncastBuilder { postgres_type: String },
 
@@ -237,6 +247,32 @@ macro_rules! append_composite_fields_to_struct {
     }};
 }
 
+/// Arrow type for a PostgreSQL `NUMERIC` whose precision and scale the schema
+/// does not declare.
+///
+/// An unconstrained `NUMERIC` has no column-level precision or scale at all —
+/// every value carries its own — while an Arrow `Decimal128` column has exactly
+/// one of each, so a single pair has to stand for the whole column.
+///
+/// The catalog settles on this same pair (`pg_data_type_to_arrow_type`), and
+/// this is what a caller with no projected schema gets, so the two agree on the
+/// column rather than describing it differently.
+///
+/// The pair must not be read off the data. The schema a caller has here may
+/// come from sampling a single row (`infer_schema_from_data` runs
+/// `SELECT * FROM <table> LIMIT 1` when the catalog reports no columns), and a
+/// scale taken from one row pins the column to whatever that row happened to
+/// hold, silently rescaling every other value: `1.23456` beside a `1.5` comes
+/// back as `1.2`, and because a NULL carries no scale, a column sampled on a
+/// NULL row comes back with every fraction truncated. That sample is not stable
+/// either — `LIMIT 1` has no `ORDER BY`.
+///
+/// A fixed pair keeps the column deterministic and carries every value with up
+/// to 20 decimal places exactly. A value needing more is refused rather than
+/// rounded away (see `NumericScaleTooWide`).
+const NUMERIC_UNDECLARED_PRECISION: u8 = 38;
+const NUMERIC_UNDECLARED_SCALE: i8 = 20;
+
 /// Converts Postgres `Row`s to an Arrow `RecordBatch`. Assumes that all rows have the same schema and
 /// sets the schema based on the first row.
 ///
@@ -267,16 +303,23 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
             let mut numeric_scale: Option<u32> = None;
 
             let mut data_type = if *column_type == Type::NUMERIC {
-                if let Some(schema) = projected_schema.as_ref() {
-                    match get_decimal_column_precision_and_scale(column_name, schema) {
-                        Some((precision, scale)) => {
-                            numeric_scale = Some(u32::try_from(scale).unwrap_or_default());
-                            Some(DataType::Decimal128(precision, scale))
-                        }
-                        None => None,
+                let declared = projected_schema
+                    .as_ref()
+                    .and_then(|schema| get_decimal_column_precision_and_scale(column_name, schema));
+                match declared {
+                    Some((precision, scale)) => {
+                        numeric_scale = Some(u32::try_from(scale).unwrap_or_default());
+                        Some(DataType::Decimal128(precision, scale))
                     }
-                } else {
-                    None
+                    // Undeclared scale: see `NUMERIC_UNDECLARED_SCALE`.
+                    None => {
+                        numeric_scale =
+                            Some(u32::try_from(NUMERIC_UNDECLARED_SCALE).unwrap_or_default());
+                        Some(DataType::Decimal128(
+                            NUMERIC_UNDECLARED_PRECISION,
+                            NUMERIC_UNDECLARED_SCALE,
+                        ))
+                    }
                 }
             } else if *column_type == Type::NUMERIC_ARRAY {
                 if let Some(schema) = projected_schema.as_ref() {
@@ -581,9 +624,19 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         continue;
                     };
 
-                    // Record Batch Scale is determined by first row, while Postgres Numeric Type doesn't have fixed scale
-                    // Resolve scale difference for incoming records
+                    // Every value of the column lands on one scale (see
+                    // `widest_numeric_scale`). Widening is exact; narrowing
+                    // would hand back a number the source never held, so refuse
+                    // rather than round it away.
                     let dest_scale = postgres_numeric_scale.unwrap_or_default();
+                    ensure!(
+                        v.scale() <= dest_scale,
+                        NumericScaleTooWideSnafu {
+                            column: column_names.get(i).cloned().unwrap_or_default(),
+                            value_scale: v.scale(),
+                            column_scale: dest_scale,
+                        }
+                    );
                     v.rescale(dest_scale);
                     dec_builder.append_value(v.mantissa());
                 }

@@ -194,6 +194,7 @@ async fn test_arrow_postgres_one_way(container_manager: &Mutex<ContainerManager>
 
     test_postgres_enum_type(container_manager.port).await;
     test_postgres_numeric_type(container_manager.port).await;
+    test_postgres_undeclared_numeric_scale(container_manager.port).await;
     test_postgres_numeric_array_type(container_manager.port).await;
     test_postgres_jsonb_type(container_manager.port).await;
     test_postgres_nullability_constraints(container_manager.port).await;
@@ -379,6 +380,61 @@ async fn test_postgres_numeric_type(port: usize) {
         create_table_stmt,
         insert_table_stmt,
         extra_stmt,
+        expected_record,
+        UnsupportedTypeAction::default(),
+    )
+    .await;
+}
+
+/// An undeclared `NUMERIC` column serves every value at scale 20, whatever the
+/// first row happens to hold — including a NULL, which carries no scale at all.
+///
+/// This pins the catalog-driven default (`numeric` -> `Decimal128(38, 20)`)
+/// end to end, so that a column whose values have differing scales, or whose
+/// first row is NULL, cannot start taking its scale from the data. Reading the
+/// scale off a row is what the `projected_schema: None` path in `rows_to_arrow`
+/// does, and it is why that path pins the same 38/20 rather than sampling.
+async fn test_postgres_undeclared_numeric_scale(port: usize) {
+    let create_table_stmt = "
+    CREATE TABLE undeclared_numeric (
+    amount NUMERIC  -- no precision or scale
+);";
+
+    // The first row is NULL on purpose: it is what `LIMIT 1` returns, and it
+    // carries no scale of its own for the column to inherit.
+    let insert_table_stmt = "
+    INSERT INTO undeclared_numeric (amount) VALUES
+(NULL),
+(1.23456),
+(1.5);
+    ";
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "amount",
+        DataType::Decimal128(38, 20),
+        true,
+    )]));
+
+    let expected_record = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(
+            Decimal128Array::from(vec![
+                None,
+                Some(123_456_000_000_000_000_000i128),
+                Some(150_000_000_000_000_000_000i128),
+            ])
+            .with_precision_and_scale(38, 20)
+            .expect("valid decimal precision and scale"),
+        )],
+    )
+    .expect("Failed to created arrow record batch");
+
+    arrow_postgres_one_way(
+        port,
+        "undeclared_numeric",
+        create_table_stmt,
+        insert_table_stmt,
+        None,
         expected_record,
         UnsupportedTypeAction::default(),
     )
