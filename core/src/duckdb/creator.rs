@@ -7,7 +7,6 @@ use arrow::{
     datatypes::SchemaRef,
     ffi_stream::FFI_ArrowArrayStream,
 };
-use datafusion::common::utils::quote_identifier;
 use datafusion::common::Constraints;
 use datafusion::sql::TableReference;
 use duckdb::Transaction;
@@ -18,6 +17,7 @@ use std::fmt::Display;
 use std::sync::{Arc, Mutex};
 
 use super::DuckDB;
+use crate::sql::sql_provider_datafusion::expr;
 use crate::util::{
     column_reference::ColumnReference, constraints::get_primary_keys_from_constraints,
     indexes::IndexType,
@@ -38,6 +38,21 @@ impl RelationName {
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
     }
+
+    #[must_use]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Renders the name as a double-quoted DuckDB identifier, doubling any embedded quote.
+    ///
+    /// Every statement this module builds by hand names its relation through here rather than
+    /// interpolating [`Display`], so that a quote in a dataset name cannot close the identifier
+    /// early and widen the statement.
+    #[must_use]
+    pub(crate) fn quoted(&self) -> String {
+        expr::quoted_identifier(&self.0)
+    }
 }
 
 impl From<TableReference> for RelationName {
@@ -45,6 +60,17 @@ impl From<TableReference> for RelationName {
         RelationName(table_ref.to_string())
     }
 }
+
+/// Restricts a DuckDB catalog view to the database and schema that a bare table reference
+/// resolves in.
+///
+/// `duckdb_tables()`, `duckdb_indexes()` and `duckdb_constraints()` each span *every* attached
+/// database, while the tables this module creates are named bare and therefore live in
+/// `current_database().current_schema()`. Matching on `table_name` alone lets an attached
+/// database — one the `attach_databases` parameter added, or the staging file the accelerator's
+/// swap path attaches — answer for a table of the same name that this module does not manage.
+const CURRENT_CATALOG_SCOPE: &str =
+    "database_name = current_database() AND schema_name = current_schema()";
 
 /// A table definition, which includes the table name, schema, constraints, and indexes.
 /// This is used to store the definition of a table for a dataset, and can be re-used to create one or more tables (like internal data tables).
@@ -172,7 +198,9 @@ impl TableDefinition {
     /// If the transaction fails to query for whether the table exists.
     pub fn has_table(&self, tx: &Transaction<'_>) -> super::Result<bool> {
         let mut stmt = tx
-            .prepare("SELECT 1 FROM duckdb_tables() WHERE table_name = ?")
+            .prepare(&format!(
+                "SELECT 1 FROM duckdb_tables() WHERE {CURRENT_CATALOG_SCOPE} AND table_name = ?"
+            ))
             .context(super::UnableToQueryDataSnafu)?;
         let mut rows = stmt
             .query([self.name.to_string()])
@@ -193,10 +221,17 @@ impl TableDefinition {
         &self,
         tx: &Transaction<'_>,
     ) -> super::Result<Vec<(RelationName, u64)>> {
-        // list all related internal tables, based on the table definition name
+        // list all related internal tables, based on the table definition name. The prefix is
+        // matched as a string literal, so an apostrophe in the dataset name needs the literal
+        // escape. `_` and `%` in the name stay wildcards and can over-match, which the name check
+        // below rejects.
         let sql = format!(
-            "select table_name from duckdb_tables() where table_name LIKE '__data_{table_name}%'",
-            table_name = self.name
+            "select table_name from duckdb_tables() \
+             where {CURRENT_CATALOG_SCOPE} and table_name LIKE {prefix}",
+            prefix = expr::string_literal(
+                &format!("__data_{table_name}%", table_name = self.name),
+                Some(expr::Engine::DuckDB)
+            )
         );
         let mut stmt = tx.prepare(&sql).context(super::UnableToQueryDataSnafu)?;
         let mut rows = stmt.query([]).context(super::UnableToQueryDataSnafu)?;
@@ -299,7 +334,9 @@ impl TableManager {
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn base_table(&self, tx: &Transaction<'_>) -> super::Result<Option<Self>> {
         let mut stmt = tx
-            .prepare("SELECT 1 FROM duckdb_tables() WHERE table_name = ?")
+            .prepare(&format!(
+                "SELECT 1 FROM duckdb_tables() WHERE {CURRENT_CATALOG_SCOPE} AND table_name = ?"
+            ))
             .context(super::UnableToQueryDataSnafu)?;
         let mut rows = stmt
             .query([self.definition_name().to_string()])
@@ -370,7 +407,7 @@ impl TableManager {
     fn drop_table(&self, tx: &Transaction<'_>) -> super::Result<()> {
         // drop this table
         tx.execute(
-            &format!(r#"DROP TABLE IF EXISTS "{}""#, self.table_name()),
+            &format!("DROP TABLE IF EXISTS {}", self.table_name().quoted()),
             [],
         )
         .context(super::UnableToDropDuckDBTableSnafu)?;
@@ -389,9 +426,9 @@ impl TableManager {
     ) -> super::Result<u64> {
         // insert from this table, into the target table
         let mut insert_sql = format!(
-            r#"INSERT INTO "{}" SELECT * FROM "{}""#,
-            table.table_name(),
-            self.table_name()
+            "INSERT INTO {} SELECT * FROM {}",
+            table.table_name().quoted(),
+            self.table_name().quoted()
         );
 
         if let Some(on_conflict) = on_conflict {
@@ -450,7 +487,10 @@ impl TableManager {
         let table_name = self.table_name();
         let index_name = TableManager::get_index_name(table_name, &index);
 
-        let sql = format!(r#"DROP INDEX IF EXISTS "{index_name}""#);
+        let sql = format!(
+            "DROP INDEX IF EXISTS {}",
+            expr::quoted_identifier(&index_name)
+        );
         tracing::debug!("{sql}");
 
         tx.execute(&sql, [])
@@ -493,16 +533,26 @@ impl TableManager {
         tx.register_arrow_scan_view(&view_name, &stream)
             .context(super::UnableToRegisterArrowScanViewForTableCreationSnafu)?;
 
-        let sql =
-            format!(r#"CREATE TABLE IF NOT EXISTS "{table_name}" AS SELECT * FROM "{view_name}""#,);
+        let sql = format!(
+            "CREATE TABLE IF NOT EXISTS {} AS SELECT * FROM {}",
+            table_name.quoted(),
+            expr::quoted_identifier(&view_name)
+        );
         tracing::debug!("{sql}");
 
         tx.execute(&sql, [])
             .context(super::UnableToCreateDuckDBTableSnafu)?;
 
+        // `duckdb_tables()` matches on the table's *name*, so the name is a string literal here
+        // rather than an identifier, and needs the literal escape instead of the quoted one.
         let create_stmt = tx
             .query_row(
-                &format!("select sql from duckdb_tables() where table_name = '{table_name}'",),
+                &format!(
+                    "select sql from duckdb_tables() \
+                     where {CURRENT_CATALOG_SCOPE} and table_name = {table_name}",
+                    table_name =
+                        expr::string_literal(table_name.as_str(), Some(expr::Engine::DuckDB))
+                ),
                 [],
                 |r| r.get::<usize, String>(0),
             )
@@ -554,8 +604,8 @@ impl TableManager {
         tx.execute(
             &format!(
                 "CREATE OR REPLACE VIEW {base_table} AS SELECT * FROM {internal_table}",
-                base_table = quote_identifier(&self.definition_name().to_string()),
-                internal_table = quote_identifier(&self.table_name().to_string())
+                base_table = self.definition_name().quoted(),
+                internal_table = self.table_name().quoted()
             ),
             [],
         )
@@ -570,13 +620,37 @@ impl TableManager {
         &self,
         tx: &Transaction<'_>,
     ) -> super::Result<HashSet<String>> {
-        // DuckDB provides convenient queryable 'pragma_table_info' table function
-        // Complex table name with schema as part of the name must be quoted as
-        // '"<name>"', otherwise it will be parsed to schema and table name
-        let sql = format!(
-            "SELECT name FROM pragma_table_info('{table_name}') WHERE pk = true",
-            table_name = quote_identifier(&self.table_name().to_string())
-        );
+        let table_name = self.table_name();
+        let sql = if table_name.as_str().contains('"') {
+            // `pragma_table_info` re-parses its argument with DuckDB's own qualified-name parser,
+            // and that parser rejects the doubled quote an escaped identifier carries
+            // ("Unterminated quote in qualified name"), so no escaping at this call site can
+            // address a name holding a `"`. `duckdb_constraints.table_name` is an ordinary string
+            // column, which needs no identifier parsing at all.
+            //
+            // It is the fallback rather than the only path because it costs a scan over every
+            // constraint in every attached database: measured against 100 tables it takes ~8ms to
+            // the pragma's ~0.8ms, and it grows with the table count while the pragma stays flat.
+            // This lookup runs on every append, so the common name keeps the constant-time path.
+            //
+            // The view also spans every attachment — and the file-swap path does attach a second
+            // database — so it is narrowed to the database and schema a bare table reference
+            // resolves in, which is what the pragma resolved through.
+            format!(
+                "SELECT unnest(constraint_column_names) FROM duckdb_constraints() \
+                 WHERE {CURRENT_CATALOG_SCOPE} \
+                 AND table_name = {table_name} AND constraint_type = 'PRIMARY KEY'",
+                table_name = expr::string_literal(table_name.as_str(), Some(expr::Engine::DuckDB))
+            )
+        } else {
+            // A name carrying a dot must stay a single identifier rather than split into
+            // schema.table, so the quoted identifier is nested inside the string literal and needs
+            // the literal escape as well as the identifier one.
+            format!(
+                "SELECT name FROM pragma_table_info({table_name}) WHERE pk = true",
+                table_name = expr::string_literal(&table_name.quoted(), Some(expr::Engine::DuckDB))
+            )
+        };
         tracing::debug!("{sql}");
 
         let mut stmt = tx
@@ -598,9 +672,13 @@ impl TableManager {
     /// Returns the current indexes in database for this table.
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn current_indexes(&self, tx: &Transaction<'_>) -> super::Result<HashSet<String>> {
+        // `duckdb_indexes.table_name` holds the table's name, so it is matched as a string
+        // literal here rather than named as an identifier.
         let sql = format!(
-            "SELECT index_name FROM duckdb_indexes WHERE table_name = '{table_name}'",
-            table_name = &self.table_name().to_string()
+            "SELECT index_name FROM duckdb_indexes() \
+             WHERE {CURRENT_CATALOG_SCOPE} AND table_name = {table_name}",
+            table_name =
+                expr::string_literal(self.table_name().as_str(), Some(expr::Engine::DuckDB))
         );
 
         tracing::debug!("{sql}");
@@ -753,7 +831,7 @@ impl TableManager {
     pub fn current_schema(&self, tx: &Transaction<'_>) -> super::Result<SchemaRef> {
         let sql = format!(
             "SELECT * FROM {table_name} LIMIT 0",
-            table_name = quote_identifier(&self.table_name().to_string())
+            table_name = self.table_name().quoted()
         );
         let mut stmt = tx.prepare(&sql).context(super::UnableToQueryDataSnafu)?;
         let result: duckdb::Arrow<'_> = stmt
@@ -765,7 +843,7 @@ impl TableManager {
     pub fn get_row_count(&self, tx: &Transaction<'_>) -> super::Result<u64> {
         let sql = format!(
             "SELECT COUNT(1) FROM {table_name}",
-            table_name = quote_identifier(&self.table_name().to_string())
+            table_name = self.table_name().quoted()
         );
         let count = tx
             .query_row(&sql, [], |r| r.get::<usize, u64>(0))
@@ -800,9 +878,9 @@ impl ViewCreator {
     ) -> super::Result<u64> {
         // insert from this view, into the target table
         let mut insert_sql = format!(
-            r#"INSERT INTO "{table_name}" SELECT * FROM "{view_name}""#,
-            view_name = self.name,
-            table_name = table.table_name()
+            "INSERT INTO {table_name} SELECT * FROM {view_name}",
+            view_name = self.name.quoted(),
+            table_name = table.table_name().quoted()
         );
 
         if let Some(on_conflict) = on_conflict {
@@ -821,14 +899,8 @@ impl ViewCreator {
 
     pub fn drop(&self, tx: &Transaction<'_>) -> super::Result<()> {
         // drop this view
-        tx.execute(
-            &format!(
-                r#"DROP VIEW IF EXISTS "{view_name}""#,
-                view_name = self.name
-            ),
-            [],
-        )
-        .context(super::UnableToDropDuckDBTableSnafu)?;
+        tx.execute(&format!("DROP VIEW IF EXISTS {}", self.name.quoted()), [])
+            .context(super::UnableToDropDuckDBTableSnafu)?;
 
         Ok(())
     }
@@ -1630,6 +1702,586 @@ pub(crate) mod tests {
             .expect("to verify indexes match");
 
         assert!(indexes_match);
+
+        tx.rollback().expect("should rollback transaction");
+    }
+
+    #[test]
+    fn test_relation_name_quoted_escapes_an_embedded_quote() {
+        assert_eq!(RelationName::new("plain").quoted(), r#""plain""#);
+        // A dot must stay inside the identifier rather than splitting it into schema.table.
+        assert_eq!(RelationName::new("sch.tbl").quoted(), r#""sch.tbl""#);
+        // The whole point: the quote is doubled, so it cannot close the identifier early.
+        assert_eq!(RelationName::new(r#"wi"th"#).quoted(), r#""wi""th""#);
+        assert_eq!(RelationName::new(r#"a"b"c"#).quoted(), r#""a""b""c""#);
+        // A backslash carries no meaning inside a quoted identifier and must pass through.
+        assert_eq!(RelationName::new(r"back\slash").quoted(), r#""back\slash""#);
+        assert_eq!(RelationName::new("").quoted(), r#""""#);
+    }
+
+    /// Every statement `TableManager` and `ViewCreator` build by hand names their relation by
+    /// interpolation, so a quote in the dataset name used to close the identifier early and
+    /// leave a statement that either fails to parse or names a different table. Drives the whole
+    /// lifecycle against real DuckDB with a name carrying both a quote and a dot.
+    #[tokio::test]
+    async fn test_quote_bearing_table_name_survives_the_creator_lifecycle() {
+        let _guard = init_tracing(None);
+        let pool = get_mem_duckdb();
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("name", arrow::datatypes::DataType::Utf8, false),
+        ]));
+        let table_definition = Arc::new(
+            TableDefinition::new(RelationName::new(r#"we"ird.tbl"#), Arc::clone(&schema))
+                .with_indexes(vec![(
+                    ColumnReference::try_from("name").expect("valid column reference"),
+                    IndexType::Enabled,
+                )]),
+        );
+
+        let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
+        let conn = pool_conn
+            .as_any_mut()
+            .downcast_mut::<DuckDbConnection>()
+            .expect("to downcast to duckdb connection");
+        let tx = conn
+            .get_underlying_conn_mut()
+            .transaction()
+            .expect("should begin transaction");
+
+        // `create_table` runs `get_table_create_statement`, which names the table as an
+        // identifier in the `CREATE TABLE` and as a string literal in the `duckdb_tables()`
+        // lookup — two different escapes on the same name.
+        let table = TableManager::new(Arc::clone(&table_definition))
+            .with_internal(true)
+            .expect("to create table manager");
+        table
+            .create_table(Arc::clone(&pool), &tx)
+            .expect("to create a table whose name holds a quote");
+
+        assert_eq!(table.get_row_count(&tx).expect("to count rows"), 0);
+        assert!(table
+            .current_schema(&tx)
+            .expect("to read the schema back")
+            .fields()
+            .iter()
+            .any(|f| f.name() == "id"));
+        table.create_indexes(&tx).expect("to create indexes");
+        table.create_view(&tx).expect("to create the view");
+
+        // Insert through a `ViewCreator`, which names both the view and the target table.
+        tx.execute(
+            &format!(
+                "CREATE OR REPLACE VIEW {} AS SELECT 1::BIGINT AS id, 'a' AS name",
+                RelationName::new(r#"src"view"#).quoted()
+            ),
+            [],
+        )
+        .expect("to create the source view");
+        let rows = ViewCreator::from_name(RelationName::new(r#"src"view"#))
+            .insert_into(&table, &tx, None)
+            .expect("to insert through a quote-bearing view name");
+        assert_eq!(rows, 1);
+        assert_eq!(table.get_row_count(&tx).expect("to count rows"), 1);
+
+        ViewCreator::from_name(RelationName::new(r#"src"view"#))
+            .drop(&tx)
+            .expect("to drop the source view");
+
+        // `delete_table` drops the indexes (whose names embed the table name) then the table.
+        table.delete_table(&tx).expect("to drop indexes and table");
+        assert!(
+            table.get_row_count(&tx).is_err(),
+            "the table should be gone after delete_table"
+        );
+
+        tx.rollback().expect("should rollback transaction");
+    }
+
+    /// Two sites name the table inside a *string literal* rather than as an identifier: the
+    /// `duckdb_tables()` lookup in `get_table_create_statement`, and the `pragma_table_info`
+    /// argument in `current_primary_keys`. An apostrophe closed those literals early and the
+    /// statement failed to parse.
+    #[tokio::test]
+    async fn test_apostrophe_table_name_reaches_the_catalog_lookups() {
+        let _guard = init_tracing(None);
+        let pool = get_mem_duckdb();
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let table_definition = Arc::new(
+            TableDefinition::new(RelationName::new("o'brien"), Arc::clone(&schema))
+                .with_constraints(get_pk_constraints(&["id"], Arc::clone(&schema)))
+                .with_indexes(vec![(
+                    ColumnReference::try_from("id").expect("valid column reference"),
+                    IndexType::Enabled,
+                )]),
+        );
+
+        let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
+        let conn = pool_conn
+            .as_any_mut()
+            .downcast_mut::<DuckDbConnection>()
+            .expect("to downcast to duckdb connection");
+        let tx = conn
+            .get_underlying_conn_mut()
+            .transaction()
+            .expect("should begin transaction");
+
+        let table = TableManager::new(Arc::clone(&table_definition))
+            .with_internal(true)
+            .expect("to create table manager");
+        table
+            .create_table(Arc::clone(&pool), &tx)
+            .expect("to create a table whose name holds an apostrophe");
+
+        assert_eq!(table.get_row_count(&tx).expect("to count rows"), 0);
+        assert!(table
+            .current_primary_keys(&tx)
+            .expect("to read primary keys back through pragma_table_info")
+            .contains("id"));
+
+        // `current_indexes` matches `duckdb_indexes.table_name` as a literal too.
+        table.create_indexes(&tx).expect("to create indexes");
+        assert_eq!(
+            table
+                .current_indexes(&tx)
+                .expect("to read indexes back through duckdb_indexes")
+                .len(),
+            1
+        );
+
+        tx.rollback().expect("should rollback transaction");
+    }
+
+    /// `current_primary_keys` addressed the table through `pragma_table_info`, whose argument
+    /// DuckDB re-parses as a qualified name. No escaping reaches that parser: the doubled quote of
+    /// an escaped identifier is rejected outright, so the primary-key drift check could not read
+    /// back a table whose name holds a `"`. A `"` now selects the `duckdb_constraints()` fallback.
+    ///
+    /// Runs one identical table under several names, so the two lookups are held to the same
+    /// answer rather than only to their own: a `"` (the fallback), a `"` alongside an apostrophe
+    /// (the fallback, whose own argument is a string literal the apostrophe would close), a dot
+    /// (the pragma, whose argument must stay one identifier rather than split into schema.table),
+    /// an apostrophe alone (the pragma's literal), and a plain name.
+    #[tokio::test]
+    async fn test_both_primary_key_lookups_agree_on_an_awkward_table_name() {
+        let _guard = init_tracing(None);
+
+        for name in [
+            r#"we"ird.tbl"#,
+            r#"o'br"ien.tbl"#,
+            "sch.dotted",
+            "o'brien",
+            "plain",
+        ] {
+            let pool = get_mem_duckdb();
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+                arrow::datatypes::Field::new("part", arrow::datatypes::DataType::Int64, false),
+                arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Utf8, true),
+            ]));
+            let table_definition = Arc::new(
+                TableDefinition::new(RelationName::new(name), Arc::clone(&schema))
+                    .with_constraints(get_pk_constraints(&["id", "part"], Arc::clone(&schema))),
+            );
+
+            let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
+            let conn = pool_conn
+                .as_any_mut()
+                .downcast_mut::<DuckDbConnection>()
+                .expect("to downcast to duckdb connection");
+            let tx = conn
+                .get_underlying_conn_mut()
+                .transaction()
+                .expect("should begin transaction");
+
+            // Built by hand rather than through `create_table` so the table carries constraints the
+            // primary key does not cover: `duckdb_constraints()` holds one row per constraint of
+            // every kind, so the fallback has to pick out the PRIMARY KEY rows. A UNIQUE column and
+            // a NOT NULL column outside the key are the two other kinds these tables can carry.
+            let table = TableManager::from_table_name(
+                Arc::clone(&table_definition),
+                RelationName::new(name),
+            );
+            tx.execute(
+                &format!(
+                    "CREATE TABLE {table} (\
+                     id BIGINT, part BIGINT, payload VARCHAR UNIQUE, tag VARCHAR NOT NULL, \
+                     PRIMARY KEY (id, part))",
+                    table = table.table_name().quoted(),
+                ),
+                [],
+            )
+            .unwrap_or_else(|e| panic!("should create a table named {name:?}: {e}"));
+
+            assert_eq!(
+                table
+                    .current_primary_keys(&tx)
+                    .unwrap_or_else(|e| panic!("should read the primary keys of {name:?}: {e}")),
+                ["id".to_string(), "part".to_string()]
+                    .into_iter()
+                    .collect::<HashSet<String>>(),
+                "for {name:?}, both primary-key columns come back and neither the UNIQUE nor the \
+                 NOT NULL column does"
+            );
+
+            // The drift check itself, which is the only caller, must agree.
+            assert!(
+                table
+                    .verify_primary_keys_match(&table, &tx)
+                    .expect("to compare primary keys"),
+                "the drift check must see no drift for {name:?}"
+            );
+
+            tx.rollback().expect("should rollback transaction");
+        }
+    }
+
+    /// Attaches a second in-memory database to `conn` under the alias `staging`, holding a table
+    /// named `decoy_name` with a column no definition in these tests declares.
+    ///
+    /// This is the shape both the `attach_databases` parameter and the accelerator's file-swap
+    /// staging file produce: a catalog the connection can see but a bare `CREATE TABLE` never
+    /// lands in.
+    fn attach_decoy_database(conn: &mut DuckDbConnection, decoy_name: &RelationName) {
+        let raw = conn.get_underlying_conn_mut();
+        raw.execute("ATTACH ':memory:' AS staging", [])
+            .expect("to attach a second database");
+        raw.execute(
+            &format!(
+                "CREATE TABLE staging.main.{decoy} (decoy VARCHAR)",
+                decoy = decoy_name.quoted()
+            ),
+            [],
+        )
+        .expect("to create the decoy table");
+    }
+
+    /// Creates a same-named decoy table in another schema of the *current* database. Bare names
+    /// resolve in `current_schema()`, so this table is not the one the creator manages either —
+    /// and `duckdb_tables()` lists it ahead of `main`.
+    fn create_decoy_in_another_schema(conn: &mut DuckDbConnection, decoy_name: &RelationName) {
+        let raw = conn.get_underlying_conn_mut();
+        raw.execute("CREATE SCHEMA elsewhere", [])
+            .expect("to create a second schema");
+        raw.execute(
+            &format!(
+                "CREATE TABLE elsewhere.{decoy} (decoy VARCHAR)",
+                decoy = decoy_name.quoted()
+            ),
+            [],
+        )
+        .expect("to create the decoy table");
+    }
+
+    /// A dataset whose table does not exist yet, but whose name an attached database also uses.
+    /// `make_initial_table` reads `has_table` and `list_internal_tables` to decide whether to
+    /// create anything, so an unscoped lookup leaves the dataset with no table at all.
+    #[tokio::test]
+    async fn test_table_existence_checks_ignore_an_attached_databases_same_named_table() {
+        let _guard = init_tracing(None);
+        let pool = get_mem_duckdb();
+
+        let table_definition = get_basic_table_definition();
+        let internal = TableManager::new(Arc::clone(&table_definition))
+            .with_internal(true)
+            .expect("to create table manager");
+
+        let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
+        let conn = pool_conn
+            .as_any_mut()
+            .downcast_mut::<DuckDbConnection>()
+            .expect("to downcast to duckdb connection");
+
+        attach_decoy_database(conn, table_definition.name());
+        {
+            let raw = conn.get_underlying_conn_mut();
+            raw.execute(
+                &format!(
+                    "CREATE TABLE staging.main.{decoy} (decoy VARCHAR)",
+                    decoy = internal.table_name().quoted()
+                ),
+                [],
+            )
+            .expect("to create the decoy internal table");
+        }
+
+        let tx = conn
+            .get_underlying_conn_mut()
+            .transaction()
+            .expect("should begin transaction");
+
+        assert!(
+            !table_definition
+                .has_table(&tx)
+                .expect("to check whether the base table exists"),
+            "the attached database's same-named table must not answer for the base table"
+        );
+        assert!(
+            table_definition
+                .list_internal_tables(&tx)
+                .expect("to list internal tables")
+                .is_empty(),
+            "the attached database's internal tables must not be listed as this dataset's"
+        );
+
+        let base = TableManager::new(Arc::clone(&table_definition))
+            .with_internal(true)
+            .expect("to create table manager")
+            .base_table(&tx)
+            .expect("to look for a base table");
+        assert!(
+            base.is_none(),
+            "the attached database's same-named table must not answer for the base table lookup"
+        );
+
+        tx.rollback().expect("should rollback transaction");
+    }
+
+    /// The internal-table prefix is matched as a `LIKE` pattern, so an apostrophe in the dataset
+    /// name has to be escaped as a string literal or the statement does not parse.
+    #[tokio::test]
+    async fn test_list_internal_tables_matches_a_name_holding_an_apostrophe() {
+        let _guard = init_tracing(None);
+        let pool = get_mem_duckdb();
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let table_definition = Arc::new(TableDefinition::new(
+            RelationName::new("o'brien"),
+            Arc::clone(&schema),
+        ));
+
+        let internal = TableManager::new(Arc::clone(&table_definition))
+            .with_internal(true)
+            .expect("to create table manager");
+
+        let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
+        let conn = pool_conn
+            .as_any_mut()
+            .downcast_mut::<DuckDbConnection>()
+            .expect("to downcast to duckdb connection");
+        let tx = conn
+            .get_underlying_conn_mut()
+            .transaction()
+            .expect("should begin transaction");
+
+        internal
+            .create_table(Arc::clone(&pool), &tx)
+            .expect("to create the table");
+
+        assert_eq!(
+            table_definition
+                .list_internal_tables(&tx)
+                .expect("to list the internal tables of a name holding an apostrophe")
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            vec![internal.table_name().clone()],
+            "the dataset's own internal table comes back for a name holding an apostrophe"
+        );
+
+        tx.rollback().expect("should rollback transaction");
+    }
+
+    /// `create_table` reads the DDL DuckDB generated for the table it just created back out of
+    /// `duckdb_tables()`. An attached database holding that same name contributes a second row,
+    /// and the row the lookup picks decides the columns the dataset's table is created with.
+    ///
+    /// The decoy sits in another *schema* of the same database, which `duckdb_tables()` lists
+    /// ahead of `main`, so an unscoped lookup reads the decoy's DDL rather than the table it just
+    /// created.
+    #[tokio::test]
+    async fn test_create_table_reads_back_its_own_ddl_not_another_schemas() {
+        let _guard = init_tracing(None);
+        let pool = get_mem_duckdb();
+
+        let table_definition = get_basic_table_definition();
+        let internal = TableManager::new(Arc::clone(&table_definition))
+            .with_internal(true)
+            .expect("to create table manager");
+
+        let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
+        let conn = pool_conn
+            .as_any_mut()
+            .downcast_mut::<DuckDbConnection>()
+            .expect("to downcast to duckdb connection");
+
+        create_decoy_in_another_schema(conn, internal.table_name());
+
+        let tx = conn
+            .get_underlying_conn_mut()
+            .transaction()
+            .expect("should begin transaction");
+
+        internal
+            .create_table(Arc::clone(&pool), &tx)
+            .expect("to create the table");
+
+        let created = internal
+            .current_schema(&tx)
+            .expect("to read the created table's schema");
+        assert_eq!(
+            created
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
+            table_definition
+                .schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
+            "the table is created from its own DDL, not from the other schema's decoy"
+        );
+
+        tx.rollback().expect("should rollback transaction");
+    }
+
+    /// `duckdb_indexes()` spans every attached database too, and the write path skips creating
+    /// indexes when it believes the table already has them.
+    #[tokio::test]
+    async fn test_current_indexes_ignores_an_attached_databases_index() {
+        let _guard = init_tracing(None);
+        let pool = get_mem_duckdb();
+
+        let table_definition = get_basic_table_definition();
+        let internal = TableManager::new(Arc::clone(&table_definition))
+            .with_internal(true)
+            .expect("to create table manager");
+
+        let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
+        let conn = pool_conn
+            .as_any_mut()
+            .downcast_mut::<DuckDbConnection>()
+            .expect("to downcast to duckdb connection");
+
+        attach_decoy_database(conn, internal.table_name());
+        {
+            let raw = conn.get_underlying_conn_mut();
+            raw.execute(
+                &format!(
+                    "CREATE INDEX decoy_index ON staging.main.{decoy} (decoy)",
+                    decoy = internal.table_name().quoted()
+                ),
+                [],
+            )
+            .expect("to create the decoy index");
+        }
+
+        let tx = conn
+            .get_underlying_conn_mut()
+            .transaction()
+            .expect("should begin transaction");
+
+        internal
+            .create_table(Arc::clone(&pool), &tx)
+            .expect("to create the table");
+
+        assert!(
+            internal
+                .current_indexes(&tx)
+                .expect("to read the current indexes")
+                .is_empty(),
+            "the attached database's index must not count as this table's"
+        );
+
+        tx.rollback().expect("should rollback transaction");
+    }
+
+    /// The scope is a database *and* a schema: a bare table reference resolves in
+    /// `current_schema()`, so a same-named table in another schema of the same database must not
+    /// answer either.
+    #[tokio::test]
+    async fn test_table_existence_checks_ignore_another_schemas_same_named_table() {
+        let _guard = init_tracing(None);
+        let pool = get_mem_duckdb();
+
+        let table_definition = get_basic_table_definition();
+
+        let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
+        let conn = pool_conn
+            .as_any_mut()
+            .downcast_mut::<DuckDbConnection>()
+            .expect("to downcast to duckdb connection");
+
+        create_decoy_in_another_schema(conn, table_definition.name());
+
+        let tx = conn
+            .get_underlying_conn_mut()
+            .transaction()
+            .expect("should begin transaction");
+
+        assert!(
+            !table_definition
+                .has_table(&tx)
+                .expect("to check whether the base table exists"),
+            "another schema's same-named table must not answer for the base table"
+        );
+
+        tx.rollback().expect("should rollback transaction");
+    }
+
+    /// `duckdb_constraints()` spans every attached database and schema, unlike the
+    /// `pragma_table_info` path it falls back from, which resolves the name the way a query would.
+    /// The accelerator's file-swap path attaches a second database, so an unconstrained lookup
+    /// would read another attachment's same-named table and report the wrong primary keys.
+    ///
+    /// The name carries a `"` so that the fallback — the only path with this exposure — is the one
+    /// under test.
+    #[tokio::test]
+    async fn test_primary_key_lookup_ignores_an_attached_databases_same_named_table() {
+        let _guard = init_tracing(None);
+        let pool = get_mem_duckdb();
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let table_definition = Arc::new(
+            TableDefinition::new(RelationName::new(r#"col"lides"#), Arc::clone(&schema))
+                .with_constraints(get_pk_constraints(&["id"], Arc::clone(&schema))),
+        );
+
+        let table = TableManager::new(Arc::clone(&table_definition))
+            .with_internal(true)
+            .expect("to create table manager");
+
+        let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
+        let conn = pool_conn
+            .as_any_mut()
+            .downcast_mut::<DuckDbConnection>()
+            .expect("to downcast to duckdb connection");
+
+        // A second database holding a table of the same name, with a *different* primary key.
+        let raw = conn.get_underlying_conn_mut();
+        raw.execute("ATTACH ':memory:' AS staging", [])
+            .expect("to attach a second database");
+        raw.execute(
+            &format!(
+                "CREATE TABLE staging.main.{table} (decoy BIGINT PRIMARY KEY)",
+                table = table.table_name().quoted()
+            ),
+            [],
+        )
+        .expect("to create the decoy table");
+
+        let tx = raw.transaction().expect("should begin transaction");
+        table
+            .create_table(Arc::clone(&pool), &tx)
+            .expect("to create the table");
+
+        assert_eq!(
+            table
+                .current_primary_keys(&tx)
+                .expect("to read the primary keys"),
+            ["id".to_string()].into_iter().collect::<HashSet<String>>(),
+            "the attached database's same-named table must not contribute its primary key"
+        );
 
         tx.rollback().expect("should rollback transaction");
     }

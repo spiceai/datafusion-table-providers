@@ -1164,14 +1164,29 @@ impl IndexBuilder {
 
     #[must_use]
     pub fn build_mysql(self) -> String {
-        self.build(MysqlQueryBuilder)
+        self.build_quoted_with(MysqlQueryBuilder, '`')
     }
 
+    /// Builds the statement quoting identifiers with `"`, which is what every dialect here uses
+    /// except MySQL — see [`IndexBuilder::build_mysql`].
     #[must_use]
     pub fn build<T: GenericBuilder>(self, query_builder: T) -> String {
+        self.build_quoted_with(query_builder, '"')
+    }
+
+    /// `quote` is the character `query_builder` wraps identifiers in.
+    ///
+    /// The index name needs it because `sea-query` writes that one name into the statement
+    /// verbatim, while the table and column names go through `Alias`, which doubles an embedded
+    /// quote. Pre-doubling here escapes the index name the same way, so a quote in the table name
+    /// (which [`IndexBuilder::index_name`] embeds) cannot close the identifier early. The
+    /// `index_name` accessor keeps returning the unescaped logical name, which is what the
+    /// drift comparison and `DROP INDEX` match against.
+    #[must_use]
+    fn build_quoted_with<T: GenericBuilder>(self, query_builder: T, quote: char) -> String {
         let mut index = Index::create();
         index.table(Alias::new(&self.table_name));
-        index.name(self.index_name());
+        index.name(self.index_name().replace(quote, &format!("{quote}{quote}")));
         if self.unique {
             index.unique();
         }
@@ -1688,5 +1703,33 @@ mod tests {
             sql,
             r#"CREATE UNIQUE INDEX IF NOT EXISTS "i_users_id_name" ON "users" ("id", "name")"#
         );
+    }
+
+    /// The index name embeds the table name, and `sea-query` writes that name into the statement
+    /// verbatim while escaping the table and column names it renders through `Alias` — so a quote
+    /// in the table name used to close the index identifier early and leave unparseable SQL.
+    ///
+    /// Asserting the rendered SQL also pins `sea-query`'s half of the contract: if it ever starts
+    /// escaping the index name itself, this fails rather than silently double-escaping.
+    #[test]
+    fn test_create_index_escapes_a_quote_in_the_index_name() {
+        let sql = IndexBuilder::new(r#"we"ird"#, vec![r#"co"l"#]).build_postgres();
+        assert_eq!(
+            sql,
+            r#"CREATE INDEX IF NOT EXISTS "i_we""ird_co""l" ON "we""ird" ("co""l")"#
+        );
+
+        let sql = IndexBuilder::new(r#"we"ird"#, vec!["id"]).build_sqlite();
+        assert_eq!(
+            sql,
+            r#"CREATE INDEX IF NOT EXISTS "i_we""ird_id" ON "we""ird" ("id")"#
+        );
+
+        // MySQL quotes with a backtick, so that is the character needing the doubling there —
+        // a double quote is an ordinary character inside a backtick-quoted name.
+        let sql = IndexBuilder::new("ba`ck", vec!["id"]).build_mysql();
+        assert_eq!(sql, "CREATE INDEX `i_ba``ck_id` ON `ba``ck` (`id`)");
+        let sql = IndexBuilder::new(r#"we"ird"#, vec!["id"]).build_mysql();
+        assert_eq!(sql, r#"CREATE INDEX `i_we"ird_id` ON `we"ird` (`id`)"#);
     }
 }
