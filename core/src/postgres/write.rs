@@ -87,13 +87,16 @@ impl TableProvider for PostgresTableWriter {
         op: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         // `InsertOp::Replace` promises an atomic per-row upsert (no delete leg).
-        // Postgres can only honor that with an `ON CONFLICT (...) DO UPDATE`
-        // target, which comes from `on_conflict`. Without one there is no
-        // conflict key to update on, so refuse rather than silently degrade to
-        // a plain append that would not replace existing rows.
-        if matches!(op, InsertOp::Replace) && self.on_conflict.is_none() {
+        // Postgres delivers that only with an `ON CONFLICT (...) DO UPDATE`,
+        // i.e. `OnConflict::Upsert`. A missing `on_conflict` (plain append) or a
+        // `DoNothing`/`DoNothingAll` (leaves the existing row unchanged) does
+        // NOT replace, so refuse rather than silently accept a non-replacing
+        // write.
+        if matches!(op, InsertOp::Replace)
+            && !matches!(self.on_conflict, Some(OnConflict::Upsert(_)))
+        {
             return not_impl_err!(
-                "InsertOp::Replace requires an on_conflict target on the Postgres writer, but none was configured"
+                "InsertOp::Replace requires an on_conflict upsert target on the Postgres writer"
             );
         }
         Ok(Arc::new(DataSinkExec::new(

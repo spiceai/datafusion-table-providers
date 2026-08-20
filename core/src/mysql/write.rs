@@ -72,13 +72,16 @@ impl TableProvider for MySQLTableWriter {
         input: Arc<dyn ExecutionPlan>,
         op: InsertOp,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        // `InsertOp::Replace` promises an atomic per-row upsert. MySQL can only
-        // honor that with an `ON DUPLICATE KEY UPDATE` clause, which comes from
-        // `on_conflict`. Without one there is no conflict key to update on, so
-        // refuse rather than silently degrade to a plain append.
-        if matches!(op, InsertOp::Replace) && self.on_conflict.is_none() {
+        // `InsertOp::Replace` promises an atomic per-row upsert. MySQL delivers
+        // that only with an `ON DUPLICATE KEY UPDATE`, i.e. `OnConflict::Upsert`.
+        // A missing `on_conflict` (plain append) or a `DoNothing`/`DoNothingAll`
+        // (leaves the existing row unchanged) does NOT replace, so refuse rather
+        // than silently accept a non-replacing write.
+        if matches!(op, InsertOp::Replace)
+            && !matches!(self.on_conflict, Some(OnConflict::Upsert(_)))
+        {
             return not_impl_err!(
-                "InsertOp::Replace requires an on_conflict target on the MySQL writer, but none was configured"
+                "InsertOp::Replace requires an on_conflict upsert target on the MySQL writer"
             );
         }
         Ok(Arc::new(DataSinkExec::new(
