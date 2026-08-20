@@ -19,6 +19,7 @@ use datafusion_federation::schema_cast::record_convert::try_cast_to;
 
 use datafusion_table_providers::{
     postgres::{DynPostgresConnectionPool, PostgresTableProviderFactory},
+    sql::arrow_sql_gen::postgres::rows_to_arrow,
     sql::sql_provider_datafusion::SqlTable,
     UnsupportedTypeAction,
 };
@@ -195,6 +196,7 @@ async fn test_arrow_postgres_one_way(container_manager: &Mutex<ContainerManager>
     test_postgres_enum_type(container_manager.port).await;
     test_postgres_numeric_type(container_manager.port).await;
     test_postgres_undeclared_numeric_scale(container_manager.port).await;
+    test_postgres_undeclared_numeric_without_projected_schema(container_manager.port).await;
     test_postgres_numeric_array_type(container_manager.port).await;
     test_postgres_jsonb_type(container_manager.port).await;
     test_postgres_nullability_constraints(container_manager.port).await;
@@ -439,6 +441,74 @@ async fn test_postgres_undeclared_numeric_scale(port: usize) {
         UnsupportedTypeAction::default(),
     )
     .await;
+}
+
+/// An undeclared `NUMERIC` gets the fixed 38/20 pair when there is no projected
+/// schema to take one from.
+///
+/// This is the branch `infer_schema_from_data` runs on (the fallback for when
+/// the catalog reports no columns), and the one that used to read the scale off
+/// the first row — a NULL there carries no scale, so the column came back as
+/// `Decimal128(38, 0)` with every fraction truncated.
+///
+/// Driven through `rows_to_arrow` directly on purpose: a table provider always
+/// hands down a projected schema, so nothing reachable through SQL exercises
+/// this branch.
+async fn test_postgres_undeclared_numeric_without_projected_schema(port: usize) {
+    let pool = common::get_postgres_connection_pool(port)
+        .await
+        .expect("Postgres connection pool should be created");
+    let db_conn = pool
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+
+    for stmt in [
+        "DROP TABLE IF EXISTS undeclared_numeric_raw",
+        "CREATE TABLE undeclared_numeric_raw (amount NUMERIC)",
+        // The NULL sorts first below, so it is the row a first-row scale would
+        // have been taken from.
+        "INSERT INTO undeclared_numeric_raw (amount) VALUES (NULL), (1.23456), (1.5)",
+    ] {
+        db_conn
+            .conn
+            .execute(stmt, &[])
+            .await
+            .expect("Postgres statement should run");
+    }
+
+    let rows = db_conn
+        .conn
+        .query(
+            "SELECT amount FROM undeclared_numeric_raw ORDER BY amount NULLS FIRST",
+            &[],
+        )
+        .await
+        .expect("Postgres rows should be returned");
+
+    let record_batch = rows_to_arrow(rows.as_slice(), &None).expect("Rows should convert to Arrow");
+
+    assert_eq!(
+        record_batch.schema().field(0).data_type(),
+        &DataType::Decimal128(38, 20),
+        "an undeclared NUMERIC must not take its scale from the rows"
+    );
+
+    let expected = Decimal128Array::from(vec![
+        None,
+        Some(123_456_000_000_000_000_000i128),
+        Some(150_000_000_000_000_000_000i128),
+    ])
+    .with_precision_and_scale(38, 20)
+    .expect("valid decimal precision and scale");
+
+    let actual = record_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("column is a Decimal128Array");
+
+    assert_eq!(actual, &expected, "values must keep the digits they hold");
 }
 
 async fn test_postgres_numeric_array_type(port: usize) {

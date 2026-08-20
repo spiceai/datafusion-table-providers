@@ -624,10 +624,12 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         continue;
                     };
 
-                    // Every value of the column lands on one scale (see
-                    // `widest_numeric_scale`). Widening is exact; narrowing
-                    // would hand back a number the source never held, so refuse
-                    // rather than round it away.
+                    // Every value of the column lands on the one scale the
+                    // column carries — the declared one, or
+                    // `NUMERIC_UNDECLARED_SCALE` when the schema declares none.
+                    // Widening to it is exact; narrowing would hand back a
+                    // number the source never held, so refuse rather than round
+                    // it away.
                     let dest_scale = postgres_numeric_scale.unwrap_or_default();
                     ensure!(
                         v.scale() <= dest_scale,
