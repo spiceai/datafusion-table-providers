@@ -21,7 +21,7 @@ use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use arrow_schema::ArrowError;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::{Constraints, SchemaExt};
+use datafusion::common::{not_impl_err, Constraints, SchemaExt};
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::sql::TableReference;
@@ -237,6 +237,19 @@ impl TableProvider for DuckDBTableWriter {
         input: Arc<dyn ExecutionPlan>,
         op: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // `InsertOp::Replace` promises an atomic per-row upsert. DuckDB delivers
+        // that only with an `ON CONFLICT (...) DO UPDATE`, i.e.
+        // `OnConflict::Upsert`. A missing `on_conflict` (plain append) or a
+        // `DoNothing`/`DoNothingAll` (leaves the existing row unchanged) does
+        // NOT replace, so refuse rather than silently accept a non-replacing
+        // write.
+        if matches!(op, InsertOp::Replace)
+            && !matches!(self.on_conflict, Some(OnConflict::Upsert(_)))
+        {
+            return not_impl_err!(
+                "InsertOp::Replace requires an on_conflict upsert target on the DuckDB writer"
+            );
+        }
         let mut sink = DuckDBDataSink::new(
             Arc::clone(&self.pool),
             Arc::clone(&self.table_definition),
