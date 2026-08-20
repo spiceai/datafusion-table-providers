@@ -169,6 +169,19 @@ impl MySQLTableFactory {
         &self,
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        self.read_write_table_provider_with_on_conflict(table_reference, None)
+            .await
+    }
+
+    /// Like [`read_write_table_provider`](Self::read_write_table_provider), but
+    /// binds an `on_conflict` target to the writer so `InsertOp::Replace`
+    /// delivers an atomic `INSERT ... ON DUPLICATE KEY UPDATE` upsert instead of
+    /// a plain append. `None` reproduces the append-only writer.
+    pub async fn read_write_table_provider_with_on_conflict(
+        &self,
+        table_reference: TableReference,
+        on_conflict: Option<OnConflict>,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let read_provider = Self::table_provider(self, table_reference.clone()).await?;
         let schema = read_provider.schema();
 
@@ -180,7 +193,7 @@ impl MySQLTableFactory {
             Constraints::default(),
         );
 
-        Ok(MySQLTableWriter::create(read_provider, mysql, None))
+        Ok(MySQLTableWriter::create(read_provider, mysql, on_conflict))
     }
 
     pub fn conn_pool_metrics(&self) -> Arc<Metrics> {

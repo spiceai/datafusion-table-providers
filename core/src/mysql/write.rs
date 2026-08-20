@@ -4,6 +4,7 @@ use crate::util::retriable_error::check_and_mark_retriable_error;
 use crate::util::{constraints, to_datafusion_error};
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::not_impl_err;
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::{
     catalog::Session,
@@ -71,6 +72,15 @@ impl TableProvider for MySQLTableWriter {
         input: Arc<dyn ExecutionPlan>,
         op: InsertOp,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        // `InsertOp::Replace` promises an atomic per-row upsert. MySQL can only
+        // honor that with an `ON DUPLICATE KEY UPDATE` clause, which comes from
+        // `on_conflict`. Without one there is no conflict key to update on, so
+        // refuse rather than silently degrade to a plain append.
+        if matches!(op, InsertOp::Replace) && self.on_conflict.is_none() {
+            return not_impl_err!(
+                "InsertOp::Replace requires an on_conflict target on the MySQL writer, but none was configured"
+            );
+        }
         Ok(Arc::new(DataSinkExec::new(
             input,
             Arc::new(MySQLDataSink::new(

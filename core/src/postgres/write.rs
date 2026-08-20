@@ -5,7 +5,7 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{Constraints, SchemaExt},
+    common::{not_impl_err, Constraints, SchemaExt},
     datasource::{
         sink::{DataSink, DataSinkExec},
         TableProvider, TableType,
@@ -86,6 +86,16 @@ impl TableProvider for PostgresTableWriter {
         input: Arc<dyn ExecutionPlan>,
         op: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // `InsertOp::Replace` promises an atomic per-row upsert (no delete leg).
+        // Postgres can only honor that with an `ON CONFLICT (...) DO UPDATE`
+        // target, which comes from `on_conflict`. Without one there is no
+        // conflict key to update on, so refuse rather than silently degrade to
+        // a plain append that would not replace existing rows.
+        if matches!(op, InsertOp::Replace) && self.on_conflict.is_none() {
+            return not_impl_err!(
+                "InsertOp::Replace requires an on_conflict target on the Postgres writer, but none was configured"
+            );
+        }
         Ok(Arc::new(DataSinkExec::new(
             input,
             Arc::new(PostgresDataSink::new(

@@ -6,7 +6,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::{
     catalog::Session,
-    common::Constraints,
+    common::{not_impl_err, Constraints},
     datasource::{TableProvider, TableType},
     error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
@@ -101,6 +101,15 @@ impl TableProvider for SqliteTableWriter {
         input: Arc<dyn ExecutionPlan>,
         op: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // `InsertOp::Replace` promises an atomic per-row upsert. SQLite can only
+        // honor that with an `ON CONFLICT (...) DO UPDATE` target, which comes
+        // from `on_conflict`. Without one there is no conflict key to update on,
+        // so refuse rather than silently degrade to a plain append.
+        if matches!(op, InsertOp::Replace) && self.on_conflict.is_none() {
+            return not_impl_err!(
+                "InsertOp::Replace requires an on_conflict target on the SQLite writer, but none was configured"
+            );
+        }
         Ok(Arc::new(DataSinkExec::new(
             input,
             Arc::new(SqliteDataSink::new(
