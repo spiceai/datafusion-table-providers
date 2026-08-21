@@ -19,6 +19,7 @@ use datafusion_federation::schema_cast::record_convert::try_cast_to;
 
 use datafusion_table_providers::{
     postgres::{DynPostgresConnectionPool, PostgresTableProviderFactory},
+    sql::arrow_sql_gen::postgres::rows_to_arrow,
     sql::sql_provider_datafusion::SqlTable,
     UnsupportedTypeAction,
 };
@@ -194,6 +195,10 @@ async fn test_arrow_postgres_one_way(container_manager: &Mutex<ContainerManager>
 
     test_postgres_enum_type(container_manager.port).await;
     test_postgres_numeric_type(container_manager.port).await;
+    test_postgres_undeclared_numeric_scale(container_manager.port).await;
+    test_postgres_undeclared_numeric_without_projected_schema(container_manager.port).await;
+    test_postgres_undeclared_numeric_too_wide_for_precision(container_manager.port).await;
+    test_postgres_negative_scale_numeric(container_manager.port).await;
     test_postgres_numeric_array_type(container_manager.port).await;
     test_postgres_jsonb_type(container_manager.port).await;
     test_postgres_nullability_constraints(container_manager.port).await;
@@ -379,6 +384,229 @@ async fn test_postgres_numeric_type(port: usize) {
         create_table_stmt,
         insert_table_stmt,
         extra_stmt,
+        expected_record,
+        UnsupportedTypeAction::default(),
+    )
+    .await;
+}
+
+/// An undeclared `NUMERIC` column serves every value at scale 20, whatever the
+/// first row happens to hold — including a NULL, which carries no scale at all,
+/// and whatever the value's magnitude.
+///
+/// This pins the catalog-driven default (`numeric` -> `Decimal128(38, 20)`)
+/// end to end, so that a column whose values have differing scales, or whose
+/// first row is NULL, cannot start taking its scale from the data. Reading the
+/// scale off a row is what the `projected_schema: None` path in `rows_to_arrow`
+/// does, and it is why that path pins the same 38/20 rather than sampling.
+async fn test_postgres_undeclared_numeric_scale(port: usize) {
+    let create_table_stmt = "
+    CREATE TABLE undeclared_numeric (
+    amount NUMERIC  -- no precision or scale
+);";
+
+    // The first row is NULL on purpose: it is what `LIMIT 1` returns, and it
+    // carries no scale of its own for the column to inherit.
+    let insert_table_stmt = "
+    INSERT INTO undeclared_numeric (amount) VALUES
+(NULL),
+(1.23456),
+(1.5),
+(1000000000),
+(123456789012345678);
+    ";
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "amount",
+        DataType::Decimal128(38, 20),
+        true,
+    )]));
+
+    let expected_record = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(
+            Decimal128Array::from(vec![
+                None,
+                Some(123_456_000_000_000_000_000i128),
+                Some(150_000_000_000_000_000_000i128),
+                // Large values are where scaling through `Decimal::rescale`
+                // used to stop short of the column's scale and hand back a
+                // different number: 1000000000 read back as 100000000, and the
+                // 18-digit value nine orders of magnitude out.
+                Some(100_000_000_000_000_000_000_000_000_000i128),
+                Some(12_345_678_901_234_567_800_000_000_000_000_000_000i128),
+            ])
+            .with_precision_and_scale(38, 20)
+            .expect("valid decimal precision and scale"),
+        )],
+    )
+    .expect("Failed to created arrow record batch");
+
+    arrow_postgres_one_way(
+        port,
+        "undeclared_numeric",
+        create_table_stmt,
+        insert_table_stmt,
+        None,
+        expected_record,
+        UnsupportedTypeAction::default(),
+    )
+    .await;
+}
+
+/// An undeclared `NUMERIC` gets the fixed 38/20 pair when there is no projected
+/// schema to take one from.
+///
+/// This is the branch `infer_schema_from_data` runs on (the fallback for when
+/// the catalog reports no columns), and the one that used to read the scale off
+/// the first row — a NULL there carries no scale, so the column came back as
+/// `Decimal128(38, 0)` with every fraction truncated.
+///
+/// Driven through `rows_to_arrow` directly on purpose: a table provider always
+/// hands down a projected schema, so nothing reachable through SQL exercises
+/// this branch.
+async fn test_postgres_undeclared_numeric_without_projected_schema(port: usize) {
+    let pool = common::get_postgres_connection_pool(port)
+        .await
+        .expect("Postgres connection pool should be created");
+    let db_conn = pool
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+
+    for stmt in [
+        "DROP TABLE IF EXISTS undeclared_numeric_raw",
+        "CREATE TABLE undeclared_numeric_raw (amount NUMERIC)",
+        // The NULL sorts first below, so it is the row a first-row scale would
+        // have been taken from.
+        "INSERT INTO undeclared_numeric_raw (amount) VALUES (NULL), (1.23456), (1.5)",
+    ] {
+        db_conn
+            .conn
+            .execute(stmt, &[])
+            .await
+            .expect("Postgres statement should run");
+    }
+
+    let rows = db_conn
+        .conn
+        .query(
+            "SELECT amount FROM undeclared_numeric_raw ORDER BY amount NULLS FIRST",
+            &[],
+        )
+        .await
+        .expect("Postgres rows should be returned");
+
+    let record_batch = rows_to_arrow(rows.as_slice(), &None).expect("Rows should convert to Arrow");
+
+    assert_eq!(
+        record_batch.schema().field(0).data_type(),
+        &DataType::Decimal128(38, 20),
+        "an undeclared NUMERIC must not take its scale from the rows"
+    );
+
+    let expected = Decimal128Array::from(vec![
+        None,
+        Some(123_456_000_000_000_000_000i128),
+        Some(150_000_000_000_000_000_000i128),
+    ])
+    .with_precision_and_scale(38, 20)
+    .expect("valid decimal precision and scale");
+
+    let actual = record_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("column is a Decimal128Array");
+
+    assert_eq!(actual, &expected, "values must keep the digits they hold");
+}
+
+/// A value that cannot fit the digits the column carries is refused, not
+/// emitted as an array that contradicts its own type.
+///
+/// At the 38/20 default a 19-digit integer needs a 39-digit coefficient. That
+/// still fits `i128`, so a storage-only overflow check lets it through and the
+/// builder produces a `Decimal128(38, 20)` array holding a value too wide for
+/// its own precision.
+async fn test_postgres_undeclared_numeric_too_wide_for_precision(port: usize) {
+    let pool = common::get_postgres_connection_pool(port)
+        .await
+        .expect("Postgres connection pool should be created");
+    let db_conn = pool
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+
+    for stmt in [
+        "DROP TABLE IF EXISTS numeric_too_wide",
+        "CREATE TABLE numeric_too_wide (amount NUMERIC)",
+        // 19 integer digits: coefficient 10^38 at scale 20, one digit past
+        // what Decimal128(38, _) can carry.
+        "INSERT INTO numeric_too_wide (amount) VALUES (1000000000000000000)",
+    ] {
+        db_conn
+            .conn
+            .execute(stmt, &[])
+            .await
+            .expect("Postgres statement should run");
+    }
+
+    let rows = db_conn
+        .conn
+        .query("SELECT amount FROM numeric_too_wide", &[])
+        .await
+        .expect("Postgres rows should be returned");
+
+    let error = rows_to_arrow(rows.as_slice(), &None)
+        .expect_err("a value too wide for the column's precision must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("amount"),
+        "the refusal must name the column: {message}"
+    );
+}
+
+/// A `NUMERIC` declared with a negative scale keeps its value.
+///
+/// PostgreSQL allows a negative scale, which counts trailing zeros instead of
+/// decimal places, and the catalog carries it through: `pg_catalog.format_type`
+/// reports `numeric(2,-3)` and the schema parses the scale as a signed `i8`, so
+/// the column really is `Decimal128(2, -3)` and `12000` is stored as the
+/// coefficient `12`. Converting that scale to an unsigned value silently reads
+/// it as 0, which puts the whole coefficient in the column instead.
+async fn test_postgres_negative_scale_numeric(port: usize) {
+    let create_table_stmt = "
+    CREATE TABLE negative_scale_numeric (
+    amount NUMERIC(2,-3)
+);";
+
+    let insert_table_stmt = "
+    INSERT INTO negative_scale_numeric (amount) VALUES (12000), (NULL);
+    ";
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "amount",
+        DataType::Decimal128(2, -3),
+        true,
+    )]));
+
+    let expected_record = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(
+            Decimal128Array::from(vec![Some(12i128), None])
+                .with_precision_and_scale(2, -3)
+                .expect("valid decimal precision and scale"),
+        )],
+    )
+    .expect("Failed to created arrow record batch");
+
+    arrow_postgres_one_way(
+        port,
+        "negative_scale_numeric",
+        create_table_stmt,
+        insert_table_stmt,
+        None,
         expected_record,
         UnsupportedTypeAction::default(),
     )

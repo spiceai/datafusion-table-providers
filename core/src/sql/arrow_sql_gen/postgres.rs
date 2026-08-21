@@ -45,6 +45,26 @@ pub enum Error {
     #[snafu(display("No builder found for index {index}"))]
     NoBuilderForIndex { index: usize },
 
+    #[snafu(display(
+        "Failed to read column '{column}': a value has {value_scale} decimal places but the column carries {column_scale}, so returning it would drop digits it actually holds. \
+        Declare the column as NUMERIC(38, {value_scale}) or wider at the source."
+    ))]
+    NumericScaleTooWide {
+        column: String,
+        value_scale: u32,
+        column_scale: i8,
+    },
+
+    #[snafu(display(
+        "Failed to read column '{column}': a value needs more than the {column_precision} digits the column carries once it is given {column_scale} decimal places. \
+        Declare the column with a smaller scale at the source, or read it as text."
+    ))]
+    NumericValueTooLarge {
+        column: String,
+        column_precision: u8,
+        column_scale: i8,
+    },
+
     #[snafu(display("Failed to downcast builder for {postgres_type}"))]
     FailedToDowncastBuilder { postgres_type: String },
 
@@ -237,6 +257,86 @@ macro_rules! append_composite_fields_to_struct {
     }};
 }
 
+/// Arrow type for a PostgreSQL `NUMERIC` whose precision and scale the schema
+/// does not declare.
+///
+/// An unconstrained `NUMERIC` has no column-level precision or scale at all —
+/// every value carries its own — while an Arrow `Decimal128` column has exactly
+/// one of each, so a single pair has to stand for the whole column.
+///
+/// The catalog settles on this same pair (`pg_data_type_to_arrow_type`), and
+/// this is what a caller with no projected schema gets, so the two agree on the
+/// column rather than describing it differently.
+///
+/// The pair must not be read off the data. The schema a caller has here may
+/// come from sampling a single row (`infer_schema_from_data` runs
+/// `SELECT * FROM <table> LIMIT 1` when the catalog reports no columns), and a
+/// scale taken from one row pins the column to whatever that row happened to
+/// hold, silently rescaling every other value: `1.23456` beside a `1.5` comes
+/// back as `1.2`, and because a NULL carries no scale, a column sampled on a
+/// NULL row comes back with every fraction truncated. That sample is not stable
+/// either — `LIMIT 1` has no `ORDER BY`.
+///
+/// A fixed pair keeps the column deterministic and carries every value with up
+/// to 20 decimal places exactly. A value needing more is refused rather than
+/// rounded away (see `NumericScaleTooWide`).
+const NUMERIC_UNDECLARED_PRECISION: u8 = 38;
+const NUMERIC_UNDECLARED_SCALE: i8 = 20;
+
+/// Why a `NUMERIC` value cannot be carried by the column it was read into.
+enum NumericFit {
+    /// The value has digits finer than the column's scale.
+    ScaleTooNarrow,
+    /// The coefficient needs more digits than the column's precision.
+    PrecisionTooNarrow,
+}
+
+/// The `Decimal128` coefficient of `value` at `precision` and `scale`, or why
+/// it does not fit them.
+///
+/// Deliberately not `Decimal::rescale`. `rust_decimal` holds a 96-bit
+/// coefficient, and rescaling toward a scale whose coefficient will not fit
+/// silently stops at the widest scale that does — leaving a number that is then
+/// read back at the scale the column declares, which is a different number.
+/// Rescaling `1000000000` toward 20 stops at 19, so it reads back as
+/// `100000000`; an 18-digit integer stops at 11 and comes back nine orders of
+/// magnitude out. `i128` spans the whole `Decimal128` range, so shift the
+/// coefficient here, and report a value that fits neither the shift nor the
+/// digits the column declares rather than quietly altering it.
+fn numeric_coefficient(value: &Decimal, precision: u8, scale: i8) -> Result<i128, NumericFit> {
+    let value_scale = i32::try_from(value.scale()).map_err(|_| NumericFit::ScaleTooNarrow)?;
+    let shift = i32::from(scale) - value_scale;
+    let mantissa = value.mantissa();
+
+    let coefficient = if let Ok(widen) = u32::try_from(shift) {
+        10i128
+            .checked_pow(widen)
+            .and_then(|factor| mantissa.checked_mul(factor))
+            .ok_or(NumericFit::PrecisionTooNarrow)?
+    } else {
+        // The column holds fewer decimal places than the value carries — a
+        // negative scale holds none at all and counts trailing zeros instead,
+        // so `NUMERIC(2, -3)` stores `12000` as the coefficient `12`. Shifting
+        // down is only sound when it divides exactly; anything else would drop
+        // digits the value actually holds.
+        let divisor = 10i128
+            .checked_pow(shift.unsigned_abs())
+            .ok_or(NumericFit::ScaleTooNarrow)?;
+        if mantissa % divisor != 0 {
+            return Err(NumericFit::ScaleTooNarrow);
+        }
+        mantissa / divisor
+    };
+
+    let limit = 10u128
+        .checked_pow(u32::from(precision))
+        .ok_or(NumericFit::PrecisionTooNarrow)?;
+    if coefficient.unsigned_abs() >= limit {
+        return Err(NumericFit::PrecisionTooNarrow);
+    }
+    Ok(coefficient)
+}
+
 /// Converts Postgres `Row`s to an Arrow `RecordBatch`. Assumes that all rows have the same schema and
 /// sets the schema based on the first row.
 ///
@@ -267,16 +367,23 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
             let mut numeric_scale: Option<u32> = None;
 
             let mut data_type = if *column_type == Type::NUMERIC {
-                if let Some(schema) = projected_schema.as_ref() {
-                    match get_decimal_column_precision_and_scale(column_name, schema) {
-                        Some((precision, scale)) => {
-                            numeric_scale = Some(u32::try_from(scale).unwrap_or_default());
-                            Some(DataType::Decimal128(precision, scale))
-                        }
-                        None => None,
+                let declared = projected_schema
+                    .as_ref()
+                    .and_then(|schema| get_decimal_column_precision_and_scale(column_name, schema));
+                match declared {
+                    Some((precision, scale)) => {
+                        numeric_scale = Some(u32::try_from(scale).unwrap_or_default());
+                        Some(DataType::Decimal128(precision, scale))
                     }
-                } else {
-                    None
+                    // Undeclared scale: see `NUMERIC_UNDECLARED_SCALE`.
+                    None => {
+                        numeric_scale =
+                            Some(u32::try_from(NUMERIC_UNDECLARED_SCALE).unwrap_or_default());
+                        Some(DataType::Decimal128(
+                            NUMERIC_UNDECLARED_PRECISION,
+                            NUMERIC_UNDECLARED_SCALE,
+                        ))
+                    }
                 }
             } else if *column_type == Type::NUMERIC_ARRAY {
                 if let Some(schema) = projected_schema.as_ref() {
@@ -576,16 +683,43 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         *postgres_numeric_scale = Some(scale);
                     };
 
-                    let Some(mut v) = v else {
+                    let Some(v) = v else {
                         dec_builder.append_null();
                         continue;
                     };
 
-                    // Record Batch Scale is determined by first row, while Postgres Numeric Type doesn't have fixed scale
-                    // Resolve scale difference for incoming records
-                    let dest_scale = postgres_numeric_scale.unwrap_or_default();
-                    v.rescale(dest_scale);
-                    dec_builder.append_value(v.mantissa());
+                    // Every value of the column lands on the one scale the
+                    // column carries — the declared one, or
+                    // `NUMERIC_UNDECLARED_SCALE` when the schema declares none.
+                    // Widening to it is exact; narrowing would hand back a
+                    // number the source never held, so refuse rather than round
+                    // it away.
+                    let column_name = || column_names.get(i).cloned().unwrap_or_default();
+                    // The field is the authority on both: a negative scale
+                    // survives into it (`numeric(2,-3)`), and cannot be carried
+                    // by the unsigned scale tracked for the array path.
+                    let (dest_precision, dest_scale) =
+                        match arrow_field.as_ref().map(Field::data_type) {
+                            Some(DataType::Decimal128(precision, scale)) => (*precision, *scale),
+                            _ => (NUMERIC_UNDECLARED_PRECISION, NUMERIC_UNDECLARED_SCALE),
+                        };
+                    let coefficient = numeric_coefficient(&v, dest_precision, dest_scale).map_err(
+                        |fit| match fit {
+                            NumericFit::ScaleTooNarrow => NumericScaleTooWideSnafu {
+                                column: column_name(),
+                                value_scale: v.scale(),
+                                column_scale: dest_scale,
+                            }
+                            .build(),
+                            NumericFit::PrecisionTooNarrow => NumericValueTooLargeSnafu {
+                                column: column_name(),
+                                column_precision: dest_precision,
+                                column_scale: dest_scale,
+                            }
+                            .build(),
+                        },
+                    )?;
+                    dec_builder.append_value(coefficient);
                 }
                 Type::NUMERIC_ARRAY => {
                     let v: Option<Vec<Option<Decimal>>> =
