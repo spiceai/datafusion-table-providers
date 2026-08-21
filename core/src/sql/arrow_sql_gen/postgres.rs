@@ -55,6 +55,12 @@ pub enum Error {
         column_scale: u32,
     },
 
+    #[snafu(display(
+        "Failed to read column '{column}': a value is too large to carry {column_scale} decimal places without losing digits. \
+        Declare the column with a smaller scale at the source, or read it as text."
+    ))]
+    NumericValueTooLarge { column: String, column_scale: u32 },
+
     #[snafu(display("Failed to downcast builder for {postgres_type}"))]
     FailedToDowncastBuilder { postgres_type: String },
 
@@ -272,6 +278,24 @@ macro_rules! append_composite_fields_to_struct {
 /// rounded away (see `NumericScaleTooWide`).
 const NUMERIC_UNDECLARED_PRECISION: u8 = 38;
 const NUMERIC_UNDECLARED_SCALE: i8 = 20;
+
+/// The `Decimal128` coefficient of `value` at `scale`, or `None` when it does
+/// not fit one.
+///
+/// Deliberately not `Decimal::rescale`. `rust_decimal` holds a 96-bit
+/// coefficient, and rescaling toward a scale whose coefficient will not fit
+/// silently stops at the widest scale that does — leaving a number that is then
+/// read back at the scale the column declares, which is a different number.
+/// Rescaling `1000000000` toward 20 stops at 19, so it reads back as
+/// `100000000`; an 18-digit integer stops at 11 and comes back nine orders of
+/// magnitude out. `i128` spans the whole `Decimal128` range, so shift the
+/// coefficient here and let a value that genuinely does not fit be reported
+/// rather than quietly altered.
+fn numeric_coefficient(value: &Decimal, scale: u32) -> Option<i128> {
+    let shift = scale.checked_sub(value.scale())?;
+    let factor = 10i128.checked_pow(shift)?;
+    value.mantissa().checked_mul(factor)
+}
 
 /// Converts Postgres `Row`s to an Arrow `RecordBatch`. Assumes that all rows have the same schema and
 /// sets the schema based on the first row.
@@ -619,7 +643,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         *postgres_numeric_scale = Some(scale);
                     };
 
-                    let Some(mut v) = v else {
+                    let Some(v) = v else {
                         dec_builder.append_null();
                         continue;
                     };
@@ -631,16 +655,21 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                     // number the source never held, so refuse rather than round
                     // it away.
                     let dest_scale = postgres_numeric_scale.unwrap_or_default();
+                    let column_name = || column_names.get(i).cloned().unwrap_or_default();
                     ensure!(
                         v.scale() <= dest_scale,
                         NumericScaleTooWideSnafu {
-                            column: column_names.get(i).cloned().unwrap_or_default(),
+                            column: column_name(),
                             value_scale: v.scale(),
                             column_scale: dest_scale,
                         }
                     );
-                    v.rescale(dest_scale);
-                    dec_builder.append_value(v.mantissa());
+                    let coefficient =
+                        numeric_coefficient(&v, dest_scale).context(NumericValueTooLargeSnafu {
+                            column: column_name(),
+                            column_scale: dest_scale,
+                        })?;
+                    dec_builder.append_value(coefficient);
                 }
                 Type::NUMERIC_ARRAY => {
                     let v: Option<Vec<Option<Decimal>>> =

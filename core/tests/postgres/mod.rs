@@ -389,7 +389,8 @@ async fn test_postgres_numeric_type(port: usize) {
 }
 
 /// An undeclared `NUMERIC` column serves every value at scale 20, whatever the
-/// first row happens to hold — including a NULL, which carries no scale at all.
+/// first row happens to hold — including a NULL, which carries no scale at all,
+/// and whatever the value's magnitude.
 ///
 /// This pins the catalog-driven default (`numeric` -> `Decimal128(38, 20)`)
 /// end to end, so that a column whose values have differing scales, or whose
@@ -408,7 +409,9 @@ async fn test_postgres_undeclared_numeric_scale(port: usize) {
     INSERT INTO undeclared_numeric (amount) VALUES
 (NULL),
 (1.23456),
-(1.5);
+(1.5),
+(1000000000),
+(123456789012345678);
     ";
 
     let schema = Arc::new(Schema::new(vec![Field::new(
@@ -424,6 +427,12 @@ async fn test_postgres_undeclared_numeric_scale(port: usize) {
                 None,
                 Some(123_456_000_000_000_000_000i128),
                 Some(150_000_000_000_000_000_000i128),
+                // Large values are where scaling through `Decimal::rescale`
+                // used to stop short of the column's scale and hand back a
+                // different number: 1000000000 read back as 100000000, and the
+                // 18-digit value nine orders of magnitude out.
+                Some(100_000_000_000_000_000_000_000_000_000i128),
+                Some(12_345_678_901_234_567_800_000_000_000_000_000_000i128),
             ])
             .with_precision_and_scale(38, 20)
             .expect("valid decimal precision and scale"),
