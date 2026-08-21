@@ -198,6 +198,7 @@ async fn test_arrow_postgres_one_way(container_manager: &Mutex<ContainerManager>
     test_postgres_undeclared_numeric_scale(container_manager.port).await;
     test_postgres_undeclared_numeric_without_projected_schema(container_manager.port).await;
     test_postgres_undeclared_numeric_too_wide_for_precision(container_manager.port).await;
+    test_postgres_negative_scale_numeric(container_manager.port).await;
     test_postgres_numeric_array_type(container_manager.port).await;
     test_postgres_jsonb_type(container_manager.port).await;
     test_postgres_nullability_constraints(container_manager.port).await;
@@ -564,6 +565,52 @@ async fn test_postgres_undeclared_numeric_too_wide_for_precision(port: usize) {
         message.contains("amount"),
         "the refusal must name the column: {message}"
     );
+}
+
+/// A `NUMERIC` declared with a negative scale keeps its value.
+///
+/// PostgreSQL allows a negative scale, which counts trailing zeros instead of
+/// decimal places, and the catalog carries it through: `pg_catalog.format_type`
+/// reports `numeric(2,-3)` and the schema parses the scale as a signed `i8`, so
+/// the column really is `Decimal128(2, -3)` and `12000` is stored as the
+/// coefficient `12`. Converting that scale to an unsigned value silently reads
+/// it as 0, which puts the whole coefficient in the column instead.
+async fn test_postgres_negative_scale_numeric(port: usize) {
+    let create_table_stmt = "
+    CREATE TABLE negative_scale_numeric (
+    amount NUMERIC(2,-3)
+);";
+
+    let insert_table_stmt = "
+    INSERT INTO negative_scale_numeric (amount) VALUES (12000), (NULL);
+    ";
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "amount",
+        DataType::Decimal128(2, -3),
+        true,
+    )]));
+
+    let expected_record = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(
+            Decimal128Array::from(vec![Some(12i128), None])
+                .with_precision_and_scale(2, -3)
+                .expect("valid decimal precision and scale"),
+        )],
+    )
+    .expect("Failed to created arrow record batch");
+
+    arrow_postgres_one_way(
+        port,
+        "negative_scale_numeric",
+        create_table_stmt,
+        insert_table_stmt,
+        None,
+        expected_record,
+        UnsupportedTypeAction::default(),
+    )
+    .await;
 }
 
 async fn test_postgres_numeric_array_type(port: usize) {

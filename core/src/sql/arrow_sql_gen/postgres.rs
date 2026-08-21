@@ -52,7 +52,7 @@ pub enum Error {
     NumericScaleTooWide {
         column: String,
         value_scale: u32,
-        column_scale: u32,
+        column_scale: i8,
     },
 
     #[snafu(display(
@@ -62,7 +62,7 @@ pub enum Error {
     NumericValueTooLarge {
         column: String,
         column_precision: u8,
-        column_scale: u32,
+        column_scale: i8,
     },
 
     #[snafu(display("Failed to downcast builder for {postgres_type}"))]
@@ -283,8 +283,16 @@ macro_rules! append_composite_fields_to_struct {
 const NUMERIC_UNDECLARED_PRECISION: u8 = 38;
 const NUMERIC_UNDECLARED_SCALE: i8 = 20;
 
-/// The `Decimal128` coefficient of `value` at `scale`, or `None` when it does
-/// not fit one.
+/// Why a `NUMERIC` value cannot be carried by the column it was read into.
+enum NumericFit {
+    /// The value has digits finer than the column's scale.
+    ScaleTooNarrow,
+    /// The coefficient needs more digits than the column's precision.
+    PrecisionTooNarrow,
+}
+
+/// The `Decimal128` coefficient of `value` at `precision` and `scale`, or why
+/// it does not fit them.
 ///
 /// Deliberately not `Decimal::rescale`. `rust_decimal` holds a 96-bit
 /// coefficient, and rescaling toward a scale whose coefficient will not fit
@@ -295,17 +303,38 @@ const NUMERIC_UNDECLARED_SCALE: i8 = 20;
 /// magnitude out. `i128` spans the whole `Decimal128` range, so shift the
 /// coefficient here, and report a value that fits neither the shift nor the
 /// digits the column declares rather than quietly altering it.
-fn numeric_coefficient(value: &Decimal, precision: u8, scale: u32) -> Option<i128> {
-    let shift = scale.checked_sub(value.scale())?;
-    let factor = 10i128.checked_pow(shift)?;
-    let coefficient = value.mantissa().checked_mul(factor)?;
+fn numeric_coefficient(value: &Decimal, precision: u8, scale: i8) -> Result<i128, NumericFit> {
+    let value_scale = i32::try_from(value.scale()).map_err(|_| NumericFit::ScaleTooNarrow)?;
+    let shift = i32::from(scale) - value_scale;
+    let mantissa = value.mantissa();
 
-    // Fitting `i128` is not enough: it holds 39 digits, one more than a
-    // `Decimal128(38, _)` may carry, so a coefficient can survive the multiply
-    // and still be too wide for the column it is about to be appended to —
-    // giving an array that contradicts its own type.
-    let limit = 10u128.checked_pow(u32::from(precision))?;
-    (coefficient.unsigned_abs() < limit).then_some(coefficient)
+    let coefficient = if let Ok(widen) = u32::try_from(shift) {
+        10i128
+            .checked_pow(widen)
+            .and_then(|factor| mantissa.checked_mul(factor))
+            .ok_or(NumericFit::PrecisionTooNarrow)?
+    } else {
+        // The column holds fewer decimal places than the value carries — a
+        // negative scale holds none at all and counts trailing zeros instead,
+        // so `NUMERIC(2, -3)` stores `12000` as the coefficient `12`. Shifting
+        // down is only sound when it divides exactly; anything else would drop
+        // digits the value actually holds.
+        let divisor = 10i128
+            .checked_pow(shift.unsigned_abs())
+            .ok_or(NumericFit::ScaleTooNarrow)?;
+        if mantissa % divisor != 0 {
+            return Err(NumericFit::ScaleTooNarrow);
+        }
+        mantissa / divisor
+    };
+
+    let limit = 10u128
+        .checked_pow(u32::from(precision))
+        .ok_or(NumericFit::PrecisionTooNarrow)?;
+    if coefficient.unsigned_abs() >= limit {
+        return Err(NumericFit::PrecisionTooNarrow);
+    }
+    Ok(coefficient)
 }
 
 /// Converts Postgres `Row`s to an Arrow `RecordBatch`. Assumes that all rows have the same schema and
@@ -665,25 +694,29 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                     // Widening to it is exact; narrowing would hand back a
                     // number the source never held, so refuse rather than round
                     // it away.
-                    let dest_scale = postgres_numeric_scale.unwrap_or_default();
                     let column_name = || column_names.get(i).cloned().unwrap_or_default();
-                    ensure!(
-                        v.scale() <= dest_scale,
-                        NumericScaleTooWideSnafu {
-                            column: column_name(),
-                            value_scale: v.scale(),
-                            column_scale: dest_scale,
-                        }
-                    );
-                    let dest_precision = match arrow_field.as_ref().map(Field::data_type) {
-                        Some(DataType::Decimal128(precision, _)) => *precision,
-                        _ => NUMERIC_UNDECLARED_PRECISION,
-                    };
-                    let coefficient = numeric_coefficient(&v, dest_precision, dest_scale).context(
-                        NumericValueTooLargeSnafu {
-                            column: column_name(),
-                            column_precision: dest_precision,
-                            column_scale: dest_scale,
+                    // The field is the authority on both: a negative scale
+                    // survives into it (`numeric(2,-3)`), and cannot be carried
+                    // by the unsigned scale tracked for the array path.
+                    let (dest_precision, dest_scale) =
+                        match arrow_field.as_ref().map(Field::data_type) {
+                            Some(DataType::Decimal128(precision, scale)) => (*precision, *scale),
+                            _ => (NUMERIC_UNDECLARED_PRECISION, NUMERIC_UNDECLARED_SCALE),
+                        };
+                    let coefficient = numeric_coefficient(&v, dest_precision, dest_scale).map_err(
+                        |fit| match fit {
+                            NumericFit::ScaleTooNarrow => NumericScaleTooWideSnafu {
+                                column: column_name(),
+                                value_scale: v.scale(),
+                                column_scale: dest_scale,
+                            }
+                            .build(),
+                            NumericFit::PrecisionTooNarrow => NumericValueTooLargeSnafu {
+                                column: column_name(),
+                                column_precision: dest_precision,
+                                column_scale: dest_scale,
+                            }
+                            .build(),
                         },
                     )?;
                     dec_builder.append_value(coefficient);
