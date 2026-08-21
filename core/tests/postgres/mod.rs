@@ -197,6 +197,7 @@ async fn test_arrow_postgres_one_way(container_manager: &Mutex<ContainerManager>
     test_postgres_numeric_type(container_manager.port).await;
     test_postgres_undeclared_numeric_scale(container_manager.port).await;
     test_postgres_undeclared_numeric_without_projected_schema(container_manager.port).await;
+    test_postgres_undeclared_numeric_too_wide_for_precision(container_manager.port).await;
     test_postgres_numeric_array_type(container_manager.port).await;
     test_postgres_jsonb_type(container_manager.port).await;
     test_postgres_nullability_constraints(container_manager.port).await;
@@ -518,6 +519,51 @@ async fn test_postgres_undeclared_numeric_without_projected_schema(port: usize) 
         .expect("column is a Decimal128Array");
 
     assert_eq!(actual, &expected, "values must keep the digits they hold");
+}
+
+/// A value that cannot fit the digits the column carries is refused, not
+/// emitted as an array that contradicts its own type.
+///
+/// At the 38/20 default a 19-digit integer needs a 39-digit coefficient. That
+/// still fits `i128`, so a storage-only overflow check lets it through and the
+/// builder produces a `Decimal128(38, 20)` array holding a value too wide for
+/// its own precision.
+async fn test_postgres_undeclared_numeric_too_wide_for_precision(port: usize) {
+    let pool = common::get_postgres_connection_pool(port)
+        .await
+        .expect("Postgres connection pool should be created");
+    let db_conn = pool
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+
+    for stmt in [
+        "DROP TABLE IF EXISTS numeric_too_wide",
+        "CREATE TABLE numeric_too_wide (amount NUMERIC)",
+        // 19 integer digits: coefficient 10^38 at scale 20, one digit past
+        // what Decimal128(38, _) can carry.
+        "INSERT INTO numeric_too_wide (amount) VALUES (1000000000000000000)",
+    ] {
+        db_conn
+            .conn
+            .execute(stmt, &[])
+            .await
+            .expect("Postgres statement should run");
+    }
+
+    let rows = db_conn
+        .conn
+        .query("SELECT amount FROM numeric_too_wide", &[])
+        .await
+        .expect("Postgres rows should be returned");
+
+    let error = rows_to_arrow(rows.as_slice(), &None)
+        .expect_err("a value too wide for the column's precision must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("amount"),
+        "the refusal must name the column: {message}"
+    );
 }
 
 async fn test_postgres_numeric_array_type(port: usize) {

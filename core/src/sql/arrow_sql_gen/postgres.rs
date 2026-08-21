@@ -56,10 +56,14 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to read column '{column}': a value is too large to carry {column_scale} decimal places without losing digits. \
+        "Failed to read column '{column}': a value needs more than the {column_precision} digits the column carries once it is given {column_scale} decimal places. \
         Declare the column with a smaller scale at the source, or read it as text."
     ))]
-    NumericValueTooLarge { column: String, column_scale: u32 },
+    NumericValueTooLarge {
+        column: String,
+        column_precision: u8,
+        column_scale: u32,
+    },
 
     #[snafu(display("Failed to downcast builder for {postgres_type}"))]
     FailedToDowncastBuilder { postgres_type: String },
@@ -289,12 +293,19 @@ const NUMERIC_UNDECLARED_SCALE: i8 = 20;
 /// Rescaling `1000000000` toward 20 stops at 19, so it reads back as
 /// `100000000`; an 18-digit integer stops at 11 and comes back nine orders of
 /// magnitude out. `i128` spans the whole `Decimal128` range, so shift the
-/// coefficient here and let a value that genuinely does not fit be reported
-/// rather than quietly altered.
-fn numeric_coefficient(value: &Decimal, scale: u32) -> Option<i128> {
+/// coefficient here, and report a value that fits neither the shift nor the
+/// digits the column declares rather than quietly altering it.
+fn numeric_coefficient(value: &Decimal, precision: u8, scale: u32) -> Option<i128> {
     let shift = scale.checked_sub(value.scale())?;
     let factor = 10i128.checked_pow(shift)?;
-    value.mantissa().checked_mul(factor)
+    let coefficient = value.mantissa().checked_mul(factor)?;
+
+    // Fitting `i128` is not enough: it holds 39 digits, one more than a
+    // `Decimal128(38, _)` may carry, so a coefficient can survive the multiply
+    // and still be too wide for the column it is about to be appended to —
+    // giving an array that contradicts its own type.
+    let limit = 10u128.checked_pow(u32::from(precision))?;
+    (coefficient.unsigned_abs() < limit).then_some(coefficient)
 }
 
 /// Converts Postgres `Row`s to an Arrow `RecordBatch`. Assumes that all rows have the same schema and
@@ -664,11 +675,17 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                             column_scale: dest_scale,
                         }
                     );
-                    let coefficient =
-                        numeric_coefficient(&v, dest_scale).context(NumericValueTooLargeSnafu {
+                    let dest_precision = match arrow_field.as_ref().map(Field::data_type) {
+                        Some(DataType::Decimal128(precision, _)) => *precision,
+                        _ => NUMERIC_UNDECLARED_PRECISION,
+                    };
+                    let coefficient = numeric_coefficient(&v, dest_precision, dest_scale).context(
+                        NumericValueTooLargeSnafu {
                             column: column_name(),
+                            column_precision: dest_precision,
                             column_scale: dest_scale,
-                        })?;
+                        },
+                    )?;
                     dec_builder.append_value(coefficient);
                 }
                 Type::NUMERIC_ARRAY => {
