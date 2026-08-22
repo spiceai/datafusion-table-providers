@@ -1299,6 +1299,71 @@ mod tests {
         );
     }
 
+    /// A database file swap replaces the pool's own DuckDB instance with a fresh
+    /// one that holds none of the `ATTACH`es the old instance had, while the peer
+    /// files it attached are unchanged. The cached search_path therefore looks
+    /// valid but names catalogs the new instance never attached, so
+    /// `SET search_path` fails. `attach_once` must self-heal by re-attaching on
+    /// the current instance and retrying, instead of failing the query — this is
+    /// the regression for the `SET search_path: No catalog + schema named
+    /// "attachment_..."` failures under concurrent load with `replace_file`.
+    #[tokio::test]
+    async fn test_attach_once_reattaches_after_own_instance_swap() {
+        use crate::sql::db_connection_pool::dbconnection::duckdbconn::DuckDBAttachments;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let peer_path = dir.path().join("peer.db").to_string_lossy().to_string();
+        let main_a = dir.path().join("main_a.db").to_string_lossy().to_string();
+        let main_b = dir.path().join("main_b.db").to_string_lossy().to_string();
+
+        // A peer database, unchanged for the whole test, that main attaches.
+        {
+            let conn = Connection::open(&peer_path).expect("open peer");
+            conn.execute_batch(
+                "CREATE TABLE peer_data (v INTEGER); INSERT INTO peer_data VALUES (1), (2);",
+            )
+            .expect("seed peer");
+        }
+
+        // The attachment cache is shared across every connection of the logical
+        // pool and survives a file swap; each `Connection::open` here is a
+        // distinct DuckDB instance, modelling the pre- and post-swap instances.
+        let attachments =
+            DuckDBAttachments::new("main", &[Arc::from(peer_path.as_str()) as Arc<str>]);
+
+        // Pre-swap instance: attach and populate the cache.
+        let before = Connection::open(&main_a).expect("open main_a");
+        attachments.attach_once(&before).expect("initial attach");
+        assert_eq!(count(&before, "SELECT COUNT(1) FROM peer_data"), 2);
+
+        // Post-swap instance: a fresh instance with no attachments, while the
+        // peer file (and thus the cached identities) is unchanged. The carried
+        // cache would `SET search_path` over an attachment this instance lacks.
+        let after = Connection::open(&main_b).expect("open main_b");
+        attachments
+            .attach_once(&after)
+            .expect("attach_once must self-heal after an own-instance swap");
+        assert_eq!(
+            count(&after, "SELECT COUNT(1) FROM peer_data"),
+            2,
+            "the peer must be re-attached on the swapped-in instance"
+        );
+
+        // `invalidate` drops the cache so the next attach_once re-attaches from
+        // scratch — the proactive path a swap takes.
+        attachments.invalidate();
+        let after_invalidate =
+            Connection::open(dir.path().join("main_c.db").to_string_lossy().as_ref())
+                .expect("open main_c");
+        attachments
+            .attach_once(&after_invalidate)
+            .expect("attach_once after invalidate");
+        assert_eq!(
+            count(&after_invalidate, "SELECT COUNT(1) FROM peer_data"),
+            2
+        );
+    }
+
     #[test]
     fn test_parse_generation_suffix() {
         assert_eq!(

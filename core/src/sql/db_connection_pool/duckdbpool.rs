@@ -385,6 +385,15 @@ impl DuckDbConnectionPool {
             std::mem::replace(&mut *state, new_state)
         };
 
+        // The fresh instance carries none of the cross-database ATTACHes the old
+        // instance held, so drop the cached attach state: the next query
+        // re-attaches against the new instance rather than SET search_path over
+        // catalogs it never attached. `attach_once` self-heals if a stale cache
+        // slips through the swap, but invalidating here avoids that failing SET.
+        if let Some(attachments) = self.attached_databases.get() {
+            attachments.invalidate();
+        }
+
         tracing::debug!(
             old_path = %old_state.physical_path,
             new_path,

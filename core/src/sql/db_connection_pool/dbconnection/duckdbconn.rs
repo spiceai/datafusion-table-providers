@@ -284,14 +284,41 @@ impl DuckDBAttachments {
         format!("attachment_{random_id}_{index}")
     }
 
+    /// Invalidates the cached attach state so the next `attach_once` re-attaches
+    /// from scratch.
+    ///
+    /// Call this when the DuckDB *instance* behind the pool is replaced (a
+    /// database file swap builds a fresh instance). The cache lives on this
+    /// shared object, which survives the swap, but the actual `ATTACH`es live on
+    /// the instance, which the swap discards — so a carried-over cache names
+    /// catalogs the new instance never attached. `attach_once` also self-heals
+    /// if a stale cache slips through, but invalidating here avoids the failing
+    /// `SET search_path` on the first post-swap query.
+    pub fn invalidate(&self) {
+        *self
+            .attached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
     /// Lazily attaches databases on first call, then applies search_path to the connection.
     /// Uses the cached search_path on subsequent calls.
     ///
-    /// If an attached database file has been replaced on disk since the cached
-    /// attach was established — a different file now sits at the same path, as
-    /// a database file swap or a snapshot restore produces — the stale
-    /// attachment still resolves to the retired file, so it is detached and
-    /// re-attached first and queries observe the current file.
+    /// The cache is keyed on the attached files' on-disk identities, so if an
+    /// attached database file has been replaced on disk since the cached attach
+    /// was established — a different file now sits at the same path, as a
+    /// database file swap or a snapshot restore produces — the stale attachment
+    /// still resolves to the retired file, so it is detached and re-attached
+    /// first and queries observe the current file.
+    ///
+    /// The cache cannot, however, see that the *pool's own* DuckDB instance was
+    /// replaced by a file swap: the replacement instance holds none of the
+    /// `ATTACH`es, yet the peer files are unchanged so the cache still looks
+    /// valid. A carried-over `search_path` then names catalogs the new instance
+    /// never attached and `SET search_path` fails. So if it fails, the
+    /// attachments are re-established on this connection's current instance and
+    /// the search_path is retried once. The re-attach re-acquires the cache lock,
+    /// which serializes it against any concurrent detach/re-attach.
     ///
     /// # Errors
     ///
@@ -326,15 +353,35 @@ impl DuckDBAttachments {
                     let search_path = self.attach(conn)?;
                     *attached = Some(AttachedState {
                         search_path: Arc::clone(&search_path),
-                        identities,
+                        identities: identities.clone(),
                     });
                     search_path
                 }
             }
         };
 
-        conn.execute(&format!("SET search_path = '{}'", search_path), [])
-            .context(DuckDBConnectionSnafu)?;
+        if let Err(e) = conn.execute(&format!("SET search_path = '{}'", search_path), []) {
+            // The cached search_path names attachments this connection's instance
+            // does not have — its backing instance was replaced by a database
+            // file swap, which drops every ATTACH. Re-establish the attachments
+            // on the current instance and retry the search_path once. The swap
+            // is not observable until it completes, so one retry suffices.
+            tracing::debug!(
+                "DuckDB SET search_path failed, re-attaching databases {:?} on the current instance: {e}",
+                self.attachments
+            );
+            let mut attached = self
+                .attached
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // `attach` inspects this connection's catalog and sets the
+            // search_path itself, so no further SET is needed here.
+            let search_path = self.attach(conn)?;
+            *attached = Some(AttachedState {
+                search_path,
+                identities,
+            });
+        }
 
         Ok(())
     }
