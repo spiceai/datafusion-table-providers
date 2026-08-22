@@ -1299,6 +1299,197 @@ mod tests {
         );
     }
 
+    /// A database file swap replaces the pool's own DuckDB instance with a fresh
+    /// one that holds none of the `ATTACH`es the old instance had, while the peer
+    /// files it attached are unchanged. The cached search_path therefore looks
+    /// valid but names catalogs the new instance never attached, so
+    /// `SET search_path` fails. `attach_once` must self-heal by re-attaching on
+    /// the current instance and retrying, instead of failing the query — this is
+    /// the regression for the `SET search_path: No catalog + schema named
+    /// "attachment_..."` failures under concurrent load with `replace_file`.
+    #[tokio::test]
+    async fn test_attach_once_reattaches_after_own_instance_swap() {
+        use crate::sql::db_connection_pool::dbconnection::duckdbconn::DuckDBAttachments;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let peer_path = dir.path().join("peer.db").to_string_lossy().to_string();
+        let main_a = dir.path().join("main_a.db").to_string_lossy().to_string();
+        let main_b = dir.path().join("main_b.db").to_string_lossy().to_string();
+
+        // A peer database, unchanged for the whole test, that main attaches.
+        {
+            let conn = Connection::open(&peer_path).expect("open peer");
+            conn.execute_batch(
+                "CREATE TABLE peer_data (v INTEGER); INSERT INTO peer_data VALUES (1), (2);",
+            )
+            .expect("seed peer");
+        }
+
+        // The attachment cache is shared across every connection of the logical
+        // pool and survives a file swap; each `Connection::open` here is a
+        // distinct DuckDB instance, modelling the pre- and post-swap instances.
+        let attachments =
+            DuckDBAttachments::new("main", &[Arc::from(peer_path.as_str()) as Arc<str>]);
+
+        // Pre-swap instance: attach and populate the cache.
+        let before = Connection::open(&main_a).expect("open main_a");
+        attachments.attach_once(&before).expect("initial attach");
+        assert_eq!(count(&before, "SELECT COUNT(1) FROM peer_data"), 2);
+
+        // Post-swap instance: a fresh instance with no attachments, while the
+        // peer file (and thus the cached identities) is unchanged. The carried
+        // cache would `SET search_path` over an attachment this instance lacks.
+        let after = Connection::open(&main_b).expect("open main_b");
+        attachments
+            .attach_once(&after)
+            .expect("attach_once must self-heal after an own-instance swap");
+        assert_eq!(
+            count(&after, "SELECT COUNT(1) FROM peer_data"),
+            2,
+            "the peer must be re-attached on the swapped-in instance"
+        );
+
+        // `invalidate` drops the cache so the next attach_once re-attaches from
+        // scratch — the proactive path a swap takes.
+        attachments.invalidate();
+        let after_invalidate =
+            Connection::open(dir.path().join("main_c.db").to_string_lossy().as_ref())
+                .expect("open main_c");
+        attachments
+            .attach_once(&after_invalidate)
+            .expect("attach_once after invalidate");
+        assert_eq!(
+            count(&after_invalidate, "SELECT COUNT(1) FROM peer_data"),
+            2
+        );
+    }
+
+    /// The reported failure (#13363) only appears under concurrent load: readers
+    /// run a cross-database query (which resolves through `attach_once` +
+    /// `SET search_path`) while the pool's own instance is swapped out from under
+    /// them by a `replace_file` refresh. The swapped-in instance holds none of
+    /// the attachments, so a reader reusing the cached `search_path` would
+    /// otherwise apply it over a catalog the new instance never attached and fail
+    /// with `No catalog + schema named "attachment_..."`.
+    ///
+    /// The fix must hold under concurrency: `swap_database_file` invalidates the
+    /// cache and `attach_once` self-heals the raced case (re-attaching under the
+    /// cache lock). A return to the pre-fix behavior makes at least one reader
+    /// fail. Threads align with a `Barrier` and the swap loop runs many rounds so
+    /// readers reliably straddle a swap — no timing sleeps are used.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_attach_once_survives_concurrent_swaps() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Barrier, Mutex};
+
+        // Writes a fresh peer database (two rows) at `path`.
+        fn write_peer(dir: &Path, path: &str) {
+            let staging = dir.join("peer_stage.db");
+            let staging = staging.to_string_lossy().to_string();
+            let _ = std::fs::remove_file(&staging);
+            {
+                let conn = Connection::open(&staging).expect("open staging peer");
+                conn.execute_batch(
+                    "CREATE TABLE peer_data (v INTEGER); INSERT INTO peer_data VALUES (1), (2);",
+                )
+                .expect("seed staging peer");
+            }
+            std::fs::rename(&staging, path).expect("place peer file");
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("main.db").to_string_lossy().to_string();
+        let peer_path = dir.path().join("peer.db").to_string_lossy().to_string();
+        write_peer(dir.path(), &peer_path);
+
+        let pool = Arc::new(
+            DuckDbConnectionPoolBuilder::file(&db_path)
+                .with_access_mode(AccessMode::ReadWrite)
+                .build()
+                .expect("pool")
+                .set_attached_databases(&[Arc::from(peer_path.as_str()) as Arc<str>])
+                .expect("attach peer"),
+        );
+
+        // Prime the attachment cache so the first swap has a stale entry to hit.
+        {
+            let conn = pooled_raw_connection(&pool);
+            pool.get_attachments()
+                .expect("attachments configured")
+                .attach_once(&conn)
+                .expect("initial attach");
+            assert_eq!(count(&conn, "SELECT COUNT(1) FROM peer_data"), 2);
+        }
+
+        const READERS: usize = 6;
+        const SWAPS: usize = 60;
+
+        let barrier = Arc::new(Barrier::new(READERS + 1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let readers: Vec<_> = (0..READERS)
+            .map(|_| {
+                let pool = Arc::clone(&pool);
+                let barrier = Arc::clone(&barrier);
+                let stop = Arc::clone(&stop);
+                let errors = Arc::clone(&errors);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    while !stop.load(Ordering::Relaxed) {
+                        let conn = pooled_raw_connection(&pool);
+                        let attachments = pool.get_attachments().expect("attachments configured");
+                        if let Err(e) = attachments.attach_once(&conn) {
+                            errors
+                                .lock()
+                                .expect("errors lock")
+                                .push(format!("attach_once failed after a concurrent swap: {e}"));
+                            return;
+                        }
+                        match conn.query_row("SELECT COUNT(1) FROM peer_data", [], |r| {
+                            r.get::<usize, i64>(0)
+                        }) {
+                            Ok(rows) if rows == 2 => {}
+                            Ok(rows) => {
+                                errors
+                                    .lock()
+                                    .expect("errors lock")
+                                    .push(format!("peer_data returned {rows} rows, expected 2"));
+                                return;
+                            }
+                            Err(e) => {
+                                errors
+                                    .lock()
+                                    .expect("errors lock")
+                                    .push(format!("cross-database query failed: {e}"));
+                                return;
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        barrier.wait();
+        for i in 0..SWAPS {
+            let new_path = dir
+                .path()
+                .join(format!("gen_{i}.db"))
+                .to_string_lossy()
+                .to_string();
+            pool.swap_database_file(&new_path)
+                .expect("swap the pool's own instance");
+        }
+        stop.store(true, Ordering::Relaxed);
+
+        for reader in readers {
+            reader.join().expect("reader thread panicked");
+        }
+
+        let errors = errors.lock().expect("errors lock");
+        assert!(errors.is_empty(), "concurrent readers failed: {errors:?}");
+    }
+
     #[test]
     fn test_parse_generation_suffix() {
         assert_eq!(
