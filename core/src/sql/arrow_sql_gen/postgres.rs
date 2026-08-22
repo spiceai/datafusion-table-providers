@@ -46,16 +46,6 @@ pub enum Error {
     NoBuilderForIndex { index: usize },
 
     #[snafu(display(
-        "Failed to read column '{column}': a value has {value_scale} decimal places but the column carries {column_scale}, so returning it would drop digits it actually holds. \
-        Declare the column as NUMERIC(38, {value_scale}) or wider at the source."
-    ))]
-    NumericScaleTooWide {
-        column: String,
-        value_scale: u32,
-        column_scale: i8,
-    },
-
-    #[snafu(display(
         "Failed to read column '{column}': a value needs more than the {column_precision} digits the column carries once it is given {column_scale} decimal places. \
         Declare the column with a smaller scale at the source, or read it as text."
     ))]
@@ -278,21 +268,21 @@ macro_rules! append_composite_fields_to_struct {
 /// either — `LIMIT 1` has no `ORDER BY`.
 ///
 /// A fixed pair keeps the column deterministic and carries every value with up
-/// to 20 decimal places exactly. A value needing more is refused rather than
-/// rounded away (see `NumericScaleTooWide`).
+/// to 20 decimal places exactly; a value needing more is rounded to it (see
+/// `numeric_coefficient`).
 const NUMERIC_UNDECLARED_PRECISION: u8 = 38;
 const NUMERIC_UNDECLARED_SCALE: i8 = 20;
 
 /// Why a `NUMERIC` value cannot be carried by the column it was read into.
+#[derive(Debug)]
 enum NumericFit {
-    /// The value has digits finer than the column's scale.
-    ScaleTooNarrow,
-    /// The coefficient needs more digits than the column's precision.
+    /// The value needs more digits than the column's precision even after
+    /// rounding to its scale.
     PrecisionTooNarrow,
 }
 
-/// The `Decimal128` coefficient of `value` at `precision` and `scale`, or why
-/// it does not fit them.
+/// The `Decimal128` coefficient of `value` rounded to `precision` and `scale`,
+/// or why it does not fit them.
 ///
 /// Deliberately not `Decimal::rescale`. `rust_decimal` holds a 96-bit
 /// coefficient, and rescaling toward a scale whose coefficient will not fit
@@ -301,10 +291,21 @@ enum NumericFit {
 /// Rescaling `1000000000` toward 20 stops at 19, so it reads back as
 /// `100000000`; an 18-digit integer stops at 11 and comes back nine orders of
 /// magnitude out. `i128` spans the whole `Decimal128` range, so shift the
-/// coefficient here, and report a value that fits neither the shift nor the
-/// digits the column declares rather than quietly altering it.
+/// coefficient here instead.
+///
+/// A value can carry more decimal places than `scale` — federation pushes an
+/// aggregate or division expression to Postgres, whose own `NUMERIC`
+/// arithmetic settles on a scale of its own, often wider than the one the
+/// caller's schema already committed to for that column (e.g. `AVG` on a
+/// `NUMERIC(15,2)` column widens the expected scale by a fixed few digits,
+/// while Postgres computes the average to its own, larger scale). Rounding
+/// away the extra digits — half away from zero, at this exact integer
+/// coefficient rather than through `rescale` — reproduces what casting the
+/// value to `NUMERIC(precision, scale)` at the source would have produced, so
+/// it is widening (which can only ever add trailing zeros) that is exact here,
+/// never narrowing.
 fn numeric_coefficient(value: &Decimal, precision: u8, scale: i8) -> Result<i128, NumericFit> {
-    let value_scale = i32::try_from(value.scale()).map_err(|_| NumericFit::ScaleTooNarrow)?;
+    let value_scale = i32::try_from(value.scale()).unwrap_or(i32::MAX);
     let shift = i32::from(scale) - value_scale;
     let mantissa = value.mantissa();
 
@@ -316,16 +317,22 @@ fn numeric_coefficient(value: &Decimal, precision: u8, scale: i8) -> Result<i128
     } else {
         // The column holds fewer decimal places than the value carries — a
         // negative scale holds none at all and counts trailing zeros instead,
-        // so `NUMERIC(2, -3)` stores `12000` as the coefficient `12`. Shifting
-        // down is only sound when it divides exactly; anything else would drop
-        // digits the value actually holds.
+        // so `NUMERIC(2, -3)` stores `12000` as the coefficient `12`. Round to
+        // the nearest multiple of the divisor rather than requiring an exact
+        // one, so a value that merely carries more precision than the column
+        // declares is still represented — just at the precision the column
+        // actually has room for.
         let divisor = 10i128
             .checked_pow(shift.unsigned_abs())
-            .ok_or(NumericFit::ScaleTooNarrow)?;
-        if mantissa % divisor != 0 {
-            return Err(NumericFit::ScaleTooNarrow);
+            .ok_or(NumericFit::PrecisionTooNarrow)?;
+        let truncated = mantissa / divisor;
+        let remainder = mantissa % divisor;
+        let round_away_from_zero = remainder.unsigned_abs().saturating_mul(2) >= divisor.unsigned_abs();
+        if round_away_from_zero {
+            truncated + mantissa.signum()
+        } else {
+            truncated
         }
-        mantissa / divisor
     };
 
     let limit = 10u128
@@ -691,9 +698,8 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                     // Every value of the column lands on the one scale the
                     // column carries — the declared one, or
                     // `NUMERIC_UNDECLARED_SCALE` when the schema declares none.
-                    // Widening to it is exact; narrowing would hand back a
-                    // number the source never held, so refuse rather than round
-                    // it away.
+                    // Widening to it is exact; narrowing rounds to it (see
+                    // `numeric_coefficient`).
                     let column_name = || column_names.get(i).cloned().unwrap_or_default();
                     // The field is the authority on both: a negative scale
                     // survives into it (`numeric(2,-3)`), and cannot be carried
@@ -704,19 +710,13 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                             _ => (NUMERIC_UNDECLARED_PRECISION, NUMERIC_UNDECLARED_SCALE),
                         };
                     let coefficient = numeric_coefficient(&v, dest_precision, dest_scale).map_err(
-                        |fit| match fit {
-                            NumericFit::ScaleTooNarrow => NumericScaleTooWideSnafu {
-                                column: column_name(),
-                                value_scale: v.scale(),
-                                column_scale: dest_scale,
-                            }
-                            .build(),
-                            NumericFit::PrecisionTooNarrow => NumericValueTooLargeSnafu {
+                        |NumericFit::PrecisionTooNarrow| {
+                            NumericValueTooLargeSnafu {
                                 column: column_name(),
                                 column_precision: dest_precision,
                                 column_scale: dest_scale,
                             }
-                            .build(),
+                            .build()
                         },
                     )?;
                     dec_builder.append_value(coefficient);
@@ -1657,6 +1657,58 @@ mod tests {
         let negative_result = Decimal::from_sql(&Type::NUMERIC, negative_raw.as_slice())
             .expect("Failed to run FromSql");
         assert_eq!(negative_result, negative);
+    }
+
+    #[test]
+    fn test_numeric_coefficient_rounds_when_value_has_more_scale_than_column() {
+        // Mirrors AVG/division pushed down to Postgres: the value comes back
+        // with more decimal places than the destination scale (e.g. the
+        // schema already committed to `Decimal128(38, 6)` for an average, but
+        // Postgres computed it to 16 places).
+        let value = Decimal::from_str("24.1234567890123456").expect("valid decimal");
+        let coefficient =
+            numeric_coefficient(&value, 38, 6).expect("rounds instead of refusing");
+        assert_eq!(coefficient, 24_123_457);
+
+        let negative = Decimal::from_str("-24.1234567890123456").expect("valid decimal");
+        let negative_coefficient =
+            numeric_coefficient(&negative, 38, 6).expect("rounds instead of refusing");
+        assert_eq!(negative_coefficient, -24_123_457);
+    }
+
+    #[test]
+    fn test_numeric_coefficient_rounds_half_away_from_zero() {
+        let half_up = Decimal::from_str("1.25").expect("valid decimal");
+        assert_eq!(
+            numeric_coefficient(&half_up, 38, 1).expect("rounds"),
+            13
+        );
+
+        let half_down = Decimal::from_str("-1.25").expect("valid decimal");
+        assert_eq!(
+            numeric_coefficient(&half_down, 38, 1).expect("rounds"),
+            -13
+        );
+
+        let exact = Decimal::from_str("1.20").expect("valid decimal");
+        assert_eq!(numeric_coefficient(&exact, 38, 1).expect("rounds"), 12);
+    }
+
+    #[test]
+    fn test_numeric_coefficient_rounding_can_still_overflow_precision() {
+        // Rounding `9.99...` up at scale 0 needs a 3-digit coefficient, which
+        // a `NUMERIC(2, 0)` column has no room for.
+        let value = Decimal::from_str("99.9").expect("valid decimal");
+        assert!(matches!(
+            numeric_coefficient(&value, 2, 0),
+            Err(NumericFit::PrecisionTooNarrow)
+        ));
+    }
+
+    #[test]
+    fn test_numeric_coefficient_widens_exactly() {
+        let value = Decimal::from_str("1.5").expect("valid decimal");
+        assert_eq!(numeric_coefficient(&value, 38, 4).expect("widens"), 15_000);
     }
 
     #[test]
