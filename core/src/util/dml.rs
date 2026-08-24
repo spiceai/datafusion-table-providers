@@ -1,5 +1,7 @@
 use std::{fmt, sync::Arc};
 
+use arrow::datatypes::Schema;
+
 use async_trait::async_trait;
 use datafusion::{
     error::DataFusionError,
@@ -20,9 +22,22 @@ pub fn filters_to_sql(
     filters: &[Expr],
     engine: Option<expr::Engine>,
 ) -> datafusion::error::Result<String> {
+    filters_to_sql_with_schema(filters, engine, None)
+}
+
+/// [`filters_to_sql`], given the schema the filters' columns belong to.
+///
+/// The schema is what lets the DuckDB rendering tell a column that needs its timestamp
+/// normalization from one the normalization would only truncate — see
+/// [`expr::to_sql_with_engine_and_schema`].
+pub fn filters_to_sql_with_schema(
+    filters: &[Expr],
+    engine: Option<expr::Engine>,
+    schema: Option<&Schema>,
+) -> datafusion::error::Result<String> {
     let sql_parts: Result<Vec<String>, _> = filters
         .iter()
-        .map(|f| expr::to_sql_with_engine(f, engine))
+        .map(|f| expr::to_sql_with_engine_and_schema(f, engine, schema))
         .collect();
     sql_parts
         .map(|parts| match parts.as_slice() {
@@ -47,10 +62,19 @@ pub fn assignments_to_sql(
     assignments: &[(String, Expr)],
     engine: Option<expr::Engine>,
 ) -> datafusion::error::Result<String> {
+    assignments_to_sql_with_schema(assignments, engine, None)
+}
+
+/// [`assignments_to_sql`], given the schema the assignments' columns belong to.
+pub fn assignments_to_sql_with_schema(
+    assignments: &[(String, Expr)],
+    engine: Option<expr::Engine>,
+    schema: Option<&Schema>,
+) -> datafusion::error::Result<String> {
     let parts: Result<Vec<String>, _> = assignments
         .iter()
         .map(|(col, val)| {
-            expr::to_sql_with_engine(val, engine)
+            expr::to_sql_with_engine_and_schema(val, engine, schema)
                 .map(|sql_val| format!("{col} = {sql_val}", col = expr::quoted_identifier(col)))
         })
         .collect();
@@ -907,5 +931,253 @@ mod sqlite_execution_tests {
             .collect::<rusqlite::Result<Vec<i32>>>()
             .expect("rows");
         assert_eq!(quantities, vec![10, 99]);
+    }
+}
+
+/// The DuckDB timestamp normalization is only correct if the rows DuckDB then removes are the
+/// rows the filter named, so these run the `DELETE` the DML path builds and assert on what
+/// survives it. A rendering assertion cannot tell "normalized" from "normalized into a different
+/// instant".
+#[cfg(all(test, feature = "duckdb"))]
+mod duckdb_timestamp_precision_tests {
+    use super::*;
+    use crate::sql::sql_provider_datafusion::expr::Engine;
+    use arrow::datatypes::{DataType, Field, TimeUnit};
+    use datafusion::prelude::*;
+    use datafusion::scalar::ScalarValue;
+    use duckdb::Connection;
+
+    /// `2026-01-01 00:00:00` UTC, in microseconds.
+    const EPOCH_US: i64 = 1_767_225_600_000_000;
+
+    /// Row 1 sits 999µs past the second, row 2 sits on it. A filter naming any instant between
+    /// the two must remove exactly row 1 — and cannot, once both operands collapse onto the
+    /// second.
+    const MICROSECOND_APART: [&str; 2] = [
+        "2026-01-01 00:00:00.000999+00",
+        "2026-01-01 00:00:00.000000+00",
+    ];
+
+    fn schema(ts: DataType) -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("ts", ts, true),
+        ])
+    }
+
+    fn ts_literal(value: ScalarValue) -> Expr {
+        Expr::Literal(value, None)
+    }
+
+    /// Runs `setup` against a fresh in-memory DuckDB, then returns the single column `query`
+    /// selects. Every test here asserts on rows that survived a statement, so the statement and
+    /// the read have to share one connection.
+    fn one_column<T: duckdb::types::FromSql>(setup: &[String], query: &str) -> Vec<T> {
+        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+        for statement in setup {
+            conn.execute_batch(statement).unwrap_or_else(|e| {
+                panic!("the rendered statement must be valid DuckDB SQL: {statement}: {e}")
+            });
+        }
+
+        let mut stmt = conn.prepare(query).expect("prepare");
+        stmt.query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<duckdb::Result<Vec<T>>>()
+            .expect("rows")
+    }
+
+    /// Runs the `DELETE` the DML path builds for `where_clause` over a two-row table of
+    /// `column_type`, and returns the ids that survive it.
+    fn surviving_ids(column_type: &str, values: [&str; 2], where_clause: &str) -> Vec<i32> {
+        one_column(
+            &[
+                format!("CREATE TABLE t (id INTEGER, ts {column_type})"),
+                format!(
+                    "INSERT INTO t VALUES (1, '{}'), (2, '{}')",
+                    values[0], values[1]
+                ),
+                format!("DELETE FROM t WHERE {where_clause}"),
+            ],
+            "SELECT id FROM t ORDER BY id",
+        )
+    }
+
+    /// The reported defect, end to end. Row 1 sits 999µs past the second and row 2 sits on it;
+    /// the filter names the 500µs mark, so exactly row 1 goes.
+    ///
+    /// Normalized, both operands collapse onto the second, the predicate is false for every row,
+    /// and the `DELETE` silently removes nothing.
+    #[test]
+    fn a_microsecond_timestamptz_deletes_the_row_inside_the_millisecond() {
+        let schema = schema(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ));
+        let filters = vec![col("ts").gt(ts_literal(ScalarValue::TimestampMicrosecond(
+            Some(EPOCH_US + 500),
+            Some("UTC".into()),
+        )))];
+
+        let with_schema = filters_to_sql_with_schema(&filters, Some(Engine::DuckDB), Some(&schema))
+            .expect("filters_to_sql should succeed");
+        assert_eq!(with_schema, "\"ts\" > TO_TIMESTAMP(1767225600.0005)");
+        assert_eq!(
+            surviving_ids("TIMESTAMPTZ", MICROSECOND_APART, &with_schema),
+            vec![2],
+            "the row past the filter's instant must be the one removed"
+        );
+
+        // The same filter with the column-side truncation left in place, which isolates it from
+        // the literal rendering: the column collapses onto the millisecond it started in, and the
+        // row the caller selected survives even though the literal is exact.
+        let without_schema =
+            filters_to_sql(&filters, Some(Engine::DuckDB)).expect("filters_to_sql should succeed");
+        assert_eq!(
+            without_schema,
+            "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) > TO_TIMESTAMP(1767225600.0005)"
+        );
+        assert_eq!(
+            surviving_ids("TIMESTAMPTZ", MICROSECOND_APART, &without_schema),
+            vec![1, 2],
+            "this is the defect being fixed: the truncated comparison removes nothing"
+        );
+    }
+
+    /// The types the normalization exists for keep it, and keep working. Without it DuckDB v1.5.5
+    /// refuses the statement outright — *"Cannot compare values of type TIMESTAMP_MS and type
+    /// TIMESTAMP WITH TIME ZONE"* — so this is the check that the type test did not narrow the
+    /// rewrite past the case it was written for.
+    #[test]
+    fn a_naive_millisecond_column_is_still_normalized_and_still_binds() {
+        let schema = schema(DataType::Timestamp(TimeUnit::Millisecond, None));
+        let filters = vec![col("ts").gt(ts_literal(ScalarValue::TimestampMillisecond(
+            Some(1_767_225_600_001),
+            None,
+        )))];
+
+        let where_clause =
+            filters_to_sql_with_schema(&filters, Some(Engine::DuckDB), Some(&schema))
+                .expect("filters_to_sql should succeed");
+        assert_eq!(
+            where_clause,
+            "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) > TO_TIMESTAMP(1767225600.001)"
+        );
+        assert_eq!(
+            surviving_ids(
+                "TIMESTAMP_MS",
+                ["2026-01-01 00:00:00.002", "2026-01-01 00:00:00.001"],
+                &where_clause,
+            ),
+            vec![2],
+        );
+    }
+
+    /// Subtraction is the one non-comparison operator the rewrite covers, and the type test now
+    /// takes it off a timezone-aware column too. DuckDB v1.5.5 refuses `TIMESTAMP_MS - TIMESTAMPTZ`
+    /// — which is why the rewrite reaches subtraction at all — but subtracts two `TIMESTAMPTZ`
+    /// values happily, returning the same interval the normalized form does.
+    #[test]
+    fn subtracting_a_timestamp_from_a_timezone_aware_column_still_binds() {
+        let schema = schema(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ));
+        let difference = col("ts")
+            - ts_literal(ScalarValue::TimestampMicrosecond(
+                Some(EPOCH_US),
+                Some("UTC".into()),
+            ));
+
+        let rendered = assignments_to_sql_with_schema(
+            &[("d".to_string(), difference)],
+            Some(Engine::DuckDB),
+            Some(&schema),
+        )
+        .expect("assignments_to_sql should succeed");
+        assert_eq!(rendered, "\"d\" = \"ts\" - TO_TIMESTAMP(1767225600)");
+
+        let difference: Vec<String> = one_column(
+            &[
+                "CREATE TABLE t (ts TIMESTAMPTZ)".to_string(),
+                "INSERT INTO t VALUES ('2026-01-01 00:00:01.5+00')".to_string(),
+            ],
+            "SELECT (\"ts\" - TO_TIMESTAMP(1767225600))::VARCHAR FROM t",
+        );
+
+        assert_eq!(difference, vec!["00:00:01.5".to_string()]);
+    }
+
+    /// A `DATE` column is the case where the normalization is load-bearing for the *reference
+    /// frame* rather than for binding. DuckDB promotes a bare `DATE` to a `TIMESTAMPTZ` at midnight
+    /// in the session's `TimeZone`; the rendered literal is midnight UTC. Under a session west of
+    /// UTC the two are different instants, so declining the rewrite for a resolved date type would
+    /// make a `DELETE` remove different rows depending on the host.
+    #[test]
+    fn a_date_column_is_compared_in_utc_whatever_the_session_timezone_is() {
+        let schema = schema(DataType::Date32);
+        let filters = vec![col("ts").eq(ts_literal(ScalarValue::TimestampMicrosecond(
+            Some(EPOCH_US),
+            Some("UTC".into()),
+        )))];
+
+        let where_clause =
+            filters_to_sql_with_schema(&filters, Some(Engine::DuckDB), Some(&schema))
+                .expect("filters_to_sql should succeed");
+        assert_eq!(
+            where_clause,
+            "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) = TO_TIMESTAMP(1767225600)"
+        );
+
+        // Row 1 is the date the filter names. It must go under either session timezone.
+        for timezone in ["UTC", "America/Los_Angeles"] {
+            let surviving: Vec<i32> = one_column(
+                &[
+                    format!("SET TimeZone='{timezone}'"),
+                    "CREATE TABLE t (id INTEGER, ts DATE)".to_string(),
+                    "INSERT INTO t VALUES (1, '2026-01-01'), (2, '2026-01-02')".to_string(),
+                    format!("DELETE FROM t WHERE {where_clause}"),
+                ],
+                "SELECT id FROM t ORDER BY id",
+            );
+
+            assert_eq!(surviving, vec![2], "session TimeZone {timezone}");
+        }
+    }
+
+    /// A `SET` value carries the same literal rendering as a filter, so an `UPDATE` writing a
+    /// sub-second instant has to store the instant it was given.
+    #[test]
+    fn an_update_stores_the_sub_second_instant_it_was_assigned() {
+        let schema = schema(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ));
+        let assignments = vec![(
+            "ts".to_string(),
+            ts_literal(ScalarValue::TimestampMicrosecond(
+                Some(EPOCH_US + 999),
+                Some("UTC".into()),
+            )),
+        )];
+
+        let set_clause =
+            assignments_to_sql_with_schema(&assignments, Some(Engine::DuckDB), Some(&schema))
+                .expect("assignments_to_sql should succeed");
+        assert_eq!(set_clause, "\"ts\" = TO_TIMESTAMP(1767225600.000999)");
+
+        // Pinned so the rendered instant is read back in the frame it was written in, rather
+        // than in whatever zone the host happens to be set to.
+        let stored: Vec<String> = one_column(
+            &[
+                "SET TimeZone='UTC'".to_string(),
+                "CREATE TABLE t (id INTEGER, ts TIMESTAMPTZ)".to_string(),
+                "INSERT INTO t VALUES (1, '2020-01-01 00:00:00+00')".to_string(),
+                update_statement(&TableReference::bare("t"), &set_clause, None),
+            ],
+            "SELECT ts::VARCHAR FROM t",
+        );
+
+        assert_eq!(stored, vec!["2026-01-01 00:00:00.000999+00".to_string()]);
     }
 }
