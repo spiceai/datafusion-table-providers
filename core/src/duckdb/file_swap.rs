@@ -834,12 +834,14 @@ fn prepare_hnsw_support(live_conn: &Connection) {
 /// Ordering (all under the exclusive write gate):
 /// 1. `rename(building, generation)` — marks the staging output complete;
 ///    recovery adopts completed generations, never `.building` files.
-/// 2. Unlink the old database file and its WAL. From here the configured path
-///    is free; a crash before step 3 is healed at boot by adopting the
+/// 2. Clear the WAL beside the configured path, and unlink the retiring file
+///    only when it is not the configured path — step 3 replaces that one
+///    atomically. A crash before step 3 is healed at boot by adopting the
 ///    generation.
 /// 3. `rename(generation, configured)` — the new file takes the live name.
-/// 4. Repoint the pool. If the old file could not be unlinked (Windows file
-///    locking), serve the generation path instead; a restart normalizes it.
+/// 4. Repoint the pool. If the configured WAL could not be cleared (Windows
+///    file locking), serve the generation path instead; a later swap or a
+///    restart normalizes it.
 fn complete_swap(
     pool: &Arc<DuckDbConnectionPool>,
     building_path: &str,
@@ -869,33 +871,29 @@ fn complete_swap(
         })
         .map_err(to_retriable_data_write_error)?;
 
-    // Free the configured path: remove the retiring file (which may already
-    // live at a generation path if a previous swap could not reclaim the
-    // configured name) and any stale file still holding the configured name.
-    let mut configured_free = true;
-    for stale in [old_physical.clone(), configured_path.clone()] {
-        match remove_file_if_exists(&stale) {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to remove retiring DuckDB database file {stale} during file swap: {e}"
-                );
-                if stale == configured_path {
-                    configured_free = false;
-                }
-            }
+    // A foreign WAL left beside the configured path would be replayed against
+    // the new file, so failing to remove it blocks reclaiming that name.
+    let configured_free = match remove_file_if_exists(&wal_path_of(&configured_path)) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to remove retiring DuckDB WAL file {configured_path}.wal during file swap: {e}"
+            );
+            false
         }
-        match remove_file_if_exists(&wal_path_of(&stale)) {
-            Ok(_) => {}
-            Err(e) => {
+    };
+
+    // Remove the retiring file and its WAL only when the file is not the
+    // configured path: the rename below replaces that path atomically, and the
+    // retired inode stays alive for readers still holding it open. The
+    // configured path must never be unlinked -- peers attach it by name and
+    // fail if it is briefly absent.
+    if old_physical != configured_path {
+        for stale in [wal_path_of(&old_physical), old_physical.clone()] {
+            if let Err(e) = remove_file_if_exists(&stale) {
                 tracing::warn!(
-                    "Failed to remove retiring DuckDB WAL file {stale}.wal during file swap: {e}"
+                    "Failed to remove retiring DuckDB file {stale} during file swap: {e}"
                 );
-                if stale == configured_path {
-                    // A foreign WAL beside the configured path would be
-                    // replayed against the new file — do not place it there.
-                    configured_free = false;
-                }
             }
         }
     }
@@ -912,7 +910,7 @@ fn complete_swap(
         }
     } else {
         tracing::warn!(
-            "Configured DuckDB database path {configured_path} is not reclaimable; serving {generation_path} until restart"
+            "Configured DuckDB database path {configured_path} is not reclaimable; serving {generation_path}. Instances that attached it keep reading the retired file until a later swap reclaims the name"
         );
         generation_path.to_string()
     };
@@ -1488,6 +1486,64 @@ mod tests {
 
         let errors = errors.lock().expect("errors lock");
         assert!(errors.is_empty(), "concurrent readers failed: {errors:?}");
+    }
+
+    /// The configured database path exists continuously across a swap.
+    ///
+    /// Peers attach this path by name, and both the `ATTACH` and its pre-flight
+    /// `fs::metadata` resolve it at that moment, so a moment where the path is
+    /// absent fails their queries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_configured_path_is_never_absent_during_swap() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("swap_gap.db").to_string_lossy().to_string();
+
+        let pool = Arc::new(
+            DuckDbConnectionPoolBuilder::file(&db_path)
+                .with_access_mode(AccessMode::ReadWrite)
+                .build()
+                .expect("pool"),
+        );
+
+        let definition = swap_dataset_definition();
+        overwrite_with_swap(&pool, &definition, &[(1, "one")]).await;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let misses = Arc::new(AtomicU64::new(0));
+        let probes = Arc::new(AtomicU64::new(0));
+
+        // Probe the configured path exactly as a peer instance's attach
+        // pre-flight does, as fast as possible.
+        let watcher = {
+            let path = db_path.clone();
+            let stop = Arc::clone(&stop);
+            let misses = Arc::clone(&misses);
+            let probes = Arc::clone(&probes);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    probes.fetch_add(1, Ordering::Relaxed);
+                    if std::fs::metadata(&path).is_err() {
+                        misses.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+
+        for i in 0..8 {
+            overwrite_with_swap(&pool, &definition, &[(i, "row"), (i + 1, "row")]).await;
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        watcher.join().expect("watcher");
+
+        assert_eq!(
+            misses.load(Ordering::Relaxed),
+            0,
+            "configured path vanished during a swap, over {} probes",
+            probes.load(Ordering::Relaxed)
+        );
     }
 
     #[test]
