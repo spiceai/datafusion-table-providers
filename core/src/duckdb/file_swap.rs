@@ -836,12 +836,10 @@ fn prepare_hnsw_support(live_conn: &Connection) {
 ///    recovery adopts completed generations, never `.building` files.
 /// 2. Clear the WAL beside the configured path, and unlink the retiring file
 ///    only when it is not the configured path — step 3 replaces that one
-///    atomically. A crash before step 3 is healed at boot by adopting the
-///    generation.
+///    atomically.
 /// 3. `rename(generation, configured)` — the new file takes the live name.
 /// 4. Repoint the pool. If the configured WAL could not be cleared (Windows
-///    file locking), serve the generation path instead; a later swap or a
-///    restart normalizes it.
+///    file locking), serve the generation path instead.
 fn complete_swap(
     pool: &Arc<DuckDbConnectionPool>,
     building_path: &str,
@@ -1512,8 +1510,10 @@ mod tests {
         attachments.attach_once(&conn).expect("attach");
 
         // A catalog that is not ours and was never attached.
+        let calls = std::cell::Cell::new(0);
         let err = attachments
             .with_attachment_recovery(&conn, |c| {
+                calls.set(calls.get() + 1);
                 c.prepare("SELECT * FROM not_our_catalog.main.t")
                     .map(|_| ())
             })
@@ -1523,15 +1523,21 @@ mod tests {
             msg.contains("not_our_catalog"),
             "the original error must surface unchanged, got: {msg}"
         );
+        assert_eq!(calls.get(), 1, "an unrelated error must not be retried");
 
         // And a plain syntax error must also pass straight through.
+        let calls = std::cell::Cell::new(0);
         let err = attachments
-            .with_attachment_recovery(&conn, |c| c.prepare("SELECT FROM WHERE").map(|_| ()))
+            .with_attachment_recovery(&conn, |c| {
+                calls.set(calls.get() + 1);
+                c.prepare("SELECT FROM WHERE").map(|_| ())
+            })
             .expect_err("must not succeed");
         assert!(
             !err.to_string().contains("attachment_"),
             "a syntax error must not be reported as an attachment problem: {err}"
         );
+        assert_eq!(calls.get(), 1, "a syntax error must not be retried");
 
         // The healthy path still works after both failures.
         attachments

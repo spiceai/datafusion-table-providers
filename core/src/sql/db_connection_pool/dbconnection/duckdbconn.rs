@@ -312,7 +312,7 @@ impl DuckDBAttachments {
     ///
     /// Returns the original error if it is not a stale-attachment failure, or
     /// the retry's error if recovery did not help.
-    pub fn with_attachment_recovery<T>(
+    pub(crate) fn with_attachment_recovery<T>(
         &self,
         conn: &Connection,
         mut op: impl FnMut(&Connection) -> duckdb::Result<T>,
