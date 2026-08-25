@@ -308,12 +308,8 @@ fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> 
                 // exceeds the 2^53 an `f64` represents exactly, which would round the value by a
                 // few hundred nanoseconds and could carry that into the microsecond DuckDB keeps.
                 // `div_euclid` floors, so the truncation goes the same way either side of the
-                // epoch. The microsecond value is then subject to the same year-2255 bound as the
-                // arm below.
-                Some(Engine::DuckDB) => {
-                    let seconds = value.div_euclid(1_000) as f64 / 1_000_000.0;
-                    Ok(format!("TO_TIMESTAMP({seconds})"))
-                }
+                // epoch.
+                Some(Engine::DuckDB) => Ok(duckdb_timestamp_literal(value.div_euclid(1_000))),
                 _ => Ok(format!("TO_TIMESTAMP({})", value / 1_000_000_000)),
             },
             ScalarValue::TimestampMicrosecond(Some(value), timezone) => {
@@ -330,16 +326,7 @@ fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> 
                         }
                     }
                     Some(Engine::MySQL) => Ok(format!("FROM_UNIXTIME({seconds})")),
-                    // Integer division, as the catch-all arm does it, would round the literal
-                    // down to a whole second, moving which rows a comparison against it selects.
-                    //
-                    // `TO_TIMESTAMP` takes a `DOUBLE`, so microsecond resolution is exact only
-                    // while the epoch-second value keeps 16 significant digits — up to about the
-                    // year 2255. Past that the instant can land a microsecond out, and rendering
-                    // the fraction from integer arithmetic does not help: DuckDB's own parse is
-                    // what rounds. Verified at 2260, where both forms land on the same wrong
-                    // microsecond.
-                    Some(Engine::DuckDB) => Ok(format!("TO_TIMESTAMP({seconds})")),
+                    Some(Engine::DuckDB) => Ok(duckdb_timestamp_literal(*value)),
                     _ => Ok(format!("TO_TIMESTAMP({})", value / 1_000_000)),
                 }
             }
@@ -354,8 +341,7 @@ fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> 
                             Ok(format!("TO_TIMESTAMP({seconds})"))
                         }
                     }
-                    // As in the microsecond arm above.
-                    Some(Engine::DuckDB) => Ok(format!("TO_TIMESTAMP({seconds})")),
+                    Some(Engine::DuckDB) => duckdb_timestamp_literal_from(*value, 1_000, expr),
                     _ => Ok(format!("TO_TIMESTAMP({})", value / 1000)),
                 }
             }
@@ -368,6 +354,7 @@ fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> 
                         Ok(format!("TO_TIMESTAMP({value})"))
                     }
                 }
+                Some(Engine::DuckDB) => duckdb_timestamp_literal_from(*value, 1_000_000, expr),
                 _ => Ok(format!("TO_TIMESTAMP({value})")),
             },
             ScalarValue::Decimal128(Some(v), _, s) => {
@@ -506,6 +493,53 @@ fn is_duckdb_timestamp_operand(expr: &Expr) -> bool {
         },
         _ => false,
     }
+}
+
+/// Renders a count of microseconds since the epoch as the DuckDB timestamp literal every arm of
+/// [`render_expr`] emits for that engine.
+///
+/// The engines sharing the catch-all arm render a timestamp by integer division down to whole
+/// seconds, which drops everything below the second and moves which rows a comparison against the
+/// literal selects. DuckDB carries its own arm to keep those digits, and this is the whole of it:
+/// one route for every unit, so no unit is left rendering by a form whose exactness has to be
+/// argued on its own.
+///
+/// `TO_TIMESTAMP` takes a `DOUBLE`, so reaching it costs the count a widening to `f64` — which
+/// represents consecutive integers exactly only up to `2^53`. As a microsecond count that limit
+/// falls at about **2255-06-05**, and past it the rendered literal can name a different
+/// microsecond than the Arrow value it came from, so a comparison built from it selects on a
+/// boundary one microsecond away from the one the query asked for: a wrong row set rather than an
+/// error. Rendering the fraction from integer arithmetic does not help — DuckDB's parse of the
+/// `DOUBLE` is what rounds.
+///
+/// `make_timestamptz` takes the count as a `BIGINT`, so nothing is widened. Measured against
+/// v1.5.5 it is exact across the whole `i64` microsecond range — which is the whole of Arrow's
+/// microsecond range — and it yields the same `TIMESTAMP WITH TIME ZONE` fixed to UTC that
+/// `TO_TIMESTAMP` does, which is the type [`is_duckdb_timestamp_operand`] and the normalization
+/// both rely on the literal having.
+///
+/// The UTC frame is what rules out the alternatives: `CAST(make_timestamp(..) AS TIMESTAMPTZ)`
+/// reads the count in the session's `TimeZone`, and under `America/Los_Angeles` it lands seven
+/// hours from the instant the value names, while this rendering measures identical there and
+/// under `UTC`.
+fn duckdb_timestamp_literal(micros: i64) -> String {
+    format!("make_timestamptz({micros})")
+}
+
+/// [`duckdb_timestamp_literal`] for a coarser unit, where `per_micros` is how many microseconds
+/// one of its ticks is worth.
+///
+/// A count that cannot be expressed in microseconds at all is past the range DuckDB can hold, so
+/// there is no literal to render for it. Declining leaves `supports_filters_pushdown` reporting
+/// the filter unsupported and DataFusion applying it itself, rather than pushing down a literal
+/// that cannot mean what it says.
+fn duckdb_timestamp_literal_from(value: i64, per_micros: i64, expr: &Expr) -> Result<String> {
+    value
+        .checked_mul(per_micros)
+        .map(duckdb_timestamp_literal)
+        .ok_or_else(|| Error::UnsupportedFilterExpr {
+            expr: format!("{expr}"),
+        })
 }
 
 /// Whether the DuckDB timestamp normalization has to be applied to `expr`, given the schema its
@@ -1049,7 +1083,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "(\"flag\" = true) OR (TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < TO_TIMESTAMP(1767225600))"
+            "(\"flag\" = true) OR (TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < make_timestamptz(1767225600000000))"
         );
     }
 
@@ -1065,7 +1099,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "(\"flag\" = true) AND (TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < TO_TIMESTAMP(1767225600))"
+            "(\"flag\" = true) AND (TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < make_timestamptz(1767225600000000))"
         );
     }
 
@@ -1094,7 +1128,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < TO_TIMESTAMP(1767225600)"
+            "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < make_timestamptz(1767225600000000)"
         );
     }
 
@@ -1519,7 +1553,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "\"flag\" = (TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < TO_TIMESTAMP(1767225600))"
+            "\"flag\" = (TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < make_timestamptz(1767225600000000))"
         );
     }
 
@@ -1535,7 +1569,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) - TO_TIMESTAMP(1767225600)"
+            "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) - make_timestamptz(1767225600000000)"
         );
     }
 
@@ -1549,7 +1583,7 @@ mod tests {
 
         let sql = to_sql_with_engine(&expr, Some(Engine::DuckDB)).expect("to unparse");
 
-        assert_eq!(sql, "TO_TIMESTAMP(1767225600) > \"ts\"");
+        assert_eq!(sql, "make_timestamptz(1767225600000000) > \"ts\"");
     }
 
     /// Two timestamp operands are already comparable and must be left alone. This is the shape
@@ -1562,7 +1596,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "TO_TIMESTAMP(EPOCH(CAST(\"ts\" AS TIMESTAMP))) < TO_TIMESTAMP(1767225600)"
+            "TO_TIMESTAMP(EPOCH(CAST(\"ts\" AS TIMESTAMP))) < make_timestamptz(1767225600000000)"
         );
     }
 
@@ -1579,7 +1613,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < (TO_TIMESTAMP(1767225600) + \"delta\")"
+            "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < (make_timestamptz(1767225600000000) + \"delta\")"
         );
     }
 
@@ -1590,11 +1624,11 @@ mod tests {
         for (expr, expected) in [
             (
                 col("ts").lt(ts_lit() - col("delta")),
-                "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < (TO_TIMESTAMP(1767225600) - \"delta\")",
+                "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < (make_timestamptz(1767225600000000) - \"delta\")",
             ),
             (
                 col("ts").lt(col("delta") + ts_lit()),
-                "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < (\"delta\" + TO_TIMESTAMP(1767225600))",
+                "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < (\"delta\" + make_timestamptz(1767225600000000))",
             ),
         ] {
             let sql = to_sql_with_engine(&expr, Some(Engine::DuckDB)).expect("to unparse");
@@ -1614,7 +1648,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "TO_TIMESTAMP(EPOCH_MS(\"x\") / 1000) - (TO_TIMESTAMP(1767225600) + \"delta\")"
+            "TO_TIMESTAMP(EPOCH_MS(\"x\") / 1000) - (make_timestamptz(1767225600000000) + \"delta\")"
         );
     }
 
@@ -1629,7 +1663,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "\"ts\" < (TO_TIMESTAMP(1767225600) - TO_TIMESTAMP(1767225600))"
+            "\"ts\" < (make_timestamptz(1767225600000000) - make_timestamptz(1767225600000000))"
         );
     }
 
@@ -1717,7 +1751,7 @@ mod tests {
                 .expect("to unparse");
 
             assert_eq!(
-                sql, "\"ts\" < TO_TIMESTAMP(1767225600)",
+                sql, "\"ts\" < make_timestamptz(1767225600000000)",
                 "a TIMESTAMPTZ column ({unit:?}) must be compared as it stands"
             );
         }
@@ -1742,7 +1776,7 @@ mod tests {
                 .expect("to unparse");
 
             assert_eq!(
-                sql, "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < TO_TIMESTAMP(1767225600)",
+                sql, "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < make_timestamptz(1767225600000000)",
                 "a naive timestamp column ({unit:?}) must still be normalized"
             );
         }
@@ -1763,7 +1797,7 @@ mod tests {
                 .expect("to unparse");
 
             assert_eq!(
-                sql, "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < TO_TIMESTAMP(1767225600)",
+                sql, "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < make_timestamptz(1767225600000000)",
                 "a {date:?} column must still be normalized"
             );
         }
@@ -1786,7 +1820,7 @@ mod tests {
         let sql = to_sql_with_engine_and_schema(&expr, Some(Engine::DuckDB), Some(&schema))
             .expect("to unparse");
 
-        assert_eq!(sql, "\"other\" < TO_TIMESTAMP(1767225600)");
+        assert_eq!(sql, "\"other\" < make_timestamptz(1767225600000000)");
     }
 
     /// Only a resolved type declines the normalization. With nothing to resolve against, the
@@ -1800,7 +1834,8 @@ mod tests {
             DataType::Int64,
             true,
         )]);
-        let normalized = "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < TO_TIMESTAMP(1767225600)";
+        let normalized =
+            "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < make_timestamptz(1767225600000000)";
 
         assert_eq!(
             to_sql_with_engine(&expr, Some(Engine::DuckDB)).expect("to unparse"),
@@ -1830,17 +1865,17 @@ mod tests {
         for (value, expected) in [
             (
                 ScalarValue::TimestampMicrosecond(Some(micros), None),
-                "TO_TIMESTAMP(1767225600.000999)",
+                "make_timestamptz(1767225600000999)",
             ),
             (
                 ScalarValue::TimestampMillisecond(Some(1_767_225_600_001), None),
-                "TO_TIMESTAMP(1767225600.001)",
+                "make_timestamptz(1767225600001000)",
             ),
             // A `TIMESTAMPTZ` holds microseconds, so the trailing nanoseconds go — but only
             // those, rather than the whole fractional second.
             (
                 ScalarValue::TimestampNanosecond(Some(micros * 1_000 + 999), None),
-                "TO_TIMESTAMP(1767225600.000999)",
+                "make_timestamptz(1767225600000999)",
             ),
         ] {
             let sql = to_sql_with_engine(&Expr::Literal(value.clone(), None), Some(Engine::DuckDB))
@@ -1850,10 +1885,11 @@ mod tests {
         }
     }
 
-    /// A whole-second literal has nothing below the second to keep, and must render exactly as it
-    /// did — the sub-second rendering is a repair, not a reformatting of every timestamp.
+    /// Every unit reaches DuckDB through the same microsecond count, so one instant has one
+    /// rendering however the caller spelled it — there is no unit left rendering by a route whose
+    /// exactness has to be argued separately.
     #[test]
-    fn test_duckdb_renders_a_whole_second_timestamp_literal_unchanged() {
+    fn test_duckdb_renders_every_unit_of_one_instant_identically() {
         for value in [
             ScalarValue::TimestampSecond(Some(1_767_225_600), None),
             ScalarValue::TimestampMillisecond(Some(1_767_225_600_000), None),
@@ -1863,7 +1899,7 @@ mod tests {
             let sql = to_sql_with_engine(&Expr::Literal(value.clone(), None), Some(Engine::DuckDB))
                 .expect("to unparse");
 
-            assert_eq!(sql, "TO_TIMESTAMP(1767225600)", "{value:?}");
+            assert_eq!(sql, "make_timestamptz(1767225600000000)", "{value:?}");
         }
     }
 
