@@ -908,7 +908,7 @@ fn complete_swap(
         }
     } else {
         tracing::warn!(
-            "Configured DuckDB database path {configured_path} is not reclaimable; serving {generation_path}. Instances that attached it keep reading the retired file until a later swap reclaims the name"
+            "Configured DuckDB database path {configured_path} is not reclaimable; serving {generation_path} until restart"
         );
         generation_path.to_string()
     };
