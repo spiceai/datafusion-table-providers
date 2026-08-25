@@ -1,6 +1,6 @@
 use std::{borrow::Cow, sync::Arc};
 
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::{DataType, Schema, TimeUnit};
 use bigdecimal::{num_bigint::BigInt, BigDecimal};
 use datafusion::{
     logical_expr::{Cast, Expr, Operator},
@@ -10,7 +10,6 @@ use datafusion::{
     },
     sql::TableReference,
 };
-use snafu::{ensure, OptionExt};
 
 pub const SECONDS_IN_DAY: i32 = 86_400;
 
@@ -303,14 +302,9 @@ fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> 
                         Ok(format!("TO_TIMESTAMP({})", *value as f64 / 1_000_000_000.0))
                     }
                 }
-                // A `TIMESTAMPTZ` holds microseconds, so the nanosecond digits cannot survive
-                // whatever this renders. They are dropped here, in integer arithmetic, rather
-                // than by widening the nanosecond count to `f64` as the arms above do — 1.7e18
-                // exceeds the 2^53 an `f64` represents exactly, which would round the value by a
-                // few hundred nanoseconds and could carry that into the microsecond DuckDB keeps.
-                // `div_euclid` floors, so the truncation goes the same way either side of the
-                // epoch.
-                Some(Engine::DuckDB) => duckdb_timestamp_literal(value.div_euclid(1_000), expr),
+                Some(Engine::DuckDB) => {
+                    duckdb_timestamp_literal(*value, TimeUnit::Nanosecond, expr)
+                }
                 _ => Ok(format!("TO_TIMESTAMP({})", value / 1_000_000_000)),
             },
             ScalarValue::TimestampMicrosecond(Some(value), timezone) => {
@@ -327,7 +321,9 @@ fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> 
                         }
                     }
                     Some(Engine::MySQL) => Ok(format!("FROM_UNIXTIME({seconds})")),
-                    Some(Engine::DuckDB) => duckdb_timestamp_literal(*value, expr),
+                    Some(Engine::DuckDB) => {
+                        duckdb_timestamp_literal(*value, TimeUnit::Microsecond, expr)
+                    }
                     _ => Ok(format!("TO_TIMESTAMP({})", value / 1_000_000)),
                 }
             }
@@ -342,7 +338,9 @@ fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> 
                             Ok(format!("TO_TIMESTAMP({seconds})"))
                         }
                     }
-                    Some(Engine::DuckDB) => duckdb_timestamp_literal_from(*value, 1_000, expr),
+                    Some(Engine::DuckDB) => {
+                        duckdb_timestamp_literal(*value, TimeUnit::Millisecond, expr)
+                    }
                     _ => Ok(format!("TO_TIMESTAMP({})", value / 1000)),
                 }
             }
@@ -355,7 +353,7 @@ fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> 
                         Ok(format!("TO_TIMESTAMP({value})"))
                     }
                 }
-                Some(Engine::DuckDB) => duckdb_timestamp_literal_from(*value, 1_000_000, expr),
+                Some(Engine::DuckDB) => duckdb_timestamp_literal(*value, TimeUnit::Second, expr),
                 _ => Ok(format!("TO_TIMESTAMP({value})")),
             },
             ScalarValue::Decimal128(Some(v), _, s) => {
@@ -496,65 +494,51 @@ fn is_duckdb_timestamp_operand(expr: &Expr) -> bool {
     }
 }
 
-/// Renders a count of microseconds since the epoch as the DuckDB timestamp literal every arm of
-/// [`render_expr`] emits for that engine.
+/// Renders a `ScalarValue::Timestamp*` count as the DuckDB literal all four of those arms of
+/// [`render_expr`] emit for that engine. (The `Date32` and `Date64` arms have no DuckDB arm and
+/// reach the shared catch-all instead; what they render there is spiceai/spiceai#13476.)
 ///
-/// The engines sharing the catch-all arm render a timestamp by integer division down to whole
+/// The engines sharing that catch-all render a timestamp by integer division down to whole
 /// seconds, which drops everything below the second and moves which rows a comparison against the
-/// literal selects. DuckDB carries its own arm to keep those digits, and this is the whole of it:
-/// one route for every unit, so no unit is left rendering by a form whose exactness has to be
-/// argued on its own.
+/// literal selects. DuckDB carries its own arm to keep those digits, and this is the whole of it —
+/// `unit` is what each arm contributes, so a call site cannot name a scale its `ScalarValue`
+/// variant disagrees with.
 ///
-/// `TO_TIMESTAMP` takes a `DOUBLE`, so reaching it costs the count a widening to `f64` — which
-/// represents consecutive integers exactly only up to `2^53`. As a microsecond count that limit
-/// falls at about **2255-06-05**, and past it the rendered literal can name a different
-/// microsecond than the Arrow value it came from, so a comparison built from it selects on a
-/// boundary one microsecond away from the one the query asked for: a wrong row set rather than an
-/// error. Rendering the fraction from integer arithmetic does not help — DuckDB's parse of the
-/// `DOUBLE` is what rounds.
-///
-/// `make_timestamptz` takes the count as a `BIGINT`, so nothing is widened. Measured against
-/// v1.5.5 it is exact for every microsecond count DuckDB holds, and it yields the same
-/// `TIMESTAMP WITH TIME ZONE` fixed to UTC that `TO_TIMESTAMP` does, which is the type
+/// `TO_TIMESTAMP` takes a `DOUBLE`, so reaching it costs the count a widening to `f64`, which
+/// represents consecutive integers exactly only up to `2^53` — about **2255-06-05** as a count of
+/// microseconds. `make_timestamptz` takes the count as a `BIGINT`, so nothing is widened, and it
+/// yields the same `TIMESTAMP WITH TIME ZONE` fixed to UTC, which is the type
 /// [`is_duckdb_timestamp_operand`] and the normalization both rely on the literal having.
 ///
-/// The UTC frame is what rules out the alternatives: `CAST(make_timestamp(..) AS TIMESTAMPTZ)`
-/// reads the count in the session's `TimeZone`, and under `America/Los_Angeles` it lands seven
-/// hours from the instant the value names, while this rendering measures identical there and
-/// under `UTC`.
+/// That UTC frame is what rules out the alternative: `make_timestamp` is exact too, but it yields
+/// a naive `TIMESTAMP`, and casting one to `TIMESTAMPTZ` reads the count in the session's
+/// `TimeZone` — measured under `America/Los_Angeles` it lands seven hours from the instant the
+/// value names, while this rendering measures identical there and under `UTC`.
 ///
-/// Two counts are not instants at all. DuckDB reserves `i64::MAX` and `-i64::MAX` as its infinity
-/// sentinels and refuses both — *"Timestamp microseconds out of range"* — so rendering one
-/// produces SQL that reports the filter pushdown-capable and then fails the statement built from
-/// it, which a `DELETE` or `UPDATE` reaches only after its SQL is generated. They are declined for
-/// the same reason a coarser unit that overflows is. `i64::MIN` is not among them: v1.5.5 renders
-/// it, round-trips it exactly, and compares it as the finite instant it is.
-fn duckdb_timestamp_literal(micros: i64, expr: &Expr) -> Result<String> {
-    ensure!(
-        micros != i64::MAX && micros != -i64::MAX,
-        UnsupportedFilterExprSnafu {
-            expr: format!("{expr}"),
-        }
-    );
+/// Two kinds of count have no literal to render. A second or millisecond count can name an instant
+/// no microsecond count holds, and DuckDB holds nothing else; and DuckDB reserves `i64::MAX` and
+/// `-i64::MAX` as its infinity sentinels, refusing both with *"Timestamp microseconds out of
+/// range"*, so rendering one would report the filter pushdown-capable and then fail the statement
+/// built from it — which a `DELETE` or `UPDATE` reaches only after its SQL is generated. Declining
+/// leaves `supports_filters_pushdown` reporting the filter unsupported and DataFusion applying it
+/// itself. `i64::MIN` is not a sentinel: v1.5.5 renders it, round-trips it exactly, and compares it
+/// as the finite instant it is.
+fn duckdb_timestamp_literal(value: i64, unit: TimeUnit, expr: &Expr) -> Result<String> {
+    let micros = match unit {
+        // A `TIMESTAMPTZ` holds microseconds, so the nanosecond digits cannot survive whatever
+        // this renders. `div_euclid` floors, so they are dropped towards the same side of the
+        // epoch above it as below.
+        TimeUnit::Nanosecond => Some(value.div_euclid(1_000)),
+        TimeUnit::Microsecond => Some(value),
+        TimeUnit::Millisecond => value.checked_mul(1_000),
+        TimeUnit::Second => value.checked_mul(1_000_000),
+    }
+    .filter(|micros| *micros != i64::MAX && *micros != -i64::MAX)
+    .ok_or_else(|| Error::UnsupportedFilterExpr {
+        expr: format!("{expr}"),
+    })?;
 
     Ok(format!("make_timestamptz({micros})"))
-}
-
-/// [`duckdb_timestamp_literal`] for a coarser unit, where `per_micros` is how many microseconds
-/// one of its ticks is worth.
-///
-/// A count that cannot be expressed in microseconds at all is past the range DuckDB can hold, so
-/// there is no literal to render for it. Declining leaves `supports_filters_pushdown` reporting
-/// the filter unsupported and DataFusion applying it itself, rather than pushing down a literal
-/// that cannot mean what it says.
-fn duckdb_timestamp_literal_from(value: i64, per_micros: i64, expr: &Expr) -> Result<String> {
-    let micros = value
-        .checked_mul(per_micros)
-        .context(UnsupportedFilterExprSnafu {
-            expr: format!("{expr}"),
-        })?;
-
-    duckdb_timestamp_literal(micros, expr)
 }
 
 /// Whether the DuckDB timestamp normalization has to be applied to `expr`, given the schema its
@@ -1740,7 +1724,7 @@ mod tests {
     }
 
     /// A schema whose `ts` column has `data_type`, for the type-aware normalization tests.
-    fn schema_with_ts(data_type: DataType) -> Schema {
+    pub(super) fn schema_with_ts(data_type: DataType) -> Schema {
         Schema::new(vec![
             arrow::datatypes::Field::new("ts", data_type, true),
             arrow::datatypes::Field::new("other", DataType::Int64, true),
@@ -1893,16 +1877,13 @@ mod tests {
                 "make_timestamptz(1767225600000999)",
             ),
         ] {
-            let sql = to_sql_with_engine(&Expr::Literal(value.clone(), None), Some(Engine::DuckDB))
-                .expect("to unparse");
+            let sql = render_duckdb(&value).expect("to unparse");
 
             assert_eq!(sql, expected, "{value:?}");
         }
     }
 
-    /// Every unit reaches DuckDB through the same microsecond count, so one instant has one
-    /// rendering however the caller spelled it — there is no unit left rendering by a route whose
-    /// exactness has to be argued separately.
+    /// One instant has one rendering however the caller spelled it.
     #[test]
     fn test_duckdb_renders_every_unit_of_one_instant_identically() {
         for value in [
@@ -1911,11 +1892,14 @@ mod tests {
             ScalarValue::TimestampMicrosecond(Some(1_767_225_600_000_000), None),
             ScalarValue::TimestampNanosecond(Some(1_767_225_600_000_000_000), None),
         ] {
-            let sql = to_sql_with_engine(&Expr::Literal(value.clone(), None), Some(Engine::DuckDB))
-                .expect("to unparse");
+            let sql = render_duckdb(&value).expect("to unparse");
 
             assert_eq!(sql, "make_timestamptz(1767225600000000)", "{value:?}");
         }
+    }
+
+    fn render_duckdb(value: &ScalarValue) -> Result<String> {
+        to_sql_with_engine(&Expr::Literal(value.clone(), None), Some(Engine::DuckDB))
     }
 
     /// `2^53` microseconds is about 2255-06-05, and it is the last microsecond an `f64` can hold
@@ -1939,8 +1923,7 @@ mod tests {
                 "make_timestamptz(9007199254740993)",
             ),
         ] {
-            let sql = to_sql_with_engine(&Expr::Literal(value.clone(), None), Some(Engine::DuckDB))
-                .expect("to unparse");
+            let sql = render_duckdb(&value).expect("to unparse");
 
             assert_eq!(sql, expected, "{value:?}");
         }
@@ -1963,16 +1946,14 @@ mod tests {
                 "make_timestamptz(-9007199254740994)",
             ),
         ] {
-            let sql = to_sql_with_engine(&Expr::Literal(value.clone(), None), Some(Engine::DuckDB))
-                .expect("to unparse");
+            let sql = render_duckdb(&value).expect("to unparse");
 
             assert_eq!(sql, expected, "{value:?}");
         }
     }
 
-    /// A second or millisecond count can name an instant no microsecond count can hold, and
-    /// DuckDB holds nothing else. Rendering is declined rather than wrapped, which leaves
-    /// `supports_filters_pushdown` reporting the filter unsupported so DataFusion applies it.
+    /// A second or millisecond count can name an instant no microsecond count can hold. Rendering
+    /// is declined rather than wrapped.
     #[test]
     fn test_duckdb_declines_a_timestamp_literal_microseconds_cannot_hold() {
         for value in [
@@ -1981,8 +1962,7 @@ mod tests {
             ScalarValue::TimestampMillisecond(Some(i64::MAX), None),
             ScalarValue::TimestampMillisecond(Some(i64::MIN), None),
         ] {
-            let rendered =
-                to_sql_with_engine(&Expr::Literal(value.clone(), None), Some(Engine::DuckDB));
+            let rendered = render_duckdb(&value);
 
             assert!(
                 matches!(rendered, Err(Error::UnsupportedFilterExpr { .. })),
@@ -1991,16 +1971,12 @@ mod tests {
         }
     }
 
-    /// DuckDB reserves `i64::MAX` and `-i64::MAX` as infinity sentinels and refuses both, so
-    /// rendering one would report the filter pushdown-capable and then fail the statement built
-    /// from it. Only the microsecond arm can reach them: no product of a coarser count and its
-    /// tick size is either value, and no nanosecond count divides down to one.
+    /// Only the microsecond arm can reach DuckDB's two reserved counts: no product of a coarser
+    /// count and its tick size is either value, and no nanosecond count divides down to one.
     #[test]
     fn test_duckdb_declines_the_microsecond_counts_reserved_as_infinity() {
         for micros in [i64::MAX, -i64::MAX] {
-            let value = ScalarValue::TimestampMicrosecond(Some(micros), None);
-            let rendered =
-                to_sql_with_engine(&Expr::Literal(value.clone(), None), Some(Engine::DuckDB));
+            let rendered = render_duckdb(&ScalarValue::TimestampMicrosecond(Some(micros), None));
 
             assert!(
                 matches!(rendered, Err(Error::UnsupportedFilterExpr { .. })),
@@ -2016,8 +1992,7 @@ mod tests {
     #[test]
     fn test_duckdb_still_renders_the_counts_the_sentinels_sit_beside() {
         for micros in [i64::MAX - 1, i64::MIN, i64::MIN + 2] {
-            let value = ScalarValue::TimestampMicrosecond(Some(micros), None);
-            let sql = to_sql_with_engine(&Expr::Literal(value, None), Some(Engine::DuckDB))
+            let sql = render_duckdb(&ScalarValue::TimestampMicrosecond(Some(micros), None))
                 .expect("to unparse");
 
             assert_eq!(sql, format!("make_timestamptz({micros})"));
@@ -2055,9 +2030,9 @@ mod tests {
 /// neighbouring microsecond — both are well-formed SQL. These run the comparison DuckDB actually
 /// evaluates against rows one microsecond apart and assert on which row survives it.
 #[cfg(all(test, feature = "duckdb"))]
-mod duckdb_execution_tests {
+mod duckdb_timestamp_execution_tests {
+    use super::tests::schema_with_ts;
     use super::*;
-    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion::prelude::*;
     use duckdb::Connection;
 
@@ -2071,14 +2046,6 @@ mod duckdb_execution_tests {
         ("at_bound", "2255-06-05 23:47:34.740992+00"),
         ("one_past_bound", "2255-06-05 23:47:34.740993+00"),
     ];
-
-    fn tz_aware_schema() -> Schema {
-        Schema::new(vec![Field::new(
-            "ts",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        )])
-    }
 
     /// Runs `filter` as DuckDB would receive it and returns the labels of the rows it keeps.
     fn rows_selected_by(filter: &Expr, session_timezone: &str) -> Vec<String> {
@@ -2094,7 +2061,10 @@ mod duckdb_execution_tests {
             .expect("insert");
         }
 
-        let schema = tz_aware_schema();
+        let schema = schema_with_ts(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ));
         let where_clause =
             to_sql_with_engine_and_schema(filter, Some(Engine::DuckDB), Some(&schema))
                 .expect("to unparse");
@@ -2104,12 +2074,11 @@ mod duckdb_execution_tests {
                 "SELECT label FROM t WHERE {where_clause} ORDER BY label"
             ))
             .expect("prepare");
-        let labels = statement
+        statement
             .query_map([], |row| row.get::<_, String>(0))
             .expect("query")
             .collect::<std::result::Result<Vec<_>, _>>()
-            .expect("rows");
-        labels
+            .expect("rows")
     }
 
     fn micros_literal(micros: i64) -> Expr {
