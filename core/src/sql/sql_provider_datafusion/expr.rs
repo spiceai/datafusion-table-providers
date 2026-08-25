@@ -1903,6 +1903,79 @@ mod tests {
         }
     }
 
+    /// `2^53` microseconds is about 2255-06-05, and it is the last microsecond an `f64` can hold
+    /// alongside its neighbours. One past it is the first value the old rendering could not name:
+    /// `9007199254740993` widened to `9007199254.740992`, a literal that is a whole microsecond
+    /// short of the instant the caller asked for.
+    #[test]
+    fn test_duckdb_renders_a_microsecond_past_the_double_bound_exactly() {
+        // 2^53 + 1 microseconds.
+        let micros = 9_007_199_254_740_993i64;
+
+        for (value, expected) in [
+            (
+                ScalarValue::TimestampMicrosecond(Some(micros), None),
+                "make_timestamptz(9007199254740993)",
+            ),
+            // The nanosecond arm reduces to microseconds before rendering, so it inherits the
+            // same bound and the same repair.
+            (
+                ScalarValue::TimestampNanosecond(Some(micros * 1_000 + 999), None),
+                "make_timestamptz(9007199254740993)",
+            ),
+        ] {
+            let sql = to_sql_with_engine(&Expr::Literal(value.clone(), None), Some(Engine::DuckDB))
+                .expect("to unparse");
+
+            assert_eq!(sql, expected, "{value:?}");
+        }
+    }
+
+    /// The bound is a magnitude, not a date, so a pre-epoch instant the same distance out is
+    /// exposed to it too — and `div_euclid` floors, so the nanosecond arm truncates towards the
+    /// same side of the epoch there as it does above it.
+    #[test]
+    fn test_duckdb_renders_a_pre_epoch_microsecond_past_the_double_bound_exactly() {
+        let micros = -9_007_199_254_740_993i64;
+
+        for (value, expected) in [
+            (
+                ScalarValue::TimestampMicrosecond(Some(micros), None),
+                "make_timestamptz(-9007199254740993)",
+            ),
+            (
+                ScalarValue::TimestampNanosecond(Some(micros * 1_000 - 999), None),
+                "make_timestamptz(-9007199254740994)",
+            ),
+        ] {
+            let sql = to_sql_with_engine(&Expr::Literal(value.clone(), None), Some(Engine::DuckDB))
+                .expect("to unparse");
+
+            assert_eq!(sql, expected, "{value:?}");
+        }
+    }
+
+    /// A second or millisecond count can name an instant no microsecond count can hold, and
+    /// DuckDB holds nothing else. Rendering is declined rather than wrapped, which leaves
+    /// `supports_filters_pushdown` reporting the filter unsupported so DataFusion applies it.
+    #[test]
+    fn test_duckdb_declines_a_timestamp_literal_microseconds_cannot_hold() {
+        for value in [
+            ScalarValue::TimestampSecond(Some(i64::MAX), None),
+            ScalarValue::TimestampSecond(Some(i64::MIN), None),
+            ScalarValue::TimestampMillisecond(Some(i64::MAX), None),
+            ScalarValue::TimestampMillisecond(Some(i64::MIN), None),
+        ] {
+            let rendered =
+                to_sql_with_engine(&Expr::Literal(value.clone(), None), Some(Engine::DuckDB));
+
+            assert!(
+                matches!(rendered, Err(Error::UnsupportedFilterExpr { .. })),
+                "{value:?} rendered {rendered:?} instead of declining"
+            );
+        }
+    }
+
     /// The sub-second rendering is DuckDB-specific: the engines sharing the catch-all arm are
     /// untouched, and the ones with an arm of their own keep it.
     #[test]
@@ -1927,5 +2000,125 @@ mod tests {
 
             assert_eq!(sql, expected, "engine {engine:?}");
         }
+    }
+}
+
+/// A rendering assertion cannot tell a literal that names the right instant from one that names a
+/// neighbouring microsecond — both are well-formed SQL. These run the comparison DuckDB actually
+/// evaluates against rows one microsecond apart and assert on which row survives it.
+#[cfg(all(test, feature = "duckdb"))]
+mod duckdb_execution_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::prelude::*;
+    use duckdb::Connection;
+
+    /// `2^53` microseconds since the epoch — the last microsecond an `f64` holds alongside both
+    /// its neighbours.
+    const DOUBLE_BOUND_MICROS: i64 = 9_007_199_254_740_992;
+
+    /// The two rows are built by a route the rendering under test does not use, so a fixture and
+    /// the literal that has to find it cannot be wrong together.
+    const ROWS: [(&str, &str); 2] = [
+        ("at_bound", "2255-06-05 23:47:34.740992+00"),
+        ("one_past_bound", "2255-06-05 23:47:34.740993+00"),
+    ];
+
+    fn tz_aware_schema() -> Schema {
+        Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        )])
+    }
+
+    /// Runs `filter` as DuckDB would receive it and returns the labels of the rows it keeps.
+    fn rows_selected_by(filter: &Expr, session_timezone: &str) -> Vec<String> {
+        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+        conn.execute_batch(&format!(
+            "SET TimeZone='{session_timezone}'; CREATE TABLE t (label VARCHAR, ts TIMESTAMPTZ)"
+        ))
+        .expect("create");
+        for (label, instant) in ROWS {
+            conn.execute_batch(&format!(
+                "INSERT INTO t VALUES ('{label}', CAST('{instant}' AS TIMESTAMPTZ))"
+            ))
+            .expect("insert");
+        }
+
+        let schema = tz_aware_schema();
+        let where_clause =
+            to_sql_with_engine_and_schema(filter, Some(Engine::DuckDB), Some(&schema))
+                .expect("to unparse");
+
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT label FROM t WHERE {where_clause} ORDER BY label"
+            ))
+            .expect("prepare");
+        let labels = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("rows");
+        labels
+    }
+
+    fn micros_literal(micros: i64) -> Expr {
+        Expr::Literal(ScalarValue::TimestampMicrosecond(Some(micros), None), None)
+    }
+
+    /// The instant one microsecond past the `f64` bound is the one the caller named; the row at
+    /// the bound is the one the old rendering selected in its place.
+    #[test]
+    fn a_microsecond_past_the_double_bound_selects_the_row_it_names() {
+        let filter = col("ts").eq(micros_literal(DOUBLE_BOUND_MICROS + 1));
+
+        assert_eq!(
+            rows_selected_by(&filter, "UTC"),
+            vec!["one_past_bound".to_string()],
+            "the literal must select the microsecond it names, not its neighbour"
+        );
+    }
+
+    /// The row at the bound is still reachable — the repair moves which instant each literal
+    /// names, and both must land on their own.
+    #[test]
+    fn the_microsecond_at_the_double_bound_still_selects_its_own_row() {
+        let filter = col("ts").eq(micros_literal(DOUBLE_BOUND_MICROS));
+
+        assert_eq!(
+            rows_selected_by(&filter, "UTC"),
+            vec!["at_bound".to_string()]
+        );
+    }
+
+    /// A literal is an instant, not a wall clock. The session's `TimeZone` decides how DuckDB
+    /// *prints* a `TIMESTAMPTZ` and must not decide which rows a comparison against one keeps —
+    /// which is what rules out reaching the same exactness through a naive `make_timestamp`.
+    #[test]
+    fn the_selected_row_does_not_depend_on_the_session_timezone() {
+        let filter = col("ts").eq(micros_literal(DOUBLE_BOUND_MICROS + 1));
+
+        for timezone in ["UTC", "America/Los_Angeles", "Australia/Sydney"] {
+            assert_eq!(
+                rows_selected_by(&filter, timezone),
+                vec!["one_past_bound".to_string()],
+                "under TimeZone={timezone}"
+            );
+        }
+    }
+
+    /// A range predicate reads the same boundary the equality does, and is the shape a filter
+    /// pushdown usually takes.
+    #[test]
+    fn a_range_boundary_past_the_double_bound_excludes_the_row_below_it() {
+        let filter = col("ts").gt_eq(micros_literal(DOUBLE_BOUND_MICROS + 1));
+
+        assert_eq!(
+            rows_selected_by(&filter, "UTC"),
+            vec!["one_past_bound".to_string()],
+            "a bound one microsecond above the row at the f64 limit must exclude it"
+        );
     }
 }
