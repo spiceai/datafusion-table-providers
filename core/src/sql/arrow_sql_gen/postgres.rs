@@ -327,7 +327,8 @@ fn numeric_coefficient(value: &Decimal, precision: u8, scale: i8) -> Result<i128
             .ok_or(NumericFit::PrecisionTooNarrow)?;
         let truncated = mantissa / divisor;
         let remainder = mantissa % divisor;
-        let round_away_from_zero = remainder.unsigned_abs().saturating_mul(2) >= divisor.unsigned_abs();
+        let round_away_from_zero =
+            remainder.unsigned_abs().saturating_mul(2) >= divisor.unsigned_abs();
         if round_away_from_zero {
             truncated + mantissa.signum()
         } else {
@@ -1666,8 +1667,7 @@ mod tests {
         // schema already committed to `Decimal128(38, 6)` for an average, but
         // Postgres computed it to 16 places).
         let value = Decimal::from_str("24.1234567890123456").expect("valid decimal");
-        let coefficient =
-            numeric_coefficient(&value, 38, 6).expect("rounds instead of refusing");
+        let coefficient = numeric_coefficient(&value, 38, 6).expect("rounds instead of refusing");
         assert_eq!(coefficient, 24_123_457);
 
         let negative = Decimal::from_str("-24.1234567890123456").expect("valid decimal");
@@ -1679,16 +1679,10 @@ mod tests {
     #[test]
     fn test_numeric_coefficient_rounds_half_away_from_zero() {
         let half_up = Decimal::from_str("1.25").expect("valid decimal");
-        assert_eq!(
-            numeric_coefficient(&half_up, 38, 1).expect("rounds"),
-            13
-        );
+        assert_eq!(numeric_coefficient(&half_up, 38, 1).expect("rounds"), 13);
 
         let half_down = Decimal::from_str("-1.25").expect("valid decimal");
-        assert_eq!(
-            numeric_coefficient(&half_down, 38, 1).expect("rounds"),
-            -13
-        );
+        assert_eq!(numeric_coefficient(&half_down, 38, 1).expect("rounds"), -13);
 
         let exact = Decimal::from_str("1.20").expect("valid decimal");
         assert_eq!(numeric_coefficient(&exact, 38, 1).expect("rounds"), 12);
