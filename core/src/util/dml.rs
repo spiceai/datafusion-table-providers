@@ -1021,7 +1021,7 @@ mod duckdb_timestamp_precision_tests {
 
         let with_schema = filters_to_sql_with_schema(&filters, Some(Engine::DuckDB), Some(&schema))
             .expect("filters_to_sql should succeed");
-        assert_eq!(with_schema, "\"ts\" > TO_TIMESTAMP(1767225600.0005)");
+        assert_eq!(with_schema, "\"ts\" > make_timestamptz(1767225600000500)");
         assert_eq!(
             surviving_ids("TIMESTAMPTZ", MICROSECOND_APART, &with_schema),
             vec![2],
@@ -1035,7 +1035,7 @@ mod duckdb_timestamp_precision_tests {
             filters_to_sql(&filters, Some(Engine::DuckDB)).expect("filters_to_sql should succeed");
         assert_eq!(
             without_schema,
-            "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) > TO_TIMESTAMP(1767225600.0005)"
+            "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) > make_timestamptz(1767225600000500)"
         );
         assert_eq!(
             surviving_ids("TIMESTAMPTZ", MICROSECOND_APART, &without_schema),
@@ -1061,7 +1061,7 @@ mod duckdb_timestamp_precision_tests {
                 .expect("filters_to_sql should succeed");
         assert_eq!(
             where_clause,
-            "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) > TO_TIMESTAMP(1767225600.001)"
+            "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) > make_timestamptz(1767225600001000)"
         );
         assert_eq!(
             surviving_ids(
@@ -1095,14 +1095,17 @@ mod duckdb_timestamp_precision_tests {
             Some(&schema),
         )
         .expect("assignments_to_sql should succeed");
-        assert_eq!(rendered, "\"d\" = \"ts\" - TO_TIMESTAMP(1767225600)");
+        assert_eq!(
+            rendered,
+            "\"d\" = \"ts\" - make_timestamptz(1767225600000000)"
+        );
 
         let difference: Vec<String> = one_column(
             &[
                 "CREATE TABLE t (ts TIMESTAMPTZ)".to_string(),
                 "INSERT INTO t VALUES ('2026-01-01 00:00:01.5+00')".to_string(),
             ],
-            "SELECT (\"ts\" - TO_TIMESTAMP(1767225600))::VARCHAR FROM t",
+            "SELECT (\"ts\" - make_timestamptz(1767225600000000))::VARCHAR FROM t",
         );
 
         assert_eq!(difference, vec!["00:00:01.5".to_string()]);
@@ -1126,7 +1129,7 @@ mod duckdb_timestamp_precision_tests {
                 .expect("filters_to_sql should succeed");
         assert_eq!(
             where_clause,
-            "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) = TO_TIMESTAMP(1767225600)"
+            "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) = make_timestamptz(1767225600000000)"
         );
 
         // Row 1 is the date the filter names. It must go under either session timezone.
@@ -1164,7 +1167,7 @@ mod duckdb_timestamp_precision_tests {
         let set_clause =
             assignments_to_sql_with_schema(&assignments, Some(Engine::DuckDB), Some(&schema))
                 .expect("assignments_to_sql should succeed");
-        assert_eq!(set_clause, "\"ts\" = TO_TIMESTAMP(1767225600.000999)");
+        assert_eq!(set_clause, "\"ts\" = make_timestamptz(1767225600000999)");
 
         // Pinned so the rendered instant is read back in the frame it was written in, rather
         // than in whatever zone the host happens to be set to.
