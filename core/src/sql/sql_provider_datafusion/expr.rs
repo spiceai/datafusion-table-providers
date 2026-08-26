@@ -257,22 +257,42 @@ fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> 
         }
         Expr::Cast(cast) => handle_cast(cast, engine, schema, expr),
         Expr::Literal(value, _) => match value {
-            ScalarValue::Date32(Some(value)) => match engine {
-                Some(Engine::SQLite) => {
-                    Ok(format!("date({}, 'unixepoch')", value * SECONDS_IN_DAY))
+            // `Date32` and `Date64` both name a whole day since the UNIX epoch, but they
+            // count in different units — days and milliseconds — so the epoch second each
+            // one names is a different computation. Only one of them scales by the length
+            // of a day, and it has to be computed in a width that holds the result.
+            ScalarValue::Date32(Some(value)) => {
+                // Widen before multiplying. `value` and `SECONDS_IN_DAY` are both `i32`, so
+                // the product would be computed in `i32` and overflow for every date past
+                // `i32::MAX / 86_400` = 24 855 days (2038-01-19), and every date below
+                // -24 855 (1901-12-13). A debug build panics there; a release build wraps to
+                // a literal naming an unrelated instant, so the comparison built from it
+                // selects a row set the query never asked for. `i32::MIN` days is the widest
+                // count the variant holds and still leaves the product four orders of
+                // magnitude inside `i64`.
+                let seconds = i64::from(*value) * i64::from(SECONDS_IN_DAY);
+                match engine {
+                    Some(Engine::SQLite) => Ok(format!("date({seconds}, 'unixepoch')")),
+                    _ => Ok(format!("TO_TIMESTAMP({seconds})")),
                 }
-                _ => Ok(format!("TO_TIMESTAMP({})", value * SECONDS_IN_DAY)),
-            },
-            ScalarValue::Date64(Some(value)) => match engine {
-                Some(Engine::SQLite) => Ok(format!(
-                    "date({}, 'unixepoch')",
-                    value * i64::from(SECONDS_IN_DAY)
-                )),
-                _ => Ok(format!(
-                    "TO_TIMESTAMP({})",
-                    value * i64::from(SECONDS_IN_DAY)
-                )),
-            },
+            }
+            ScalarValue::Date64(Some(value)) => {
+                // Arrow defines `Date64` as "the elapsed time since UNIX epoch in
+                // milliseconds", so the count is already an instant and scales *down* to the
+                // second. Scaling it up by the length of a day instead reads each
+                // millisecond as a day, which puts 1970-01-02 past the year 238 000 — an
+                // instant no row can hold, so the comparison matches nothing.
+                //
+                // `div_euclid` floors, so a count that is not a whole number of days — which
+                // Arrow's definition excludes but its type does not — lands on the same side
+                // of the instant it names above the epoch as below. Every whole-day count,
+                // which is the entire well-formed domain, divides exactly and is unaffected.
+                let seconds = value.div_euclid(1_000);
+                match engine {
+                    Some(Engine::SQLite) => Ok(format!("date({seconds}, 'unixepoch')")),
+                    _ => Ok(format!("TO_TIMESTAMP({seconds})")),
+                }
+            }
             ScalarValue::Null => Ok(value.to_string()),
             ScalarValue::Int16(Some(value)) => Ok(value.to_string()),
             ScalarValue::Int32(Some(value)) => Ok(value.to_string()),
@@ -496,7 +516,9 @@ fn is_duckdb_timestamp_operand(expr: &Expr) -> bool {
 
 /// Renders a `ScalarValue::Timestamp*` count as the DuckDB literal all four of those arms of
 /// [`render_expr`] emit for that engine. (The `Date32` and `Date64` arms have no DuckDB arm and
-/// reach the shared catch-all instead; what they render there is spiceai/spiceai#13476.)
+/// reach the shared catch-all instead. They render a whole-second count, and `TO_TIMESTAMP`'s
+/// `DOUBLE` represents consecutive integers exactly up to `2^53` seconds — past the end of the
+/// timestamp range DuckDB itself holds — so nothing they can name loses a digit to it.)
 ///
 /// The engines sharing that catch-all render a timestamp by integer division down to whole
 /// seconds, which drops everything below the second and moves which rows a comparison against the
@@ -1999,6 +2021,164 @@ mod tests {
         }
     }
 
+    /// `2038-01-19` is the last day whose epoch second an `i32` holds (`i32::MAX / 86_400` =
+    /// 24 855). One day further is where computing the product in `i32` stops naming a date at
+    /// all, so it is the day every `Date32` assertion below is anchored on.
+    const FIRST_DAY_PAST_THE_I32_SECOND_BOUND: i32 = 24_856;
+
+    fn date32_lit(days: i32) -> Expr {
+        Expr::Literal(ScalarValue::Date32(Some(days)), None)
+    }
+
+    fn date64_lit(millis: i64) -> Expr {
+        Expr::Literal(ScalarValue::Date64(Some(millis)), None)
+    }
+
+    /// Asserts a date literal names `seconds` through BOTH arms the date `match` has — SQLite's
+    /// own `date(..)` and the catch-all every other engine shares. Checking only one would pass a
+    /// fix that reached that arm and left the other naming a different day, which is the shape
+    /// both defects had.
+    fn assert_date_renders(expr: &Expr, seconds: i64, what: &str) {
+        assert_eq!(
+            to_sql_with_engine(expr, None).expect("to unparse"),
+            format!("TO_TIMESTAMP({seconds})"),
+            "{what}"
+        );
+        assert_eq!(
+            to_sql_with_engine(expr, Some(Engine::SQLite)).expect("to unparse"),
+            format!("date({seconds}, 'unixepoch')"),
+            "{what} on SQLite"
+        );
+    }
+
+    /// A `Date32` past the `i32` second bound has no rendering at all on a product computed in
+    /// `i32`: a debug build panics on the multiply and a release build wraps to a literal naming
+    /// an unrelated instant, so a comparison built from it selects a row set nobody asked for.
+    /// Every date here is an ordinary one a user can write.
+    #[test]
+    fn test_date32_past_the_i32_second_bound_names_its_own_instant() {
+        for (days, seconds) in [
+            (FIRST_DAY_PAST_THE_I32_SECOND_BOUND, 2_147_558_400_i64), // 2038-01-20
+            (-FIRST_DAY_PAST_THE_I32_SECOND_BOUND, -2_147_558_400),   // 1901-12-13
+            (30_000, 2_592_000_000),                                  // 2052-02-20
+        ] {
+            assert_date_renders(&date32_lit(days), seconds, &format!("Date32({days})"));
+        }
+    }
+
+    /// The widest counts the variant holds, so the widening cannot be sized to the dates that
+    /// happen to be in a test above it.
+    #[test]
+    fn test_date32_renders_the_widest_counts_it_can_hold() {
+        for (days, seconds) in [
+            (i32::MAX, 185_542_587_100_800_i64),
+            (i32::MIN, -185_542_587_187_200),
+        ] {
+            assert_date_renders(&date32_lit(days), seconds, &format!("Date32({days})"));
+        }
+    }
+
+    /// `Date64` counts milliseconds since the epoch, so its epoch second is a division. Scaling
+    /// it by the length of a day instead put 1970-01-02 past the year 238 000.
+    #[test]
+    fn test_date64_renders_its_millisecond_count_as_the_second_it_names() {
+        for (millis, seconds) in [
+            (86_400_000_i64, 86_400_i64),       // 1970-01-02
+            (-86_400_000, -86_400),             // 1969-12-31
+            (0, 0),                             // 1970-01-01
+            (1_767_225_600_000, 1_767_225_600), // 2026-01-01
+            (2_147_558_400_000, 2_147_558_400), // 2038-01-20
+        ] {
+            assert_date_renders(&date64_lit(millis), seconds, &format!("Date64({millis})"));
+        }
+    }
+
+    /// The two variants spell the same day in different units, so a filter on one has to render
+    /// the same instant as a filter on the other. This is what the units error broke: the same
+    /// day rendered two instants that were not even the same order of magnitude apart.
+    #[test]
+    fn test_date32_and_date64_render_one_day_identically() {
+        for days in [
+            0,
+            1,
+            -1,
+            19_000,
+            FIRST_DAY_PAST_THE_I32_SECOND_BOUND,
+            -FIRST_DAY_PAST_THE_I32_SECOND_BOUND,
+        ] {
+            let millis = i64::from(days) * 86_400_000;
+
+            for engine in [None, Some(Engine::SQLite), Some(Engine::Postgres)] {
+                assert_eq!(
+                    to_sql_with_engine(&date32_lit(days), engine).expect("to unparse"),
+                    to_sql_with_engine(&date64_lit(millis), engine).expect("to unparse"),
+                    "day {days} on {engine:?}"
+                );
+            }
+        }
+    }
+
+    /// Both arms are shared by every engine, so the fix has to reach the catch-all and the
+    /// SQLite arm alike — patching one would leave the other naming a different day.
+    #[test]
+    fn test_every_engine_renders_a_date_literal_past_the_i32_bound() {
+        for (engine, expected) in [
+            (None, "TO_TIMESTAMP(2147558400)"),
+            (Some(Engine::DuckDB), "TO_TIMESTAMP(2147558400)"),
+            (Some(Engine::Postgres), "TO_TIMESTAMP(2147558400)"),
+            (Some(Engine::MySQL), "TO_TIMESTAMP(2147558400)"),
+            (Some(Engine::ODBC), "TO_TIMESTAMP(2147558400)"),
+            (Some(Engine::Spark), "TO_TIMESTAMP(2147558400)"),
+            (Some(Engine::SQLite), "date(2147558400, 'unixepoch')"),
+        ] {
+            assert_eq!(
+                to_sql_with_engine(&date32_lit(FIRST_DAY_PAST_THE_I32_SECOND_BOUND), engine)
+                    .expect("to unparse"),
+                expected,
+                "Date32 on {engine:?}"
+            );
+            assert_eq!(
+                to_sql_with_engine(&date64_lit(2_147_558_400_000), engine).expect("to unparse"),
+                expected,
+                "Date64 on {engine:?}"
+            );
+        }
+    }
+
+    /// The half that must NOT move: a `Date32` inside the bound renders byte-identically, because
+    /// widening changes the width the product is computed in and not the instant any date names.
+    ///
+    /// This is the one assertion here that holds on both sides of the fix, and deliberately so —
+    /// it pins the property the fix has to preserve, and it is what would refuse a "repair" that
+    /// shifted every date to buy the ones past the bound. Read it as a control, not as a
+    /// regression pin; the pins are the tests above it.
+    #[test]
+    fn test_a_date_inside_the_bound_renders_unchanged() {
+        for (days, expected) in [
+            (0, "TO_TIMESTAMP(0)"),
+            (1, "TO_TIMESTAMP(86400)"),
+            (-1, "TO_TIMESTAMP(-86400)"),
+            (19_000, "TO_TIMESTAMP(1641600000)"),
+            (24_855, "TO_TIMESTAMP(2147472000)"),
+        ] {
+            assert_eq!(
+                to_sql_with_engine(&date32_lit(days), None).expect("to unparse"),
+                expected,
+                "Date32({days})"
+            );
+        }
+
+        assert_eq!(
+            to_sql_with_engine(&date32_lit(19_000), Some(Engine::SQLite)).expect("to unparse"),
+            "date(1641600000, 'unixepoch')"
+        );
+        // The one `Date64` count the units error left alone: zero scales either way to zero.
+        assert_eq!(
+            to_sql_with_engine(&date64_lit(0), None).expect("to unparse"),
+            "TO_TIMESTAMP(0)"
+        );
+    }
+
     /// The sub-second rendering is DuckDB-specific: the engines sharing the catch-all arm are
     /// untouched, and the ones with an arm of their own keep it.
     #[test]
@@ -2154,6 +2334,100 @@ mod duckdb_timestamp_execution_tests {
                 .unwrap_or_else(|e| panic!("DuckDB refused {sql}: {e}"));
 
             assert_eq!(round_tripped, micros, "{sql}");
+        }
+    }
+}
+
+/// A rendering assertion pins the constant this file computes; it cannot tell a literal that names
+/// the right day from one that names a different day, or none at all, because every one of those
+/// is well-formed SQL. These run the comparison DuckDB actually evaluates against rows one day
+/// apart and assert on which row survives it.
+#[cfg(all(test, feature = "duckdb"))]
+mod duckdb_date_execution_tests {
+    use super::tests::schema_with_ts;
+    use super::*;
+    use datafusion::prelude::*;
+    use duckdb::Connection;
+
+    /// `2038-01-19` is the last day whose epoch second an `i32` holds (`i32::MAX / 86_400` =
+    /// 24 855). The row beside it is the first day a product computed in `i32` could not name.
+    const ROWS: [(&str, &str, i32); 2] = [
+        ("last_i32_day", "2038-01-19", 24_855),
+        ("first_day_past_it", "2038-01-20", 24_856),
+    ];
+
+    /// Runs `filter` against a real `DATE` column as DuckDB would receive it, with the column's
+    /// Arrow type declared as `column_type`, and returns the labels of the rows it keeps.
+    fn rows_selected_by(
+        filter: &Expr,
+        column_type: DataType,
+        session_timezone: &str,
+    ) -> Vec<String> {
+        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+        conn.execute_batch(&format!(
+            "SET TimeZone='{session_timezone}'; CREATE TABLE t (label VARCHAR, ts DATE)"
+        ))
+        .expect("create");
+        // The rows are built from the calendar day itself, a route the rendering under test does
+        // not use, so a fixture and the literal that has to find it cannot be wrong together.
+        for (label, day, _) in ROWS {
+            conn.execute_batch(&format!(
+                "INSERT INTO t VALUES ('{label}', CAST('{day}' AS DATE))"
+            ))
+            .expect("insert");
+        }
+
+        let schema = schema_with_ts(column_type);
+        let where_clause =
+            to_sql_with_engine_and_schema(filter, Some(Engine::DuckDB), Some(&schema))
+                .expect("to unparse");
+
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT label FROM t WHERE {where_clause} ORDER BY label"
+            ))
+            .expect("prepare");
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("rows")
+    }
+
+    /// Every day names its own row and only its own row, on both sides of the bound the `i32`
+    /// product stopped at. Asserting the row *beside* it too is what separates "the literal names
+    /// this day" from "the literal matches everything".
+    #[test]
+    fn a_date32_literal_selects_the_day_it_names() {
+        for session_timezone in ["UTC", "America/Los_Angeles"] {
+            for (label, _, days) in ROWS {
+                let filter = col("ts").eq(Expr::Literal(ScalarValue::Date32(Some(days)), None));
+
+                assert_eq!(
+                    rows_selected_by(&filter, DataType::Date32, session_timezone),
+                    vec![label.to_string()],
+                    "Date32({days}) under TimeZone {session_timezone}"
+                );
+            }
+        }
+    }
+
+    /// The same days spelled as `Date64` millisecond counts select the same rows. Scaling such a
+    /// count by the length of a day named an instant past the year 238 000, so the comparison it
+    /// built selected nothing at all.
+    #[test]
+    fn a_date64_literal_selects_the_same_day_as_the_date32_spelling_of_it() {
+        for session_timezone in ["UTC", "America/Los_Angeles"] {
+            for (label, _, days) in ROWS {
+                let millis = i64::from(days) * 86_400_000;
+                let filter = col("ts").eq(Expr::Literal(ScalarValue::Date64(Some(millis)), None));
+
+                assert_eq!(
+                    rows_selected_by(&filter, DataType::Date64, session_timezone),
+                    vec![label.to_string()],
+                    "Date64({millis}) under TimeZone {session_timezone}"
+                );
+            }
         }
     }
 }
