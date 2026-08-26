@@ -2093,6 +2093,32 @@ mod tests {
         }
     }
 
+    /// The `div_euclid` half of the `Date64` arm, which every whole-day count above leaves
+    /// untested: each of those divides exactly, so all of them pass just as well under a
+    /// truncating `/`. These do not.
+    ///
+    /// A count that is not a whole number of days is outside what Arrow's definition of `Date64`
+    /// describes but inside what its type holds, so the arm has to render *something* for it, and
+    /// below the epoch the two spellings disagree — `div_euclid` floors to the second at or before
+    /// the instant named, `/` truncates towards zero and lands after it. Flooring is what keeps the
+    /// arm consistent on both sides of the epoch, and what `duckdb_timestamp_literal` chose one arm
+    /// over for the same reason.
+    #[test]
+    fn test_date64_floors_a_sub_second_count_below_the_epoch() {
+        for (millis, seconds) in [
+            (-1_i64, -1_i64),       // truncating `/` would render 0
+            (-999, -1),             // truncating `/` would render 0
+            (-86_400_500, -86_401), // truncating `/` would render -86_400
+        ] {
+            assert_date_renders(&date64_lit(millis), seconds, &format!("Date64({millis})"));
+        }
+
+        // Above the epoch the two agree, so this half pins that flooring costs nothing there.
+        for (millis, seconds) in [(1_i64, 0_i64), (999, 0), (86_400_500, 86_400)] {
+            assert_date_renders(&date64_lit(millis), seconds, &format!("Date64({millis})"));
+        }
+    }
+
     /// The two variants spell the same day in different units, so a filter on one has to render
     /// the same instant as a filter on the other. This is what the units error broke: the same
     /// day rendered two instants that were not even the same order of magnitude apart.
