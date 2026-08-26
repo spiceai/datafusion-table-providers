@@ -834,12 +834,12 @@ fn prepare_hnsw_support(live_conn: &Connection) {
 /// Ordering (all under the exclusive write gate):
 /// 1. `rename(building, generation)` — marks the staging output complete;
 ///    recovery adopts completed generations, never `.building` files.
-/// 2. Unlink the old database file and its WAL. From here the configured path
-///    is free; a crash before step 3 is healed at boot by adopting the
-///    generation.
+/// 2. Clear the WAL beside the configured path, and unlink the retiring file
+///    only when it is not the configured path — step 3 replaces that one
+///    atomically.
 /// 3. `rename(generation, configured)` — the new file takes the live name.
-/// 4. Repoint the pool. If the old file could not be unlinked (Windows file
-///    locking), serve the generation path instead; a restart normalizes it.
+/// 4. Repoint the pool. If the configured WAL could not be cleared (Windows
+///    file locking), serve the generation path instead.
 fn complete_swap(
     pool: &Arc<DuckDbConnectionPool>,
     building_path: &str,
@@ -869,33 +869,29 @@ fn complete_swap(
         })
         .map_err(to_retriable_data_write_error)?;
 
-    // Free the configured path: remove the retiring file (which may already
-    // live at a generation path if a previous swap could not reclaim the
-    // configured name) and any stale file still holding the configured name.
-    let mut configured_free = true;
-    for stale in [old_physical.clone(), configured_path.clone()] {
-        match remove_file_if_exists(&stale) {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to remove retiring DuckDB database file {stale} during file swap: {e}"
-                );
-                if stale == configured_path {
-                    configured_free = false;
-                }
-            }
+    // A foreign WAL left beside the configured path would be replayed against
+    // the new file, so failing to remove it blocks reclaiming that name.
+    let configured_free = match remove_file_if_exists(&wal_path_of(&configured_path)) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to remove retiring DuckDB WAL file {configured_path}.wal during file swap: {e}"
+            );
+            false
         }
-        match remove_file_if_exists(&wal_path_of(&stale)) {
-            Ok(_) => {}
-            Err(e) => {
+    };
+
+    // Remove the retiring file and its WAL only when the file is not the
+    // configured path: the rename below replaces that path atomically, and the
+    // retired inode stays alive for readers still holding it open. The
+    // configured path must never be unlinked -- peers attach it by name and
+    // fail if it is briefly absent.
+    if old_physical != configured_path {
+        for stale in [wal_path_of(&old_physical), old_physical.clone()] {
+            if let Err(e) = remove_file_if_exists(&stale) {
                 tracing::warn!(
-                    "Failed to remove retiring DuckDB WAL file {stale}.wal during file swap: {e}"
+                    "Failed to remove retiring DuckDB file {stale} during file swap: {e}"
                 );
-                if stale == configured_path {
-                    // A foreign WAL beside the configured path would be
-                    // replayed against the new file — do not place it there.
-                    configured_free = false;
-                }
             }
         }
     }
@@ -1026,6 +1022,21 @@ mod tests {
     fn count(conn: &Connection, sql: &str) -> i64 {
         conn.query_row(sql, [], |r| r.get::<usize, i64>(0))
             .expect("count query")
+    }
+
+    /// Places a fresh peer database (two rows) at `path`, replacing whatever is
+    /// there by rename, as a file swap does.
+    fn write_peer(dir: &Path, path: &str) {
+        let staging = dir.join("peer_stage.db").to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&staging);
+        {
+            let conn = Connection::open(&staging).expect("open staging peer");
+            conn.execute_batch(
+                "CREATE TABLE peer_data (v INTEGER); INSERT INTO peer_data VALUES (1), (2);",
+            )
+            .expect("seed staging peer");
+        }
+        std::fs::rename(&staging, path).expect("place peer file");
     }
 
     fn pooled_raw_connection(pool: &Arc<DuckDbConnectionPool>) -> Connection {
@@ -1382,21 +1393,6 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Barrier, Mutex};
 
-        // Writes a fresh peer database (two rows) at `path`.
-        fn write_peer(dir: &Path, path: &str) {
-            let staging = dir.join("peer_stage.db");
-            let staging = staging.to_string_lossy().to_string();
-            let _ = std::fs::remove_file(&staging);
-            {
-                let conn = Connection::open(&staging).expect("open staging peer");
-                conn.execute_batch(
-                    "CREATE TABLE peer_data (v INTEGER); INSERT INTO peer_data VALUES (1), (2);",
-                )
-                .expect("seed staging peer");
-            }
-            std::fs::rename(&staging, path).expect("place peer file");
-        }
-
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("main.db").to_string_lossy().to_string();
         let peer_path = dir.path().join("peer.db").to_string_lossy().to_string();
@@ -1488,6 +1484,231 @@ mod tests {
 
         let errors = errors.lock().expect("errors lock");
         assert!(errors.is_empty(), "concurrent readers failed: {errors:?}");
+    }
+
+    /// Recovery fires only for this pool's own attachments.
+    ///
+    /// A statement naming a catalog that was never attached, or a malformed
+    /// statement, must fail with its original error rather than be retried.
+    #[test]
+    fn test_recovery_does_not_mask_unrelated_catalog_errors() {
+        use crate::sql::db_connection_pool::dbconnection::duckdbconn::DuckDBAttachments;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let peer_path = dir.path().join("peer.db").to_string_lossy().to_string();
+        {
+            let conn = Connection::open(&peer_path).expect("open peer");
+            conn.execute_batch(
+                "CREATE TABLE peer_data (v INTEGER); INSERT INTO peer_data VALUES (1);",
+            )
+            .expect("seed peer");
+        }
+
+        let attachments =
+            DuckDBAttachments::new("main", &[Arc::from(peer_path.as_str()) as Arc<str>]);
+        let conn = Connection::open(dir.path().join("main.db")).expect("open main");
+        attachments.attach_once(&conn).expect("attach");
+
+        // A catalog that is not ours and was never attached.
+        let calls = std::cell::Cell::new(0);
+        let err = attachments
+            .with_attachment_recovery(&conn, |c| {
+                calls.set(calls.get() + 1);
+                c.prepare("SELECT * FROM not_our_catalog.main.t")
+                    .map(|_| ())
+            })
+            .expect_err("must not succeed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not_our_catalog"),
+            "the original error must surface unchanged, got: {msg}"
+        );
+        assert_eq!(calls.get(), 1, "an unrelated error must not be retried");
+
+        // And a plain syntax error must also pass straight through.
+        let calls = std::cell::Cell::new(0);
+        let err = attachments
+            .with_attachment_recovery(&conn, |c| {
+                calls.set(calls.get() + 1);
+                c.prepare("SELECT FROM WHERE").map(|_| ())
+            })
+            .expect_err("must not succeed");
+        assert!(
+            !err.to_string().contains("attachment_"),
+            "a syntax error must not be reported as an attachment problem: {err}"
+        );
+        assert_eq!(calls.get(), 1, "a syntax error must not be retried");
+
+        // The healthy path still works after both failures.
+        attachments
+            .with_attachment_recovery(&conn, |c| {
+                c.prepare("SELECT COUNT(1) FROM peer_data").map(|_| ())
+            })
+            .expect("healthy prepare after unrelated failures");
+    }
+
+    /// Queries succeed while a peer database file is repeatedly replaced.
+    ///
+    /// Readers go through `query_arrow`, half of them across the attachment,
+    /// mirroring accelerations that refresh into separate DuckDB files while
+    /// serving live traffic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_recovery_holds_under_sustained_peer_replacement() {
+        use crate::sql::db_connection_pool::dbconnection::SyncDbConnection;
+        use futures::StreamExt;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("main.db").to_string_lossy().to_string();
+        let peer_path = dir.path().join("peer.db").to_string_lossy().to_string();
+        write_peer(dir.path(), &peer_path);
+
+        let pool = Arc::new(
+            DuckDbConnectionPoolBuilder::file(&db_path)
+                .with_access_mode(AccessMode::ReadWrite)
+                .build()
+                .expect("pool")
+                .set_attached_databases(&[Arc::from(peer_path.as_str()) as Arc<str>])
+                .expect("attach peer"),
+        );
+        {
+            let conn = pooled_raw_connection(&pool);
+            conn.execute_batch(
+                "CREATE TABLE local_data (v INTEGER); INSERT INTO local_data VALUES (1);",
+            )
+            .expect("seed main");
+        }
+
+        const READERS: usize = 8;
+        const REPLACEMENTS: usize = 60;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let served = Arc::new(AtomicU64::new(0));
+        let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let readers: Vec<_> = (0..READERS)
+            .map(|i| {
+                let pool = Arc::clone(&pool);
+                let stop = Arc::clone(&stop);
+                let served = Arc::clone(&served);
+                let errors = Arc::clone(&errors);
+                // half read only main, half read across the attachment
+                let sql = if i % 2 == 0 {
+                    "SELECT count(1) FROM local_data"
+                } else {
+                    "SELECT count(1) FROM peer_data"
+                };
+                tokio::spawn(async move {
+                    while !stop.load(Ordering::Relaxed) {
+                        let mut conn = Arc::clone(&pool).connect_sync().expect("connect");
+                        let duck = conn
+                            .as_any_mut()
+                            .downcast_mut::<DuckDbConnection>()
+                            .expect("duckdb connection");
+                        match duck.query_arrow(sql, &[], None) {
+                            Ok(mut stream) => {
+                                while let Some(batch) = stream.next().await {
+                                    if let Err(e) = batch {
+                                        errors
+                                            .lock()
+                                            .expect("errors lock")
+                                            .push(format!("[{sql}] stream failed: {e}"));
+                                        return;
+                                    }
+                                }
+                                served.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                errors
+                                    .lock()
+                                    .expect("errors lock")
+                                    .push(format!("[{sql}] query_arrow failed: {e}"));
+                                return;
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for _ in 1..=REPLACEMENTS {
+            write_peer(dir.path(), &peer_path);
+            // Space the replacements: a file is replaced once per refresh, so
+            // back-to-back replacements would exercise a collision that a real
+            // schedule cannot produce. 50ms is still far faster than that.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        stop.store(true, Ordering::Relaxed);
+        for reader in readers {
+            reader.await.expect("reader task");
+        }
+
+        let errors = errors.lock().expect("errors lock");
+        assert!(
+            errors.is_empty(),
+            "{} queries served across {REPLACEMENTS} replacements, then: {:?}",
+            served.load(Ordering::Relaxed),
+            errors
+        );
+    }
+
+    /// The configured database path exists continuously across a swap.
+    ///
+    /// Peers attach this path by name, and both the `ATTACH` and its pre-flight
+    /// `fs::metadata` resolve it at that moment, so a moment where the path is
+    /// absent fails their queries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_configured_path_is_never_absent_during_swap() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("swap_gap.db").to_string_lossy().to_string();
+
+        let pool = Arc::new(
+            DuckDbConnectionPoolBuilder::file(&db_path)
+                .with_access_mode(AccessMode::ReadWrite)
+                .build()
+                .expect("pool"),
+        );
+
+        let definition = swap_dataset_definition();
+        overwrite_with_swap(&pool, &definition, &[(1, "one")]).await;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let misses = Arc::new(AtomicU64::new(0));
+        let probes = Arc::new(AtomicU64::new(0));
+
+        // Probe the configured path exactly as a peer instance's attach
+        // pre-flight does, as fast as possible.
+        let watcher = {
+            let path = db_path.clone();
+            let stop = Arc::clone(&stop);
+            let misses = Arc::clone(&misses);
+            let probes = Arc::clone(&probes);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    probes.fetch_add(1, Ordering::Relaxed);
+                    if std::fs::metadata(&path).is_err() {
+                        misses.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+
+        for i in 0..8 {
+            overwrite_with_swap(&pool, &definition, &[(i, "row"), (i + 1, "row")]).await;
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        watcher.join().expect("watcher");
+
+        assert_eq!(
+            misses.load(Ordering::Relaxed),
+            0,
+            "configured path vanished during a swap, over {} probes",
+            probes.load(Ordering::Relaxed)
+        );
     }
 
     #[test]

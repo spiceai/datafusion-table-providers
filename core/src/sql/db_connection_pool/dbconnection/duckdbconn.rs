@@ -108,6 +108,9 @@ struct AttachedState {
     identities: Vec<(Arc<str>, Option<FileIdentity>)>,
 }
 
+/// Prefix shared by every alias attached databases are exposed under.
+const ATTACHMENT_ALIAS_PREFIX: &str = "attachment_";
+
 /// Configuration and state for attaching external DuckDB databases.
 #[derive(Debug)]
 pub struct DuckDBAttachments {
@@ -218,7 +221,7 @@ impl DuckDBAttachments {
         while let Some(row) = rows.next()? {
             let db_name: String = row.get(1)?;
             let db_path: Option<String> = row.get(2)?;
-            if db_name.starts_with("attachment_") {
+            if db_name.starts_with(ATTACHMENT_ALIAS_PREFIX) {
                 // attachment always has a path so it is safe to use unwrap_or_default
                 existing_attachments.insert(db_path.unwrap_or_default(), db_name);
             }
@@ -281,7 +284,72 @@ impl DuckDBAttachments {
 
     #[must_use]
     fn get_attachment_name(random_id: &str, index: usize) -> String {
-        format!("attachment_{random_id}_{index}")
+        format!("{ATTACHMENT_ALIAS_PREFIX}{random_id}_{index}")
+    }
+
+    /// True if `err` reports a missing catalog belonging to this pool's own
+    /// attachments. Matching this pool's alias prefix keeps an unrelated
+    /// catalog error from being mistaken for one.
+    fn is_stale_attachment_error(&self, err: &duckdb::Error) -> bool {
+        err.to_string()
+            .contains(&format!("{ATTACHMENT_ALIAS_PREFIX}{}_", self.random_id))
+    }
+
+    /// Runs `op`, retrying once if a concurrent re-attach invalidated this
+    /// connection's attachments.
+    ///
+    /// A re-attach breaks both a bind (`Catalog "attachment_..." does not
+    /// exist`) and the start of an already-prepared statement (`Prepared
+    /// statement requires database attachment_...`), so `op` must cover prepare
+    /// *and* execution start. `op` must not have emitted rows when it returns
+    /// an error, so re-running it cannot duplicate output.
+    ///
+    /// Re-attaching waits out any re-attach already in flight, then releases
+    /// the lock before `op` runs, so a slow statement does not block other
+    /// queries.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original error if it is not a stale-attachment failure, or
+    /// the retry's error if recovery did not help.
+    pub(crate) fn with_attachment_recovery<T>(
+        &self,
+        conn: &Connection,
+        mut op: impl FnMut(&Connection) -> duckdb::Result<T>,
+    ) -> duckdb::Result<T> {
+        match op(conn) {
+            Ok(value) => Ok(value),
+            Err(e) if self.is_stale_attachment_error(&e) => {
+                if let Err(re) = self.reattach_locked(conn) {
+                    tracing::warn!("Failed to re-establish DuckDB attachments: {re}");
+                    return Err(e);
+                }
+                op(conn)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Re-attaches under the cache lock, refreshing the cached state.
+    ///
+    /// Identities are read inside the lock so the cache records the files that
+    /// were actually attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the attach fails.
+    fn reattach_locked(&self, conn: &Connection) -> Result<()> {
+        let mut attached = self
+            .attached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let identities = self.attachment_identities();
+        let search_path = self.attach(conn)?;
+        *attached = Some(AttachedState {
+            search_path,
+            identities,
+        });
+        Ok(())
     }
 
     /// Invalidates the cached attach state so the next `attach_once` re-attaches
@@ -304,6 +372,10 @@ impl DuckDBAttachments {
     /// Lazily attaches databases on first call, then applies search_path to the connection.
     /// Uses the cached search_path on subsequent calls.
     ///
+    /// This prepares the connection only. Statements that name an attached
+    /// catalog should run inside [`Self::with_attachment_recovery`], which
+    /// recovers if the attachments are replaced after this returns.
+    ///
     /// The cache is keyed on the attached files' on-disk identities, so if an
     /// attached database file has been replaced on disk since the cached attach
     /// was established — a different file now sits at the same path, as a
@@ -324,6 +396,9 @@ impl DuckDBAttachments {
     ///
     /// Returns an error if attachment or search_path setting fails.
     pub fn attach_once(&self, conn: &Connection) -> Result<()> {
+        // Stat the attached files before taking the lock: the common case is a
+        // cache hit, and holding it across the syscalls would serialize every
+        // concurrent query behind them.
         let identities = self.attachment_identities();
 
         let search_path = {
@@ -331,6 +406,17 @@ impl DuckDBAttachments {
                 .attached
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            // Only on a miss, re-read the identities under the lock, so a thread
+            // that raced the same replacement sees the updated cache and skips
+            // the re-attach. `DETACH` is instance-wide, so each one it avoids is
+            // a window in which another connection's statement could fail.
+            let identities = if matches!(attached.as_ref(), Some(state) if state.identities == identities)
+            {
+                identities
+            } else {
+                self.attachment_identities()
+            };
 
             match attached.as_ref() {
                 Some(state) if state.identities == identities => Arc::clone(&state.search_path),
@@ -353,7 +439,7 @@ impl DuckDBAttachments {
                     let search_path = self.attach(conn)?;
                     *attached = Some(AttachedState {
                         search_path: Arc::clone(&search_path),
-                        identities: identities.clone(),
+                        identities,
                     });
                     search_path
                 }
@@ -361,29 +447,38 @@ impl DuckDBAttachments {
         };
 
         if let Err(e) = conn.execute(&format!("SET search_path = '{}'", search_path), []) {
-            // The cached search_path names attachments this connection's instance
-            // does not have — its backing instance was replaced by a database
-            // file swap, which drops every ATTACH. Re-establish the attachments
-            // on the current instance and retry the search_path once. The swap
-            // is not observable until it completes, so one retry suffices.
+            // The cache is current but this connection's instance holds none of
+            // the attachments: a database file swap replaced the instance.
+            // Re-attach on it and apply the search_path again.
             tracing::debug!(
                 "DuckDB SET search_path failed, re-attaching databases {:?} on the current instance: {e}",
                 self.attachments
             );
-            let mut attached = self
-                .attached
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // `attach` inspects this connection's catalog and sets the
-            // search_path itself, so no further SET is needed here.
-            let search_path = self.attach(conn)?;
-            *attached = Some(AttachedState {
-                search_path,
-                identities,
-            });
+            // `attach` sets the search_path itself, so no further SET is needed.
+            self.reattach_locked(conn)?;
         }
 
         Ok(())
+    }
+}
+
+/// Prepares and executes `sql`, returning the schema of its result.
+fn probe_schema(conn: &Connection, sql: &str) -> duckdb::Result<SchemaRef> {
+    let mut stmt = conn.prepare(sql)?;
+    let result: duckdb::Arrow<'_> = stmt.query_arrow([])?;
+    Ok(result.get_schema())
+}
+
+/// Runs `op` under attachment recovery when the connection has attachments, and
+/// directly when it does not.
+fn with_optional_recovery<T>(
+    attachments: Option<&DuckDBAttachments>,
+    conn: &Connection,
+    mut op: impl FnMut(&Connection) -> duckdb::Result<T>,
+) -> duckdb::Result<T> {
+    match attachments {
+        Some(attachments) => attachments.with_attachment_recovery(conn, op),
+        None => op(conn),
     }
 }
 
@@ -578,18 +673,16 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
         } else {
             table_reference.to_quoted_string()
         };
-        let mut stmt = self
-            .conn
-            .prepare(&format!("SELECT * FROM {table_str} LIMIT 0"))
-            .boxed()
-            .context(super::UnableToGetSchemaSnafu)?;
+        let probe_sql = format!("SELECT * FROM {table_str} LIMIT 0");
+        // Prepare and execute recover as one unit: a re-attach between them
+        // invalidates the prepared plan.
+        let schema = with_optional_recovery(self.attachments.as_deref(), &self.conn, |conn| {
+            probe_schema(conn, &probe_sql)
+        })
+        .boxed()
+        .context(super::UnableToGetSchemaSnafu)?;
 
-        let result: duckdb::Arrow<'_> = stmt
-            .query_arrow([])
-            .boxed()
-            .context(super::UnableToGetSchemaSnafu)?;
-
-        Self::handle_unsupported_schema(&result.get_schema(), self.unsupported_type_action)
+        Self::handle_unsupported_schema(&schema, self.unsupported_type_action)
     }
 
     fn query_arrow(
@@ -610,34 +703,39 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
 
         let fetch_schema_sql =
             format!("WITH fetch_schema AS ({sql}) SELECT * FROM fetch_schema LIMIT 0");
-        let mut stmt = conn
-            .prepare(&fetch_schema_sql)
-            .boxed()
-            .context(super::UnableToGetSchemaSnafu)?;
-
-        let result: duckdb::Arrow<'_> = stmt
-            .query_arrow([])
-            .boxed()
-            .context(super::UnableToGetSchemaSnafu)?;
-
-        let schema = result.get_schema();
+        let schema = with_optional_recovery(self.attachments.as_deref(), &conn, |conn| {
+            probe_schema(conn, &fetch_schema_sql)
+        })
+        .boxed()
+        .context(super::UnableToGetSchemaSnafu)?;
 
         let params = params.iter().map(dyn_clone::clone).collect::<Vec<_>>();
 
         let sql = sql.to_string();
 
+        let attachments_for_stream = self.attachments.clone();
         let create_stream = || -> Result<SendableRecordBatchStream> {
             let join_handle = tokio::task::spawn_blocking(move || {
-                let mut stmt = conn.prepare(&sql).context(DuckDBQuerySnafu)?;
                 let params: &[&dyn ToSql] = &params
                     .iter()
                     .map(|f| f.as_input_parameter())
                     .collect::<Vec<_>>();
-                let result: duckdb::ArrowStream<'_> =
-                    stmt.stream_arrow(params).context(DuckDBQuerySnafu)?;
-                for i in result {
-                    blocking_channel_send(&batch_tx, i)?;
-                }
+                // Prepare and stream_arrow recover as one unit: `stream_arrow`
+                // fails before the first batch, so re-running emits no
+                // duplicates. A send failure rides in the success value so it is
+                // reported as-is rather than retried.
+                let run = |conn: &Connection| {
+                    let mut stmt = conn.prepare(&sql)?;
+                    for batch in stmt.stream_arrow(params)? {
+                        if let Err(e) = blocking_channel_send(&batch_tx, batch) {
+                            return Ok(Err(e));
+                        }
+                    }
+                    Ok(Ok(()))
+                };
+                with_optional_recovery(attachments_for_stream.as_deref(), &conn, run)
+                    .context(DuckDBQuerySnafu)??;
+
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
             });
 
