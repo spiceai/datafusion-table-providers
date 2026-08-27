@@ -625,6 +625,7 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
         let params = params.iter().map(dyn_clone::clone).collect::<Vec<_>>();
 
         let sql = sql.to_string();
+        let query_schema = Arc::clone(&schema);
 
         let create_stream = || -> Result<SendableRecordBatchStream> {
             let join_handle = tokio::task::spawn_blocking(move || {
@@ -634,7 +635,7 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
                     .map(|f| f.as_input_parameter())
                     .collect::<Vec<_>>();
                 let result: duckdb::ArrowStream<'_> =
-                    stmt.stream_arrow(params).context(DuckDBQuerySnafu)?;
+                    stmt.stream_arrow(params, query_schema).context(DuckDBQuerySnafu)?;
                 for i in result {
                     blocking_channel_send(&batch_tx, i)?;
                 }
