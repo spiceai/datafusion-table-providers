@@ -48,11 +48,41 @@ pub fn contains_unsupported_functions(
     Ok(found_unsupported)
 }
 
-#[derive(Clone, Debug)]
+/// Whether a backend can evaluate *this call* of a scalar function its
+/// [`FunctionRestriction`] already allows.
+///
+/// A deny-list answers by name, which is all it needs until a backend carves a
+/// name back out because its unparser dialect rewrites that function into
+/// native SQL. But a dialect rewrites a *call*, not a name: it can translate
+/// `f(col, 'literal')` and have no equivalent for `f(col, other_col)`. With no
+/// way to say so, carving the name out federates the untranslatable call too,
+/// and `Dialect::scalar_function_to_sql_overrides` returning `Ok(None)` for it
+/// makes the unparser emit the function verbatim into SQL the remote cannot
+/// parse.
+///
+/// A backend supplies this to refuse exactly the call shapes its dialect cannot
+/// translate, so those are left for the local engine to evaluate instead. It is
+/// consulted for every scalar call the name check allows, so an implementation
+/// returns `true` for the functions it has no opinion about.
+pub type ScalarCallSupport = Arc<dyn Fn(&ScalarFunction) -> bool + Send + Sync>;
+
+#[derive(Clone)]
 pub struct FunctionSupport {
     scalar: Option<FunctionRestriction>,
     window: Option<FunctionRestriction>,
     aggregate: Option<FunctionRestriction>,
+    scalar_call: Option<ScalarCallSupport>,
+}
+
+impl std::fmt::Debug for FunctionSupport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FunctionSupport")
+            .field("scalar", &self.scalar)
+            .field("window", &self.window)
+            .field("aggregate", &self.aggregate)
+            .field("scalar_call", &self.scalar_call.as_ref().map(|_| "<fn>"))
+            .finish()
+    }
 }
 
 impl FunctionSupport {
@@ -65,7 +95,16 @@ impl FunctionSupport {
             scalar,
             window,
             aggregate,
+            scalar_call: None,
         }
+    }
+
+    /// Adds a per-call check, consulted for every scalar call the name-based
+    /// restriction allows. See [`ScalarCallSupport`].
+    #[must_use]
+    pub fn with_scalar_call_support(mut self, scalar_call: ScalarCallSupport) -> Self {
+        self.scalar_call = Some(scalar_call);
+        self
     }
 
     pub fn deny_all_from(sess: &dyn Session) -> Self {
@@ -86,6 +125,7 @@ impl FunctionSupport {
             scalar,
             window,
             aggregate,
+            scalar_call: None,
         }
     }
 
@@ -107,6 +147,7 @@ impl FunctionSupport {
             scalar,
             window,
             aggregate,
+            scalar_call: None,
         }
     }
 
@@ -114,7 +155,9 @@ impl FunctionSupport {
         let mut supports = true;
         let _ = expr.apply(|e| {
             let support_child = match e {
-                Expr::ScalarFunction(ScalarFunction { func, .. }) => self.supports_scalar(func),
+                Expr::ScalarFunction(call) => {
+                    self.supports_scalar(&call.func) && self.supports_scalar_call(call)
+                }
                 Expr::AggregateFunction(AggregateFunction { func, .. }) => {
                     self.supports_aggregate(func)
                 }
@@ -139,6 +182,16 @@ impl FunctionSupport {
             .map(|restriction| restriction.supports(&fnc.name().to_string()))
             .unwrap_or(true)
     }
+    /// Whether the backend can evaluate this particular scalar call. `true`
+    /// when no per-call check is installed, so a backend that has nothing to
+    /// say about call shapes behaves exactly as before.
+    pub fn supports_scalar_call(&self, call: &ScalarFunction) -> bool {
+        self.scalar_call
+            .as_ref()
+            .map(|supports| supports(call))
+            .unwrap_or(true)
+    }
+
     pub fn supports_scalar(&self, fnc: &Arc<ScalarUDF>) -> bool {
         self.scalar
             .as_ref()
@@ -176,6 +229,7 @@ mod tests {
     use datafusion::logical_expr::expr::ScalarFunction;
     use datafusion::logical_expr::{create_udf, ColumnarValue, LogicalPlanBuilder, Subquery};
     use datafusion::prelude::col;
+    use datafusion::scalar::ScalarValue;
     use std::sync::Arc;
 
     fn stub_udf(name: &str) -> Arc<ScalarUDF> {
@@ -209,6 +263,111 @@ mod tests {
             .expect("scan")
             .build()
             .expect("build")
+    }
+
+    /// A `FunctionSupport` that allows every name but refuses calls of
+    /// `carved_out_fn` whose second argument is not a literal — the shape a
+    /// dialect that rewrites a literal path can translate.
+    fn literal_argument_support() -> FunctionSupport {
+        FunctionSupport::new(None, None, None).with_scalar_call_support(Arc::new(
+            |call: &ScalarFunction| {
+                if call.func.name() != "carved_out_fn" {
+                    return true;
+                }
+                call.args
+                    .iter()
+                    .skip(1)
+                    .all(|arg| matches!(arg, Expr::Literal(_, _)))
+            },
+        ))
+    }
+
+    fn projection_of(expr: Expr) -> LogicalPlan {
+        LogicalPlanBuilder::from(scan_plan("t"))
+            .project(vec![expr])
+            .expect("project")
+            .build()
+            .expect("build")
+    }
+
+    /// A stub UDF taking as many `Utf8` arguments as the call passes it, so a
+    /// two-argument call plans.
+    fn call(name: &str, args: Vec<Expr>) -> Expr {
+        let udf = Arc::new(create_udf(
+            name,
+            vec![DataType::Utf8; args.len()],
+            DataType::Utf8,
+            datafusion::logical_expr::Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        ));
+        Expr::ScalarFunction(ScalarFunction::new_udf(udf, args))
+    }
+
+    #[test]
+    fn a_call_shape_the_backend_can_translate_is_supported() {
+        let plan = projection_of(call(
+            "carved_out_fn",
+            vec![col("val"), Expr::Literal(ScalarValue::from("key"), None)],
+        ));
+
+        assert!(
+            !contains_unsupported_functions(&plan, &literal_argument_support()).expect("check"),
+            "a literal argument is the shape the backend declared it can translate"
+        );
+    }
+
+    #[test]
+    fn a_call_shape_the_backend_cannot_translate_is_unsupported() {
+        let plan = projection_of(call("carved_out_fn", vec![col("val"), col("val")]));
+
+        assert!(
+            contains_unsupported_functions(&plan, &literal_argument_support()).expect("check"),
+            "a non-literal argument has no translation, so the plan must not federate"
+        );
+    }
+
+    #[test]
+    fn the_per_call_check_only_speaks_for_the_functions_it_names() {
+        let plan = projection_of(call("other_fn", vec![col("val"), col("val")]));
+
+        assert!(
+            !contains_unsupported_functions(&plan, &literal_argument_support()).expect("check"),
+            "a function the check returns true for is unaffected by it"
+        );
+    }
+
+    #[test]
+    fn a_denied_name_stays_denied_whatever_its_call_shape() {
+        let support = FunctionSupport::new(
+            Some(FunctionRestriction::Deny(vec!["denied_fn".to_string()])),
+            None,
+            None,
+        )
+        .with_scalar_call_support(Arc::new(|_: &ScalarFunction| true));
+        let plan = projection_of(call(
+            "denied_fn",
+            vec![col("val"), Expr::Literal(ScalarValue::from("key"), None)],
+        ));
+
+        assert!(
+            contains_unsupported_functions(&plan, &support).expect("check"),
+            "the per-call check narrows what the name check allows, it never widens it"
+        );
+    }
+
+    #[test]
+    fn a_call_shape_is_refused_wherever_it_appears_in_the_plan() {
+        // The per-call check has to reach as far as the name check does, which
+        // includes an expression nested under another function call.
+        let plan = projection_of(call(
+            "outer_fn",
+            vec![call("carved_out_fn", vec![col("val"), col("val")])],
+        ));
+
+        assert!(
+            contains_unsupported_functions(&plan, &literal_argument_support()).expect("check"),
+            "an untranslatable call nested inside another call must still be refused"
+        );
     }
 
     #[test]
