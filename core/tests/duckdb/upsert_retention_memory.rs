@@ -43,7 +43,8 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{col, lit, CreateExternalTable, Expr};
 use datafusion::physical_plan::collect;
-use datafusion_table_providers::duckdb::DuckDBTableProviderFactory;
+use datafusion_table_providers::duckdb::write::DuckDBTableWriter;
+use datafusion_table_providers::duckdb::{DuckDB, DuckDBTableProviderFactory};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rstest::rstest;
@@ -556,6 +557,49 @@ async fn view_refresh_cycle(
         .expect("view refresh completes");
 }
 
+/// What DuckDB itself thinks it is holding, per allocator tag, plus the size
+/// of the database file.
+///
+/// RSS alone cannot say whether growth is DuckDB's buffer manager filling up
+/// to its configured limit (expected) or something accumulating that should
+/// have been released (not). This reads the engine's own accounting through
+/// the writer's pool, so a failing run reports *where* the memory went.
+fn duckdb_memory_report(table: &Arc<dyn datafusion::catalog::TableProvider>) -> Option<String> {
+    let writer = table.downcast_ref::<DuckDBTableWriter>()?;
+    let pool = writer.pool();
+    let mut db_conn = pool.connect_sync().ok()?;
+    let conn = &DuckDB::duckdb_conn(&mut db_conn).ok()?.conn;
+
+    let mut parts = Vec::new();
+
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT tag, memory_usage_bytes FROM duckdb_memory() \
+         WHERE memory_usage_bytes > 0 ORDER BY memory_usage_bytes DESC LIMIT 5",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        }) {
+            for row in rows.flatten() {
+                parts.push(format!("{}={:.1}MiB", row.0, row.1 as f64 / (1024.0 * 1024.0)));
+            }
+        }
+    }
+
+    if let Ok(bytes) = conn.query_row(
+        "SELECT database_size FROM pragma_database_size()",
+        [],
+        |row| row.get::<_, String>(0),
+    ) {
+        parts.push(format!("file={bytes}"));
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
 async fn count_rows(ctx: &SessionContext, table_name: &str) -> u64 {
     let batches = ctx
         // Counted over a column rather than `COUNT(*)`: the empty projection
@@ -678,6 +722,11 @@ async fn upsert_with_retention_and_view_refresh_does_not_grow_memory(
                 "cycle {cycle:>3}: rows={rows:>9} retention_deleted={deleted:>8} rss={:>8.1} MiB",
                 as_mib(rss),
             );
+            if cycle % 10 == 0 {
+                if let Some(report) = duckdb_memory_report(&dataset) {
+                    tracing::info!("cycle {cycle:>3}: dataset engine memory: {report}");
+                }
+            }
         } else {
             tracing::info!("cycle {cycle:>3}: rows={rows:>9} retention_deleted={deleted:>8}");
         }
