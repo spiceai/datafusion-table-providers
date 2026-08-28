@@ -13,6 +13,8 @@ use rstest::rstest;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+mod upsert_retention_memory;
+
 async fn arrow_duckdb_round_trip(
     arrow_record: RecordBatch,
     _source_schema: SchemaRef,
