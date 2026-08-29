@@ -712,6 +712,9 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
         let params = params.iter().map(dyn_clone::clone).collect::<Vec<_>>();
 
         let sql = sql.to_string();
+        // DuckDB 1.4.4 takes the result schema explicitly; this is the schema
+        // the probe above derived from the same SQL.
+        let query_schema = Arc::clone(&schema);
 
         let attachments_for_stream = self.attachments.clone();
         let create_stream = || -> Result<SendableRecordBatchStream> {
@@ -726,7 +729,7 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
                 // reported as-is rather than retried.
                 let run = |conn: &Connection| {
                     let mut stmt = conn.prepare(&sql)?;
-                    for batch in stmt.stream_arrow(params)? {
+                    for batch in stmt.stream_arrow(params, Arc::clone(&query_schema))? {
                         if let Err(e) = blocking_channel_send(&batch_tx, batch) {
                             return Ok(Err(e));
                         }
