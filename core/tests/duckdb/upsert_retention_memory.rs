@@ -49,18 +49,20 @@
 //! what made the per-cycle growth large enough to read off in a minute rather
 //! than an hour.
 //!
-//! Run it explicitly, and in release — the debug build of this many rows is
-//! far slower than the engine work it is measuring:
+//! Run it in release. A debug build compiles DuckDB's own assertions in, and
+//! the concurrent reads here trip storage-layer assertions that abort the test
+//! binary before it can measure anything — so the test skips itself in debug
+//! rather than reporting a crash as a memory result:
 //!
 //! ```text
 //! cargo test --release -p datafusion-table-providers --features duckdb,duckdb-federation \
-//!     --test integration upsert_with_retention -- --ignored --nocapture
+//!     --test integration upsert_with_retention -- --nocapture
 //! ```
 //!
-//! It is `#[ignore]`d because it currently fails: DuckDB 1.5.5 grows about
-//! 6 MiB per cycle at steady state on this workload and eventually exhausts
-//! `memory_limit`, where 1.4.4 plateaus. Remove the attribute once the
-//! underlying growth is fixed, so it guards against the regression returning.
+//! It exists because a DuckDB version shipped in this crate did grow without
+//! bound here: about 6 MiB per cycle at a steady row count, until the write
+//! failed against `memory_limit`. The engine this crate bundles now holds
+//! steady under the same workload, and this test is what keeps it that way.
 //! The failure it is built to produce is the engine's own
 //! `Out of Memory Error`: memory that never plateaus reaches the configured
 //! `memory_limit` and the refresh write fails, reported with the row count and
@@ -765,7 +767,12 @@ async fn fail_on_engine_error(
 #[case::single_column(PrimaryKeyShape::SingleColumn)]
 #[case::composite(PrimaryKeyShape::Composite)]
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-#[ignore = "soak test: minutes to run, and currently red on DuckDB 1.5.5 - see the module docs"]
+// Skipped in debug builds, where DuckDB compiles its own assertions in: this
+// workload's concurrent reads trip storage-layer assertions (`block_manager`,
+// `fixed_size_buffer`, `column_segment`) and abort the whole test binary. That
+// is worth chasing on its own; it is not what this test measures, and it makes
+// a debug run report nothing at all.
+#[cfg_attr(debug_assertions, ignore = "trips DuckDB's own assertions in debug builds; run with --release")]
 async fn upsert_with_retention_under_query_load_does_not_grow_memory(
     #[case] pk_shape: PrimaryKeyShape,
 ) {
