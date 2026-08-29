@@ -40,8 +40,30 @@
 //! Every dimension of the workload is tunable from the environment, so a
 //! growth configuration can be searched for without recompiling — cycles,
 //! rows, key space, table width, payload size, reader count, cadences, and the
-//! thresholds. Defaults are sized to run in about a minute; see the constants
-//! below.
+//! thresholds; see the constants below for the names.
+//!
+//! The defaults are the calibrated shape, not arbitrary. The key space has to
+//! saturate well before the measurement window, or rising memory is just the
+//! table still filling; at 50k rows a cycle against 300k keys that happens
+//! around cycle 20, which is where the warmup ends. The width and payload are
+//! what made the per-cycle growth large enough to read off in a minute rather
+//! than an hour.
+//!
+//! Run it explicitly, and in release — the debug build of this many rows is
+//! far slower than the engine work it is measuring:
+//!
+//! ```text
+//! cargo test --release -p datafusion-table-providers --features duckdb,duckdb-federation \
+//!     --test integration upsert_with_retention -- --ignored --nocapture
+//! ```
+//!
+//! It is `#[ignore]`d because it currently fails: DuckDB 1.5.5 grows about
+//! 6 MiB per cycle at steady state on this workload and eventually exhausts
+//! `memory_limit`, where 1.4.4 plateaus. Remove the attribute once the
+//! underlying growth is fixed, so it guards against the regression returning.
+//! Lowering `DUCKDB_MEM_TEST_MEMORY_LIMIT` turns the growth into a hard
+//! `Out of Memory Error` from the write itself, which is a crisper signal
+//! than any RSS threshold.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -67,24 +89,24 @@ use rstest::rstest;
 
 /// Refresh cycles to run. Each is one upsert, plus a retention delete on
 /// its own cadence.
-const DEFAULT_CYCLES: usize = 40;
+const DEFAULT_CYCLES: usize = 60;
 /// Rows written per upsert cycle.
-const DEFAULT_ROWS_PER_CYCLE: usize = 20_000;
+const DEFAULT_ROWS_PER_CYCLE: usize = 50_000;
 /// Distinct primary keys the workload cycles through. Smaller than
 /// `cycles * rows_per_cycle`, so most rows land on the `DO UPDATE` path
 /// rather than inserting.
-const DEFAULT_KEY_SPACE: usize = 200_000;
+const DEFAULT_KEY_SPACE: usize = 300_000;
 /// Extra columns appended to the base schema, alternating string and float.
 /// Raise this to test a wide table.
-const DEFAULT_EXTRA_COLUMNS: usize = 8;
+const DEFAULT_EXTRA_COLUMNS: usize = 24;
 /// Bytes in the variable-width payload column of each row.
-const DEFAULT_PAYLOAD_BYTES: usize = 64;
+const DEFAULT_PAYLOAD_BYTES: usize = 128;
 /// Run the retention delete every N cycles.
 const DEFAULT_RETENTION_EVERY: usize = 4;
 /// Reader tasks querying the table concurrently with the writes. Zero runs
 /// the refresh loop on its own, which is the comparison for whether
 /// concurrency changes the growth curve.
-const DEFAULT_READERS: usize = 2;
+const DEFAULT_READERS: usize = 4;
 /// Pause between a reader's queries. Small enough to keep reads overlapping
 /// the writes, large enough that readers do not monopolize the CPU.
 const DEFAULT_READER_PAUSE_MS: u64 = 25;
@@ -94,15 +116,15 @@ const DEFAULT_READER_PAUSE_MS: u64 = 25;
 const DEFAULT_OP_TIMEOUT_SECS: u64 = 300;
 /// Cycles to run before the memory baseline is taken. DuckDB's buffer pool
 /// and the allocator's arenas both need to reach steady state first.
-const DEFAULT_WARMUP_CYCLES: usize = 8;
+const DEFAULT_WARMUP_CYCLES: usize = 20;
 /// `memory_limit` given to the DuckDB instance.
 const DEFAULT_MEMORY_LIMIT: &str = "1GB";
 /// Rows older than this (seconds) and flagged deleted are trimmed by retention.
 const DEFAULT_RETENTION_WINDOW_SECS: i64 = 900;
 /// Allowed absolute RSS growth past the post-warmup baseline.
-const DEFAULT_MAX_GROWTH_MB: u64 = 512;
+const DEFAULT_MAX_GROWTH_MB: u64 = 256;
 /// Allowed relative RSS growth past the post-warmup baseline.
-const DEFAULT_MAX_GROWTH_RATIO: f64 = 1.5;
+const DEFAULT_MAX_GROWTH_RATIO: f64 = 1.3;
 
 #[derive(Debug, Clone)]
 struct StressConfig {
@@ -711,6 +733,7 @@ fn median(values: &mut [u64]) -> u64 {
 #[case::single_column(PrimaryKeyShape::SingleColumn)]
 #[case::composite(PrimaryKeyShape::Composite)]
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[ignore = "soak test: minutes to run, and currently red on DuckDB 1.5.5 - see the module docs"]
 async fn upsert_with_retention_under_query_load_does_not_grow_memory(
     #[case] pk_shape: PrimaryKeyShape,
 ) {
