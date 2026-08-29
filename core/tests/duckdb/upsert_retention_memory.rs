@@ -704,13 +704,15 @@ async fn upsert_with_retention_and_view_refresh_does_not_grow_memory(
         let batch = make_batch(&schema, &mut rng, &cfg, &mut high_water, now_us);
         upsert_cycle(&ctx, &dataset, batch).await;
 
-        let deleted = if cycle % cfg.retention_every == 0 {
+        // `cycle > 0` so that a cadence set high enough to disable an arm really
+        // disables it: cycle 0 is divisible by every interval.
+        let deleted = if cycle > 0 && cycle % cfg.retention_every == 0 {
             retention_cycle(&ctx, &dataset, &cfg, now_us).await
         } else {
             0
         };
 
-        if cycle % cfg.view_every == 0 {
+        if cycle > 0 && cycle % cfg.view_every == 0 {
             view_refresh_cycle(&ctx, &view, &dataset_name).await;
         }
 
