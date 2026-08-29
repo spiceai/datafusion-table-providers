@@ -1,42 +1,58 @@
 //! Memory-stability stress test for the DuckDB write path an accelerated
-//! dataset uses when it refreshes by upserting on a primary key while a
-//! retention delete trims rows out from under it, and an accelerated view
-//! repeatedly re-reads the result.
+//! dataset uses: a primary-key upsert on every refresh, a retention delete
+//! trimming rows out from under it, and query load running against the table
+//! the whole time.
 //!
-//! The loop mirrors what a refresh actually does, in the same order:
+//! One cycle is one refresh, and it does what a refresh does, in order:
 //!
 //! 1. **Upsert** — `insert_into(.., InsertOp::Append)` on a writer configured
 //!    with `on_conflict: upsert`. Internally this registers the incoming
 //!    batches as an FFI arrow scan view (`__scan_<table>_<ts>`), runs
-//!    `INSERT INTO <t> SELECT * FROM <view> ON CONFLICT (<pk>) DO UPDATE SET ..`,
-//!    drops the view, `ANALYZE`s, and commits.
+//!    `INSERT INTO <t> SELECT * FROM <scan> ON CONFLICT (<pk>) DO UPDATE SET ..`,
+//!    drops the scan, `ANALYZE`s, and commits.
 //! 2. **Retention** — a `DELETE FROM <t> WHERE <predicate>` issued as
-//!    `delete_from(filters)`, the same call a parsed retention SQL statement
-//!    lowers to. It runs right after the write, as it does in a refresh.
-//! 3. **View refresh** — the dataset is scanned back out and written into a
-//!    second, independently file-backed table with `InsertOp::Overwrite`,
-//!    which is how an accelerated view over an accelerated dataset refreshes.
+//!    `delete_from(filters)`, the call a parsed retention SQL statement lowers
+//!    to. It runs right after the write, as it does in a refresh.
 //!
-//! Each cycle is one refresh. The test asserts that resident memory reaches a
-//! plateau and stays there: DuckDB's buffer pool is expected to grow up to its
-//! `memory_limit` early, so the baseline is taken *after* a warmup and the
-//! assertion is about growth beyond that plateau.
+//! Meanwhile a configurable number of reader tasks query the table
+//! continuously, overlapping the writes rather than taking turns with them.
+//! That is what a deployment looks like: refreshes on one schedule, queries
+//! arriving whenever they arrive. It also puts real pressure on row-version
+//! retention — a reader holding a transaction open across an upsert is what
+//! keeps old versions alive — which a sequential loop cannot produce.
 //!
-//! Everything about the shape of the workload is tunable from the environment
-//! so a failing configuration can be searched for without recompiling — row
-//! count, key space, table width, payload size, cadences, and the thresholds
-//! themselves. Defaults are sized to run in about a minute; see the constants
+//! The reader shapes are the ones such deployments issue against an
+//! accelerated dataset: the filtered, ordered scan a dependent materialization
+//! performs, and a narrower keyed lookup. They aggregate or limit in SQL so
+//! the test's own result buffers stay out of the measurement.
+//!
+//! Deliberately one table and one engine: a second instance would add its own
+//! buffer pool to every RSS reading without adding pressure to the path under
+//! test.
+//!
+//! The test asserts that resident memory reaches a plateau and stays there.
+//! DuckDB's buffer pool is expected to grow toward its `memory_limit` early,
+//! so the baseline is taken after a warmup and the assertion is about growth
+//! past that plateau. Every tenth cycle also logs DuckDB's own
+//! `duckdb_memory()` accounting, so a failure says which allocator tag grew
+//! rather than only that the process did.
+//!
+//! Every dimension of the workload is tunable from the environment, so a
+//! growth configuration can be searched for without recompiling — cycles,
+//! rows, key space, table width, payload size, reader count, cadences, and the
+//! thresholds. Defaults are sized to run in about a minute; see the constants
 //! below.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use datafusion::arrow::array::{
     ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use datafusion::catalog::TableProviderFactory;
+use datafusion::catalog::{TableProvider, TableProviderFactory};
 use datafusion::common::{Constraint, Constraints, ScalarValue, ToDFSchema};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::context::SessionContext;
@@ -49,8 +65,8 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rstest::rstest;
 
-/// Refresh cycles to run. Each is one upsert, plus a retention delete and a
-/// view refresh on their own cadences.
+/// Refresh cycles to run. Each is one upsert, plus a retention delete on
+/// its own cadence.
 const DEFAULT_CYCLES: usize = 40;
 /// Rows written per upsert cycle.
 const DEFAULT_ROWS_PER_CYCLE: usize = 20_000;
@@ -65,12 +81,21 @@ const DEFAULT_EXTRA_COLUMNS: usize = 8;
 const DEFAULT_PAYLOAD_BYTES: usize = 64;
 /// Run the retention delete every N cycles.
 const DEFAULT_RETENTION_EVERY: usize = 4;
-/// Run the view refresh every N cycles.
-const DEFAULT_VIEW_EVERY: usize = 2;
+/// Reader tasks querying the table concurrently with the writes. Zero runs
+/// the refresh loop on its own, which is the comparison for whether
+/// concurrency changes the growth curve.
+const DEFAULT_READERS: usize = 2;
+/// Pause between a reader's queries. Small enough to keep reads overlapping
+/// the writes, large enough that readers do not monopolize the CPU.
+const DEFAULT_READER_PAUSE_MS: u64 = 25;
+/// How long one write or delete may take before the test calls it stuck. The
+/// write path can deadlock against concurrent reads; without this a stuck
+/// run hangs forever instead of failing.
+const DEFAULT_OP_TIMEOUT_SECS: u64 = 300;
 /// Cycles to run before the memory baseline is taken. DuckDB's buffer pool
 /// and the allocator's arenas both need to reach steady state first.
 const DEFAULT_WARMUP_CYCLES: usize = 8;
-/// `memory_limit` given to the DuckDB instances.
+/// `memory_limit` given to the DuckDB instance.
 const DEFAULT_MEMORY_LIMIT: &str = "1GB";
 /// Rows older than this (seconds) and flagged deleted are trimmed by retention.
 const DEFAULT_RETENTION_WINDOW_SECS: i64 = 900;
@@ -87,10 +112,12 @@ struct StressConfig {
     extra_columns: usize,
     payload_bytes: usize,
     retention_every: usize,
-    view_every: usize,
+    readers: usize,
+    reader_pause: Duration,
     warmup_cycles: usize,
     memory_limit: String,
     retention_window_secs: i64,
+    op_timeout: Duration,
     max_growth_bytes: u64,
     max_growth_ratio: f64,
 }
@@ -108,7 +135,11 @@ impl StressConfig {
             payload_bytes: env_usize("DUCKDB_MEM_TEST_PAYLOAD_BYTES", DEFAULT_PAYLOAD_BYTES).max(1),
             retention_every: env_usize("DUCKDB_MEM_TEST_RETENTION_EVERY", DEFAULT_RETENTION_EVERY)
                 .max(1),
-            view_every: env_usize("DUCKDB_MEM_TEST_VIEW_EVERY", DEFAULT_VIEW_EVERY).max(1),
+            readers: env_usize("DUCKDB_MEM_TEST_READERS", DEFAULT_READERS),
+            reader_pause: Duration::from_millis(env_u64(
+                "DUCKDB_MEM_TEST_READER_PAUSE_MS",
+                DEFAULT_READER_PAUSE_MS,
+            )),
             // A warmup that swallowed the whole run would leave nothing to
             // compare, so keep at least a few measured cycles.
             warmup_cycles: warmup_cycles.min(cycles.saturating_sub(3)),
@@ -117,6 +148,10 @@ impl StressConfig {
                 "DUCKDB_MEM_TEST_RETENTION_WINDOW_SECS",
                 DEFAULT_RETENTION_WINDOW_SECS,
             ),
+            op_timeout: Duration::from_secs(env_u64(
+                "DUCKDB_MEM_TEST_OP_TIMEOUT_SECS",
+                DEFAULT_OP_TIMEOUT_SECS,
+            )),
             max_growth_bytes: env_u64("DUCKDB_MEM_TEST_MAX_GROWTH_MB", DEFAULT_MAX_GROWTH_MB)
                 * 1024
                 * 1024,
@@ -165,6 +200,13 @@ fn env_f64(name: &str, default: f64) -> f64 {
 /// shells out to `ps`, which is cheap enough at one sample per refresh cycle.
 /// Anywhere else the test still runs, reporting no samples, and the memory
 /// assertion is skipped rather than guessed at.
+///
+/// RSS is the symptom that matters — a container is killed on RSS, not on
+/// DuckDB's own accounting — and it is the only measure that sees allocations
+/// DuckDB does not tag for itself, such as anything retained on the FFI or
+/// binding side. `duckdb_memory()` then says which DuckDB subsystem grew.
+/// Together they separate an engine problem from a binding problem; neither
+/// does that alone.
 fn current_rss_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -261,24 +303,6 @@ fn dataset_schema(extra_columns: usize) -> SchemaRef {
             fields.push(Field::new(format!("metric_{i}"), DataType::Float64, true));
         }
     }
-
-    Arc::new(Schema::new(fields))
-}
-
-/// Columns the view projects out of the dataset — a subset, as an accelerated
-/// view's SQL usually is.
-const VIEW_COLUMNS: [&str; 4] = ["id", "group_id", "payload", "processed_time"];
-
-fn view_schema(dataset: &SchemaRef) -> SchemaRef {
-    let fields = VIEW_COLUMNS
-        .iter()
-        .map(|name| {
-            dataset
-                .field_with_name(name)
-                .expect("view column exists in the dataset schema")
-                .clone()
-        })
-        .collect::<Vec<Field>>();
 
     Arc::new(Schema::new(fields))
 }
@@ -407,40 +431,23 @@ async fn create_table(
     name: &str,
     schema: &SchemaRef,
     db_path: &str,
-    memory_limit: &str,
+    cfg: &StressConfig,
     pk_indices: Vec<usize>,
-    on_conflict: Option<&str>,
-) -> Arc<dyn datafusion::catalog::TableProvider> {
-    let mut options = HashMap::from([
+    on_conflict: &str,
+) -> Arc<dyn TableProvider> {
+    let options = HashMap::from([
         ("mode".to_string(), "file".to_string()),
         ("duckdb_open".to_string(), db_path.to_string()),
-        ("memory_limit".to_string(), memory_limit.to_string()),
-        // A view refresh reads one instance while writing another, so a
-        // single-connection pool would serialize the two halves of the same
-        // refresh against each other. Accelerators size the pool by how many
-        // components share the instance; this is that sizing, fixed.
-        ("connection_pool_size".to_string(), "8".to_string()),
-        // Matches how an accelerated dataset is configured for throughput; the
-        // view side keeps insertion order, as an ordered view refresh does.
-        (
-            "preserve_insertion_order".to_string(),
-            if on_conflict.is_some() {
-                "false".to_string()
-            } else {
-                "true".to_string()
-            },
-        ),
+        ("memory_limit".to_string(), cfg.memory_limit.clone()),
+        // Readers and the writer need connections at the same time; a
+        // single-connection pool would serialize them, and r2d2's wait has no
+        // timeout. Accelerators size the pool by how many components share the
+        // instance — this is that sizing, fixed.
+        ("connection_pool_size".to_string(), "16".to_string()),
+        // What an accelerated dataset configures for write throughput.
+        ("preserve_insertion_order".to_string(), "false".to_string()),
+        ("on_conflict".to_string(), on_conflict.to_string()),
     ]);
-
-    if let Some(on_conflict) = on_conflict {
-        options.insert("on_conflict".to_string(), on_conflict.to_string());
-    }
-
-    let constraints = if pk_indices.is_empty() {
-        Constraints::default()
-    } else {
-        Constraints::new_unverified(vec![Constraint::PrimaryKey(pk_indices)])
-    };
 
     let cmd = CreateExternalTable {
         schema: Arc::new(
@@ -460,7 +467,7 @@ async fn create_table(
         order_exprs: vec![],
         unbounded: false,
         options,
-        constraints,
+        constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(pk_indices)]),
         column_defaults: HashMap::new(),
         temporary: false,
     };
@@ -474,7 +481,7 @@ async fn create_table(
 /// One refresh write: append a batch through the writer, upserting on conflict.
 async fn upsert_cycle(
     ctx: &SessionContext,
-    table: &Arc<dyn datafusion::catalog::TableProvider>,
+    table: &Arc<dyn TableProvider>,
     batch: RecordBatch,
 ) {
     let schema = batch.schema();
@@ -495,7 +502,7 @@ async fn upsert_cycle(
 /// the same call a parsed `retention_sql` DELETE lowers to.
 async fn retention_cycle(
     ctx: &SessionContext,
-    table: &Arc<dyn datafusion::catalog::TableProvider>,
+    table: &Arc<dyn TableProvider>,
     cfg: &StressConfig,
     now_us: i64,
 ) -> u64 {
@@ -527,34 +534,100 @@ async fn retention_cycle(
         .unwrap_or(0)
 }
 
-/// The accelerated view's refresh: scan the dataset and overwrite the view's
-/// own table with the result.
-async fn view_refresh_cycle(
+/// What the concurrent readers observed. Reader failures are counted rather
+/// than panicked on, so the writer's own error — or a memory limit being hit —
+/// is what fails the test, with the reader tally as context.
+#[derive(Debug, Default)]
+struct ReaderStats {
+    queries: AtomicU64,
+    errors: AtomicU64,
+    first_error: Mutex<Option<String>>,
+}
+
+impl ReaderStats {
+    fn record_error(&self, err: &str) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+        let mut first = self
+            .first_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if first.is_none() {
+            *first = Some(err.to_string());
+        }
+    }
+}
+
+/// Query load against the accelerated table, running for the whole soak.
+///
+/// Each reader alternates the two shapes a deployment issues: the filtered,
+/// ordered scan a dependent materialization performs, and a keyed lookup. Both
+/// aggregate or limit in SQL, so what the test itself holds stays negligible
+/// next to what the engine holds — otherwise the reader would show up in the
+/// very RSS number being asserted on.
+fn spawn_readers(
     ctx: &SessionContext,
-    view_table: &Arc<dyn datafusion::catalog::TableProvider>,
-    dataset_name: &str,
-) {
-    let sql = format!(
-        "SELECT {} FROM {dataset_name} WHERE deleted = 'false' ORDER BY group_id, id",
-        VIEW_COLUMNS.join(", ")
-    );
+    table_name: &str,
+    cfg: &StressConfig,
+    stop: &Arc<AtomicBool>,
+    stats: &Arc<ReaderStats>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    (0..cfg.readers)
+        .map(|reader| {
+            let ctx = ctx.clone();
+            let table_name = table_name.to_string();
+            let stop = Arc::clone(stop);
+            let stats = Arc::clone(stats);
+            let pause = cfg.reader_pause;
 
-    let scan = ctx
-        .sql(&sql)
-        .await
-        .expect("view query plans")
-        .create_physical_plan()
-        .await
-        .expect("view query builds a physical plan");
+            tokio::spawn(async move {
+                let mut round: u64 = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    let sql = if round % 2 == 0 {
+                        format!(
+                            "SELECT count(id), sum(group_id) FROM {table_name} \
+                             WHERE deleted = 'false'"
+                        )
+                    } else {
+                        let group = (round + reader as u64) % 64;
+                        format!(
+                            "SELECT id, group_id, payload FROM {table_name} \
+                             WHERE deleted = 'false' AND group_id = {group} \
+                             ORDER BY id LIMIT 500"
+                        )
+                    };
 
-    let plan = view_table
-        .insert_into(&ctx.state(), scan, InsertOp::Overwrite)
-        .await
-        .expect("view overwrite plan is built");
+                    match ctx.sql(&sql).await {
+                        Ok(df) => match df.collect().await {
+                            Ok(_) => {
+                                stats.queries.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(e) => stats.record_error(&e.to_string()),
+                        },
+                        Err(e) => stats.record_error(&e.to_string()),
+                    }
 
-    collect(plan, ctx.task_ctx())
-        .await
-        .expect("view refresh completes");
+                    round += 1;
+                    tokio::time::sleep(pause).await;
+                }
+            })
+        })
+        .collect()
+}
+
+/// Runs `op`, failing the test if it does not finish within the configured
+/// timeout. The write path can deadlock against a concurrent reader, and a
+/// deadlocked run that hangs forever reports nothing at all.
+async fn with_watchdog<F, T>(cfg: &StressConfig, what: &str, cycle: usize, op: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    match tokio::time::timeout(cfg.op_timeout, op).await {
+        Ok(value) => value,
+        Err(_) => panic!(
+            "{what} did not finish within {:?} on cycle {cycle}; the write path appears stuck",
+            cfg.op_timeout
+        ),
+    }
 }
 
 /// What DuckDB itself thinks it is holding, per allocator tag, plus the size
@@ -564,7 +637,7 @@ async fn view_refresh_cycle(
 /// to its configured limit (expected) or something accumulating that should
 /// have been released (not). This reads the engine's own accounting through
 /// the writer's pool, so a failing run reports *where* the memory went.
-fn duckdb_memory_report(table: &Arc<dyn datafusion::catalog::TableProvider>) -> Option<String> {
+fn duckdb_memory_report(table: &Arc<dyn TableProvider>) -> Option<String> {
     let writer = table.downcast_ref::<DuckDBTableWriter>()?;
     let pool = writer.pool();
     let mut db_conn = pool.connect_sync().ok()?;
@@ -576,21 +649,21 @@ fn duckdb_memory_report(table: &Arc<dyn datafusion::catalog::TableProvider>) -> 
         "SELECT tag, memory_usage_bytes FROM duckdb_memory() \
          WHERE memory_usage_bytes > 0 ORDER BY memory_usage_bytes DESC LIMIT 5",
     ) {
-        if let Ok(rows) = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        }) {
+        if let Ok(rows) =
+            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+        {
             for row in rows.flatten() {
                 parts.push(format!("{}={:.1}MiB", row.0, row.1 as f64 / (1024.0 * 1024.0)));
             }
         }
     }
 
-    if let Ok(bytes) = conn.query_row(
+    if let Ok(size) = conn.query_row(
         "SELECT database_size FROM pragma_database_size()",
         [],
         |row| row.get::<_, String>(0),
     ) {
-        parts.push(format!("file={bytes}"));
+        parts.push(format!("file={size}"));
     }
 
     if parts.is_empty() {
@@ -638,47 +711,28 @@ fn median(values: &mut [u64]) -> u64 {
 #[case::single_column(PrimaryKeyShape::SingleColumn)]
 #[case::composite(PrimaryKeyShape::Composite)]
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn upsert_with_retention_and_view_refresh_does_not_grow_memory(
+async fn upsert_with_retention_under_query_load_does_not_grow_memory(
     #[case] pk_shape: PrimaryKeyShape,
 ) {
     let cfg = StressConfig::from_env();
     let temp_dir = tempfile::tempdir().expect("temp dir is created");
     let dataset_name = format!("dataset_{}", pk_shape.label());
-    let view_name = format!("view_{}", pk_shape.label());
-
     let dataset_path = temp_dir
         .path()
         .join(format!("{dataset_name}.duckdb"))
         .to_string_lossy()
         .to_string();
-    let view_path = temp_dir
-        .path()
-        .join(format!("{view_name}.duckdb"))
-        .to_string_lossy()
-        .to_string();
 
     let schema = dataset_schema(cfg.extra_columns);
-    let view_schema = view_schema(&schema);
-
     let ctx = SessionContext::new();
     let dataset = create_table(
         &ctx,
         &dataset_name,
         &schema,
         &dataset_path,
-        &cfg.memory_limit,
+        &cfg,
         pk_shape.indices(),
-        Some(pk_shape.on_conflict_option()),
-    )
-    .await;
-    let view = create_table(
-        &ctx,
-        &view_name,
-        &view_schema,
-        &view_path,
-        &cfg.memory_limit,
-        vec![],
-        None,
+        pk_shape.on_conflict_option(),
     )
     .await;
 
@@ -686,14 +740,20 @@ async fn upsert_with_retention_and_view_refresh_does_not_grow_memory(
         .expect("dataset is registered");
 
     tracing::info!(
-        "starting {} cycles ({} rows/cycle, {} columns, key space {}, payload {}B, memory_limit {})",
+        "starting {} cycles ({} rows/cycle, {} columns, key space {}, payload {}B, \
+         {} readers, memory_limit {})",
         cfg.cycles,
         cfg.rows_per_cycle,
         schema.fields().len(),
         cfg.key_space,
         cfg.payload_bytes,
+        cfg.readers,
         cfg.memory_limit,
     );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader_stats = Arc::new(ReaderStats::default());
+    let readers = spawn_readers(&ctx, &dataset_name, &cfg, &stop, &reader_stats);
 
     let mut rng = StdRng::seed_from_u64(0x5EED_0000 + pk_shape as u64);
     let mut high_water: i64 = 0;
@@ -702,37 +762,75 @@ async fn upsert_with_retention_and_view_refresh_does_not_grow_memory(
     for cycle in 0..cfg.cycles {
         let now_us = now_micros();
         let batch = make_batch(&schema, &mut rng, &cfg, &mut high_water, now_us);
-        upsert_cycle(&ctx, &dataset, batch).await;
+        with_watchdog(
+            &cfg,
+            "refresh write",
+            cycle,
+            upsert_cycle(&ctx, &dataset, batch),
+        )
+        .await;
 
-        // `cycle > 0` so that a cadence set high enough to disable an arm really
-        // disables it: cycle 0 is divisible by every interval.
+        // `cycle > 0` so that a cadence set high enough to disable the arm
+        // really disables it: cycle 0 is divisible by every interval.
         let deleted = if cycle > 0 && cycle % cfg.retention_every == 0 {
-            retention_cycle(&ctx, &dataset, &cfg, now_us).await
+            with_watchdog(
+                &cfg,
+                "retention delete",
+                cycle,
+                retention_cycle(&ctx, &dataset, &cfg, now_us),
+            )
+            .await
         } else {
             0
         };
 
-        if cycle > 0 && cycle % cfg.view_every == 0 {
-            view_refresh_cycle(&ctx, &view, &dataset_name).await;
-        }
-
         let rows = count_rows(&ctx, &dataset_name).await;
+        let reads = reader_stats.queries.load(Ordering::Relaxed);
 
         if let Some(rss) = current_rss_bytes() {
             samples.push((cycle, rss));
             tracing::info!(
-                "cycle {cycle:>3}: rows={rows:>9} retention_deleted={deleted:>8} rss={:>8.1} MiB",
+                "cycle {cycle:>3}: rows={rows:>9} retention_deleted={deleted:>8} \
+                 reads={reads:>7} rss={:>8.1} MiB",
                 as_mib(rss),
             );
             if cycle % 10 == 0 {
                 if let Some(report) = duckdb_memory_report(&dataset) {
-                    tracing::info!("cycle {cycle:>3}: dataset engine memory: {report}");
+                    tracing::info!("cycle {cycle:>3}: engine memory: {report}");
                 }
             }
         } else {
-            tracing::info!("cycle {cycle:>3}: rows={rows:>9} retention_deleted={deleted:>8}");
+            tracing::info!(
+                "cycle {cycle:>3}: rows={rows:>9} retention_deleted={deleted:>8} reads={reads:>7}"
+            );
         }
     }
+
+    stop.store(true, Ordering::Relaxed);
+    for reader in readers {
+        let _ = reader.await;
+    }
+
+    let reads = reader_stats.queries.load(Ordering::Relaxed);
+    let read_errors = reader_stats.errors.load(Ordering::Relaxed);
+    tracing::info!(
+        "{}: {reads} concurrent reads completed, {read_errors} failed{}",
+        pk_shape.label(),
+        reader_stats
+            .first_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|e| format!(" (first: {e})"))
+            .unwrap_or_default(),
+    );
+
+    // With readers configured, a run where none of them completed proves
+    // nothing about behaviour under load.
+    assert!(
+        cfg.readers == 0 || reads > 0,
+        "no concurrent read completed, so the writes never overlapped a reader"
+    );
 
     // Upsert is only doing its job if the table never holds more rows than
     // there are distinct keys. A growing row count would make any memory
@@ -781,11 +879,12 @@ async fn upsert_with_retention_and_view_refresh_does_not_grow_memory(
     assert!(
         growth <= cfg.max_growth_bytes,
         "RSS grew {:.1} MiB past the post-warmup baseline of {:.1} MiB over {} cycles (cap {:.1} MiB); \
-         memory is not reaching a plateau under upsert + retention + view refresh",
+         memory is not reaching a plateau under upsert + retention with {} concurrent readers",
         as_mib(growth),
         as_mib(baseline),
         cfg.cycles,
         as_mib(cfg.max_growth_bytes),
+        cfg.readers,
     );
 
     let ratio = if baseline == 0 {
