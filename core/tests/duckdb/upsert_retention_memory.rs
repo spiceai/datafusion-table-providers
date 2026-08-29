@@ -1,73 +1,24 @@
 //! Memory-stability stress test for the DuckDB write path an accelerated
 //! dataset uses: a primary-key upsert on every refresh, a retention delete
-//! trimming rows out from under it, and query load running against the table
-//! the whole time.
+//! trimming rows out from under it, and concurrent query load.
 //!
-//! One cycle is one refresh, and it does what a refresh does, in order:
+//! One cycle is one refresh:
 //!
 //! 1. **Upsert** — `insert_into(.., InsertOp::Append)` on a writer configured
-//!    with `on_conflict: upsert`. Internally this registers the incoming
-//!    batches as an FFI arrow scan view (`__scan_<table>_<ts>`), runs
-//!    `INSERT INTO <t> SELECT * FROM <scan> ON CONFLICT (<pk>) DO UPDATE SET ..`,
-//!    drops the scan, `ANALYZE`s, and commits.
+//!    with `on_conflict: upsert`, which registers the incoming batches as an
+//!    FFI arrow scan view and runs
+//!    `INSERT INTO <t> SELECT * FROM <scan> ON CONFLICT (<pk>) DO UPDATE SET ..`.
 //! 2. **Retention** — a `DELETE FROM <t> WHERE <predicate>` issued as
 //!    `delete_from(filters)`, the call a parsed retention SQL statement lowers
 //!    to. It runs right after the write, as it does in a refresh.
 //!
-//! Meanwhile a configurable number of reader tasks query the table
-//! continuously, overlapping the writes rather than taking turns with them.
-//! That is what a deployment looks like: refreshes on one schedule, queries
-//! arriving whenever they arrive. It also puts real pressure on row-version
-//! retention — a reader holding a transaction open across an upsert is what
-//! keeps old versions alive — which a sequential loop cannot produce.
-//!
-//! The reader shapes are the ones such deployments issue against an
-//! accelerated dataset: the filtered, ordered scan a dependent materialization
-//! performs, and a narrower keyed lookup. They aggregate or limit in SQL so
-//! the test's own result buffers stay out of the measurement.
-//!
-//! Deliberately one table and one engine: a second instance would add its own
-//! buffer pool to every RSS reading without adding pressure to the path under
-//! test.
-//!
-//! The test asserts that resident memory reaches a plateau and stays there.
-//! DuckDB's buffer pool is expected to grow toward its `memory_limit` early,
-//! so the baseline is taken after a warmup and the assertion is about growth
-//! past that plateau. Every tenth cycle also logs DuckDB's own
-//! `duckdb_memory()` accounting, so a failure says which allocator tag grew
-//! rather than only that the process did.
-//!
-//! Every dimension of the workload is tunable from the environment, so a
-//! growth configuration can be searched for without recompiling — cycles,
-//! rows, key space, table width, payload size, reader count, cadences, and the
-//! thresholds; see the constants below for the names.
-//!
-//! The defaults are the calibrated shape, not arbitrary. The key space has to
-//! saturate well before the measurement window, or rising memory is just the
-//! table still filling; at 50k rows a cycle against 300k keys that happens
-//! around cycle 20, which is where the warmup ends. The width and payload are
-//! what made the per-cycle growth large enough to read off in a minute rather
-//! than an hour.
-//!
-//! Run it in release. A debug build compiles DuckDB's own assertions in, and
-//! the concurrent reads here trip storage-layer assertions that abort the test
-//! binary before it can measure anything — so the test skips itself in debug
-//! rather than reporting a crash as a memory result:
+//! Run it in release: a debug build compiles DuckDB's own assertions in, which
+//! the concurrent reads can trip.
 //!
 //! ```text
 //! cargo test --release -p datafusion-table-providers --features duckdb,duckdb-federation \
 //!     --test integration upsert_with_retention -- --nocapture
 //! ```
-//!
-//! It exists because a DuckDB version shipped in this crate did grow without
-//! bound here: about 6 MiB per cycle at a steady row count, until the write
-//! failed against `memory_limit`. The engine this crate bundles now holds
-//! steady under the same workload, and this test is what keeps it that way.
-//! The failure it is built to produce is the engine's own
-//! `Out of Memory Error`: memory that never plateaus reaches the configured
-//! `memory_limit` and the refresh write fails, reported with the row count and
-//! the memory breakdown at that moment. The RSS comparison at the end of the
-//! run is the secondary check, for growth too slow to reach the ceiling.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -91,44 +42,37 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rstest::rstest;
 
-/// Refresh cycles to run. Each is one upsert, plus a retention delete on
-/// its own cadence.
+/// Refresh cycles to run.
 const DEFAULT_CYCLES: usize = 60;
 /// Rows written per upsert cycle.
 const DEFAULT_ROWS_PER_CYCLE: usize = 50_000;
 /// Distinct primary keys the workload cycles through. Smaller than
-/// `cycles * rows_per_cycle`, so most rows land on the `DO UPDATE` path
-/// rather than inserting.
+/// `cycles * rows_per_cycle`, so most rows take the `DO UPDATE` path.
 const DEFAULT_KEY_SPACE: usize = 300_000;
 /// Extra columns appended to the base schema, alternating string and float.
-/// Raise this to test a wide table.
 const DEFAULT_EXTRA_COLUMNS: usize = 24;
 /// Bytes in the variable-width payload column of each row.
 const DEFAULT_PAYLOAD_BYTES: usize = 128;
 /// Run the retention delete every N cycles.
 const DEFAULT_RETENTION_EVERY: usize = 4;
-/// Reader tasks querying the table concurrently with the writes. Zero runs
-/// the refresh loop on its own, which is the comparison for whether
-/// concurrency changes the growth curve.
+/// Reader tasks querying the table concurrently with the writes. Zero runs the
+/// refresh loop on its own, as a comparison.
 const DEFAULT_READERS: usize = 4;
-/// Pause between a reader's queries. Small enough to keep reads overlapping
-/// the writes, large enough that readers do not monopolize the CPU.
+/// Pause between a reader's queries: short enough to overlap the writes, long
+/// enough to leave the writer some CPU.
 const DEFAULT_READER_PAUSE_MS: u64 = 25;
-/// How long one write or delete may take before the test calls it stuck. The
-/// write path can deadlock against concurrent reads; without this a stuck
-/// run hangs forever instead of failing.
+/// How long one write or delete may take before the test calls it stuck, so a
+/// deadlock against concurrent reads fails instead of hanging.
 const DEFAULT_OP_TIMEOUT_SECS: u64 = 300;
-/// Cycles to run before the memory baseline is taken. DuckDB's buffer pool
-/// and the allocator's arenas both need to reach steady state first.
+/// Cycles to run before the memory baseline is taken, so DuckDB's buffer pool
+/// and the allocator's arenas reach steady state first.
 const DEFAULT_WARMUP_CYCLES: usize = 20;
 /// `memory_limit` given to the DuckDB instance.
 ///
-/// Deliberately small. Growth that never plateaus reaches this ceiling within
+/// Deliberately small: growth that never plateaus reaches this ceiling within
 /// the default cycle count and fails the write with an `Out of Memory Error`,
-/// which is the signal this test is built around: a hard error from the
-/// engine, with no threshold to tune and no allocator noise to tolerate. A
-/// workload that holds steady stays well below it — the table and its open
-/// read transactions account for under half of this.
+/// the signal this test is built around. A workload that holds steady stays
+/// well below it.
 const DEFAULT_MEMORY_LIMIT: &str = "256MB";
 /// Rows older than this (seconds) and flagged deleted are trimmed by retention.
 const DEFAULT_RETENTION_WINDOW_SECS: i64 = 900;
@@ -173,8 +117,7 @@ impl StressConfig {
                 "DUCKDB_MEM_TEST_READER_PAUSE_MS",
                 DEFAULT_READER_PAUSE_MS,
             )),
-            // A warmup that swallowed the whole run would leave nothing to
-            // compare, so keep at least a few measured cycles.
+            // Keep at least a few measured cycles after the warmup.
             warmup_cycles: warmup_cycles.min(cycles.saturating_sub(3)),
             memory_limit: env_string("DUCKDB_MEM_TEST_MEMORY_LIMIT", DEFAULT_MEMORY_LIMIT),
             retention_window_secs: env_i64(
@@ -227,19 +170,14 @@ fn env_f64(name: &str, default: f64) -> f64 {
 
 /// Current resident set size of this process, in bytes.
 ///
-/// Hand-rolled rather than pulled from a crate: the only consumer is this
-/// test, and both platforms that run it expose RSS without a dependency.
-/// Linux reads `VmRSS` out of `/proc/self/status` (reported in kB); macOS
-/// shells out to `ps`, which is cheap enough at one sample per refresh cycle.
-/// Anywhere else the test still runs, reporting no samples, and the memory
-/// assertion is skipped rather than guessed at.
-///
 /// RSS is the symptom that matters — a container is killed on RSS, not on
 /// DuckDB's own accounting — and it is the only measure that sees allocations
-/// DuckDB does not tag for itself, such as anything retained on the FFI or
-/// binding side. `duckdb_memory()` then says which DuckDB subsystem grew.
-/// Together they separate an engine problem from a binding problem; neither
-/// does that alone.
+/// DuckDB does not tag for itself, such as anything retained on the binding
+/// side. `duckdb_memory()` then says which DuckDB subsystem grew.
+///
+/// Linux reads `VmRSS` out of `/proc/self/status` (in kB); macOS shells out to
+/// `ps`, cheap enough at one sample per cycle. Anywhere else the test still
+/// runs and the memory assertion is skipped.
 fn current_rss_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -277,9 +215,9 @@ fn as_mib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
-/// Which primary key shape the workload upserts on. Both shapes appear in real
-/// accelerations, and they take different paths through DuckDB's conflict
-/// target handling.
+/// Primary key shape the workload upserts on. Both appear in real
+/// accelerations and take different paths through DuckDB's conflict target
+/// handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrimaryKeyShape {
     /// A single surrogate key column.
@@ -352,12 +290,10 @@ fn now_micros() -> i64 {
 
 /// Picks the keys for one refresh batch.
 ///
-/// Keys are unique *within* a batch — the writer rejects a batch that violates
-/// its own primary key, and a real refresh batch carries at most one row per
-/// key. Repetition that drives the `DO UPDATE` path therefore comes from keys
-/// recurring *across* batches: roughly 70% of each batch re-uses keys already
-/// in the table, and the rest extend the key space until it is exhausted, after
-/// which every row is an update.
+/// Keys are unique within a batch — the writer rejects a batch that violates
+/// its own primary key. The `DO UPDATE` path is driven by keys recurring
+/// across batches: roughly 70% of each batch re-uses keys already in the
+/// table, and the rest extend the key space until it is exhausted.
 fn batch_keys(rng: &mut StdRng, cfg: &StressConfig, high_water: &mut i64) -> Vec<i64> {
     let rows = cfg.rows_per_cycle;
     let remaining_new = cfg.key_space.saturating_sub(*high_water as usize);
@@ -385,12 +321,8 @@ fn batch_keys(rng: &mut StdRng, cfg: &StressConfig, high_water: &mut i64) -> Vec
     keys
 }
 
-/// Builds one refresh's worth of rows.
-///
-/// Keys are drawn from a fixed key space so most rows collide with a row
-/// already in the table and take the `DO UPDATE` path; the rest extend the
-/// high-water mark and insert. A quarter of the rows are soft-deleted with an
-/// aged timestamp, which is what retention later trims.
+/// Builds one refresh's worth of rows. A quarter are soft-deleted with an aged
+/// timestamp, which is what retention later trims.
 fn make_batch(
     schema: &SchemaRef,
     rng: &mut StdRng,
@@ -446,8 +378,8 @@ fn make_batch(
     RecordBatch::try_new(Arc::clone(schema), columns).expect("batch matches the dataset schema")
 }
 
-/// A payload of `bytes` bytes whose content varies with the key, so the value
-/// genuinely changes on an update rather than rewriting the same string.
+/// A payload of `bytes` bytes that varies with the key, so an update actually
+/// changes the value.
 fn payload_for(id: i64, bytes: usize) -> String {
     let mut s = format!("{id:016}");
     while s.len() < bytes {
@@ -473,9 +405,7 @@ async fn create_table(
         ("duckdb_open".to_string(), db_path.to_string()),
         ("memory_limit".to_string(), cfg.memory_limit.clone()),
         // Readers and the writer need connections at the same time; a
-        // single-connection pool would serialize them, and r2d2's wait has no
-        // timeout. Accelerators size the pool by how many components share the
-        // instance — this is that sizing, fixed.
+        // single-connection pool would serialize them on an untimed r2d2 wait.
         ("connection_pool_size".to_string(), "16".to_string()),
         // What an accelerated dataset configures for write throughput.
         ("preserve_insertion_order".to_string(), "false".to_string()),
@@ -513,10 +443,9 @@ async fn create_table(
 
 /// One refresh write: append a batch through the writer, upserting on conflict.
 ///
-/// The error is returned rather than unwrapped because it is the test's
-/// primary signal: when the engine's memory grows without bound, this is where
-/// it surfaces, as an `Out of Memory Error` against the configured
-/// `memory_limit` while the table itself sits at a steady row count.
+/// The error is returned rather than unwrapped because it is the test's primary
+/// signal: unbounded engine memory surfaces here as an `Out of Memory Error`
+/// against the configured `memory_limit`, at a steady row count.
 async fn upsert_cycle(
     ctx: &SessionContext,
     table: &Arc<dyn TableProvider>,
@@ -563,9 +492,9 @@ async fn retention_cycle(
         .unwrap_or(0))
 }
 
-/// What the concurrent readers observed. Reader failures are counted rather
-/// than panicked on, so the writer's own error — or a memory limit being hit —
-/// is what fails the test, with the reader tally as context.
+/// What the concurrent readers observed. Failures are counted rather than
+/// panicked on, so the writer's own error is what fails the test, with the
+/// reader tally as context.
 #[derive(Debug, Default)]
 struct ReaderStats {
     queries: AtomicU64,
@@ -588,11 +517,9 @@ impl ReaderStats {
 
 /// Query load against the accelerated table, running for the whole soak.
 ///
-/// Each reader alternates the two shapes a deployment issues: the filtered,
-/// ordered scan a dependent materialization performs, and a keyed lookup. Both
-/// aggregate or limit in SQL, so what the test itself holds stays negligible
-/// next to what the engine holds — otherwise the reader would show up in the
-/// very RSS number being asserted on.
+/// Each reader alternates a filtered ordered scan and a keyed lookup. Both
+/// aggregate or limit in SQL, so the test itself holds little and the readers
+/// stay out of the RSS number being asserted on.
 fn spawn_readers(
     ctx: &SessionContext,
     table_name: &str,
@@ -644,8 +571,8 @@ fn spawn_readers(
 }
 
 /// Runs `op`, failing the test if it does not finish within the configured
-/// timeout. The write path can deadlock against a concurrent reader, and a
-/// deadlocked run that hangs forever reports nothing at all.
+/// timeout, so a deadlock against a concurrent reader reports instead of
+/// hanging forever.
 async fn with_watchdog<F, T>(cfg: &StressConfig, what: &str, cycle: usize, op: F) -> T
 where
     F: std::future::Future<Output = T>,
@@ -662,10 +589,9 @@ where
 /// What DuckDB itself thinks it is holding, per allocator tag, plus the size
 /// of the database file.
 ///
-/// RSS alone cannot say whether growth is DuckDB's buffer manager filling up
-/// to its configured limit (expected) or something accumulating that should
-/// have been released (not). This reads the engine's own accounting through
-/// the writer's pool, so a failing run reports *where* the memory went.
+/// RSS alone cannot say whether growth is DuckDB's buffer manager filling up to
+/// its configured limit (expected) or something accumulating that should have
+/// been released (not), so a failing run reports where the memory went.
 fn duckdb_memory_report(table: &Arc<dyn TableProvider>) -> Option<String> {
     let writer = table.downcast_ref::<DuckDBTableWriter>()?;
     let pool = writer.pool();
@@ -704,8 +630,8 @@ fn duckdb_memory_report(table: &Arc<dyn TableProvider>) -> Option<String> {
 
 async fn count_rows(ctx: &SessionContext, table_name: &str) -> u64 {
     let batches = ctx
-        // Counted over a column rather than `COUNT(*)`: the empty projection
-        // `COUNT(*)` plans to trips a schema mismatch in the DuckDB scan.
+        // `COUNT(*)` plans to an empty projection, which trips a schema
+        // mismatch in the DuckDB scan.
         .sql(&format!("SELECT COUNT(id) FROM {table_name}"))
         .await
         .expect("count query plans")
@@ -726,8 +652,8 @@ async fn count_rows(ctx: &SessionContext, table_name: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Median of a sample window, which rejects the occasional spike from a
-/// concurrent allocation better than a mean does.
+/// Median of a sample window, which rejects the occasional spike better than a
+/// mean does.
 fn median(values: &mut [u64]) -> u64 {
     if values.is_empty() {
         return 0;
@@ -738,12 +664,11 @@ fn median(values: &mut [u64]) -> u64 {
 
 /// Fails the test on an engine error, with the state that explains it.
 ///
-/// This is the assertion that matters. Unbounded growth inside DuckDB ends as
-/// an `Out of Memory Error` against `memory_limit` — a hard, deterministic
-/// failure from the engine itself, needing no threshold and tolerating no
-/// allocator noise, unlike the RSS comparison at the end of the run. The row
-/// count and the memory breakdown are printed with it, because "out of memory
-/// at a steady-state row count" is the claim, and neither half makes it alone.
+/// Unbounded growth inside DuckDB ends as an `Out of Memory Error` against
+/// `memory_limit` — a deterministic failure needing no threshold, unlike the
+/// RSS comparison at the end of the run. The row count and the memory
+/// breakdown are printed with it, because the claim is "out of memory at a
+/// steady-state row count".
 async fn fail_on_engine_error(
     ctx: &SessionContext,
     table: &Arc<dyn TableProvider>,
@@ -767,11 +692,8 @@ async fn fail_on_engine_error(
 #[case::single_column(PrimaryKeyShape::SingleColumn)]
 #[case::composite(PrimaryKeyShape::Composite)]
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-// Skipped in debug builds, where DuckDB compiles its own assertions in: this
-// workload's concurrent reads trip storage-layer assertions (`block_manager`,
-// `fixed_size_buffer`, `column_segment`) and abort the whole test binary. That
-// is worth chasing on its own; it is not what this test measures, and it makes
-// a debug run report nothing at all.
+// Skipped in debug builds, where DuckDB compiles its own assertions in: the
+// concurrent reads trip storage-layer assertions and abort the test binary
 #[cfg_attr(debug_assertions, ignore = "trips DuckDB's own assertions in debug builds; run with --release")]
 async fn upsert_with_retention_under_query_load_does_not_grow_memory(
     #[case] pk_shape: PrimaryKeyShape,
@@ -914,9 +836,8 @@ async fn upsert_with_retention_under_query_load_does_not_grow_memory(
     );
 
     // Upsert is only doing its job if the table never holds more rows than
-    // there are distinct keys. A growing row count would make any memory
-    // growth unremarkable, so this has to hold before the memory claim means
-    // anything.
+    // there are distinct keys; a growing row count would make any memory
+    // growth unremarkable.
     let final_rows = count_rows(&ctx, &dataset_name).await;
     assert!(
         final_rows <= cfg.key_space as u64,
