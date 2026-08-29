@@ -61,9 +61,11 @@
 //! 6 MiB per cycle at steady state on this workload and eventually exhausts
 //! `memory_limit`, where 1.4.4 plateaus. Remove the attribute once the
 //! underlying growth is fixed, so it guards against the regression returning.
-//! Lowering `DUCKDB_MEM_TEST_MEMORY_LIMIT` turns the growth into a hard
-//! `Out of Memory Error` from the write itself, which is a crisper signal
-//! than any RSS threshold.
+//! The failure it is built to produce is the engine's own
+//! `Out of Memory Error`: memory that never plateaus reaches the configured
+//! `memory_limit` and the refresh write fails, reported with the row count and
+//! the memory breakdown at that moment. The RSS comparison at the end of the
+//! run is the secondary check, for growth too slow to reach the ceiling.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -118,7 +120,14 @@ const DEFAULT_OP_TIMEOUT_SECS: u64 = 300;
 /// and the allocator's arenas both need to reach steady state first.
 const DEFAULT_WARMUP_CYCLES: usize = 20;
 /// `memory_limit` given to the DuckDB instance.
-const DEFAULT_MEMORY_LIMIT: &str = "1GB";
+///
+/// Deliberately small. Growth that never plateaus reaches this ceiling within
+/// the default cycle count and fails the write with an `Out of Memory Error`,
+/// which is the signal this test is built around: a hard error from the
+/// engine, with no threshold to tune and no allocator noise to tolerate. A
+/// workload that holds steady stays well below it — the table and its open
+/// read transactions account for under half of this.
+const DEFAULT_MEMORY_LIMIT: &str = "256MB";
 /// Rows older than this (seconds) and flagged deleted are trimmed by retention.
 const DEFAULT_RETENTION_WINDOW_SECS: i64 = 900;
 /// Allowed absolute RSS growth past the post-warmup baseline.
@@ -501,23 +510,25 @@ async fn create_table(
 }
 
 /// One refresh write: append a batch through the writer, upserting on conflict.
+///
+/// The error is returned rather than unwrapped because it is the test's
+/// primary signal: when the engine's memory grows without bound, this is where
+/// it surfaces, as an `Out of Memory Error` against the configured
+/// `memory_limit` while the table itself sits at a steady row count.
 async fn upsert_cycle(
     ctx: &SessionContext,
     table: &Arc<dyn TableProvider>,
     batch: RecordBatch,
-) {
+) -> datafusion::error::Result<()> {
     let schema = batch.schema();
     let source = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)
         .expect("memory source for the refresh batch");
 
     let plan = table
         .insert_into(&ctx.state(), source, InsertOp::Append)
-        .await
-        .expect("insert plan is built");
+        .await?;
 
-    collect(plan, ctx.task_ctx())
-        .await
-        .expect("refresh write completes");
+    collect(plan, ctx.task_ctx()).await.map(|_| ())
 }
 
 /// The retention pass: delete soft-deleted rows older than the window. This is
@@ -527,7 +538,7 @@ async fn retention_cycle(
     table: &Arc<dyn TableProvider>,
     cfg: &StressConfig,
     now_us: i64,
-) -> u64 {
+) -> datafusion::error::Result<u64> {
     let cutoff = now_us - cfg.retention_window_secs * 1_000_000;
     let filters: Vec<Expr> = vec![col("deleted").eq(lit("true")).and(
         col("processed_time").lt(lit(ScalarValue::TimestampMicrosecond(
@@ -536,16 +547,10 @@ async fn retention_cycle(
         ))),
     )];
 
-    let plan = table
-        .delete_from(&ctx.state(), filters)
-        .await
-        .expect("delete plan is built");
+    let plan = table.delete_from(&ctx.state(), filters).await?;
+    let batches = collect(plan, ctx.task_ctx()).await?;
 
-    let batches = collect(plan, ctx.task_ctx())
-        .await
-        .expect("retention delete completes");
-
-    batches
+    Ok(batches
         .first()
         .and_then(|b| {
             b.column(0)
@@ -553,7 +558,7 @@ async fn retention_cycle(
                 .downcast_ref::<datafusion::arrow::array::UInt64Array>()
                 .map(|a| a.value(0))
         })
-        .unwrap_or(0)
+        .unwrap_or(0))
 }
 
 /// What the concurrent readers observed. Reader failures are counted rather
@@ -729,6 +734,33 @@ fn median(values: &mut [u64]) -> u64 {
     values[values.len() / 2]
 }
 
+/// Fails the test on an engine error, with the state that explains it.
+///
+/// This is the assertion that matters. Unbounded growth inside DuckDB ends as
+/// an `Out of Memory Error` against `memory_limit` — a hard, deterministic
+/// failure from the engine itself, needing no threshold and tolerating no
+/// allocator noise, unlike the RSS comparison at the end of the run. The row
+/// count and the memory breakdown are printed with it, because "out of memory
+/// at a steady-state row count" is the claim, and neither half makes it alone.
+async fn fail_on_engine_error(
+    ctx: &SessionContext,
+    table: &Arc<dyn TableProvider>,
+    table_name: &str,
+    cfg: &StressConfig,
+    cycle: usize,
+    what: &str,
+    error: &datafusion::error::DataFusionError,
+) -> ! {
+    let rows = count_rows(ctx, table_name).await;
+    let engine = duckdb_memory_report(table).unwrap_or_else(|| "unavailable".to_string());
+
+    panic!(
+        "{what} failed on cycle {cycle} of {} with {rows} rows in the table \
+         (key space {}, memory_limit {}).\nEngine memory: {engine}\nError: {error}",
+        cfg.cycles, cfg.key_space, cfg.memory_limit,
+    );
+}
+
 #[rstest]
 #[case::single_column(PrimaryKeyShape::SingleColumn)]
 #[case::composite(PrimaryKeyShape::Composite)]
@@ -785,24 +817,43 @@ async fn upsert_with_retention_under_query_load_does_not_grow_memory(
     for cycle in 0..cfg.cycles {
         let now_us = now_micros();
         let batch = make_batch(&schema, &mut rng, &cfg, &mut high_water, now_us);
-        with_watchdog(
+        let write = with_watchdog(
             &cfg,
             "refresh write",
             cycle,
             upsert_cycle(&ctx, &dataset, batch),
         )
         .await;
+        if let Err(e) = write {
+            fail_on_engine_error(&ctx, &dataset, &dataset_name, &cfg, cycle, "refresh write", &e)
+                .await;
+        }
 
         // `cycle > 0` so that a cadence set high enough to disable the arm
         // really disables it: cycle 0 is divisible by every interval.
         let deleted = if cycle > 0 && cycle % cfg.retention_every == 0 {
-            with_watchdog(
+            match with_watchdog(
                 &cfg,
                 "retention delete",
                 cycle,
                 retention_cycle(&ctx, &dataset, &cfg, now_us),
             )
             .await
+            {
+                Ok(deleted) => deleted,
+                Err(e) => {
+                    fail_on_engine_error(
+                        &ctx,
+                        &dataset,
+                        &dataset_name,
+                        &cfg,
+                        cycle,
+                        "retention delete",
+                        &e,
+                    )
+                    .await
+                }
+            }
         } else {
             0
         };
