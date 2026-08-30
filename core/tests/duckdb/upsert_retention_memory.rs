@@ -13,11 +13,12 @@
 //!    to. It runs right after the write, as it does in a refresh.
 //!
 //! Run it in release: a debug build compiles DuckDB's own assertions in, which
-//! the concurrent reads can trip.
+//! the concurrent reads can trip. Run it single-threaded too — RSS is sampled
+//! process-wide, so another test case running alongside lands in the number
+//! being asserted on. Both are what this target does, and what CI runs:
 //!
 //! ```text
-//! cargo test --release -p datafusion-table-providers --features duckdb,duckdb-federation \
-//!     --test integration upsert_with_retention -- --nocapture
+//! make test-integration-duckdb
 //! ```
 
 use std::collections::HashMap;
@@ -342,7 +343,11 @@ fn make_batch(
     for id in batch_keys(rng, cfg, high_water) {
         ids.push(id);
         group_ids.push(id % 64);
-        deleted.push(if rng.random_bool(0.25) { "true" } else { "false" });
+        deleted.push(if rng.random_bool(0.25) {
+            "true"
+        } else {
+            "false"
+        });
         // Spread timestamps across twice the retention window so each
         // retention pass has something to delete and something to keep.
         processed.push(now_us - rng.random_range(0..(2 * window_us)));
@@ -353,9 +358,7 @@ fn make_batch(
         Arc::new(Int64Array::from(ids.clone())),
         Arc::new(Int64Array::from(group_ids)),
         Arc::new(StringArray::from(deleted)),
-        Arc::new(
-            TimestampMicrosecondArray::from(processed).with_timezone(Arc::from("UTC")),
-        ),
+        Arc::new(TimestampMicrosecondArray::from(processed).with_timezone(Arc::from("UTC"))),
         Arc::new(StringArray::from(payloads)),
     ];
 
@@ -471,12 +474,15 @@ async fn retention_cycle(
     now_us: i64,
 ) -> datafusion::error::Result<u64> {
     let cutoff = now_us - cfg.retention_window_secs * 1_000_000;
-    let filters: Vec<Expr> = vec![col("deleted").eq(lit("true")).and(
-        col("processed_time").lt(lit(ScalarValue::TimestampMicrosecond(
-            Some(cutoff),
-            Some("UTC".into()),
-        ))),
-    )];
+    let filters: Vec<Expr> =
+        vec![col("deleted")
+            .eq(lit("true"))
+            .and(
+                col("processed_time").lt(lit(ScalarValue::TimestampMicrosecond(
+                    Some(cutoff),
+                    Some("UTC".into()),
+                ))),
+            )];
 
     let plan = table.delete_from(&ctx.state(), filters).await?;
     let batches = collect(plan, ctx.task_ctx()).await?;
@@ -604,11 +610,15 @@ fn duckdb_memory_report(table: &Arc<dyn TableProvider>) -> Option<String> {
         "SELECT tag, memory_usage_bytes FROM duckdb_memory() \
          WHERE memory_usage_bytes > 0 ORDER BY memory_usage_bytes DESC LIMIT 5",
     ) {
-        if let Ok(rows) =
-            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
-        {
+        if let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        }) {
             for row in rows.flatten() {
-                parts.push(format!("{}={:.1}MiB", row.0, row.1 as f64 / (1024.0 * 1024.0)));
+                parts.push(format!(
+                    "{}={:.1}MiB",
+                    row.0,
+                    row.1 as f64 / (1024.0 * 1024.0)
+                ));
             }
         }
     }
@@ -694,7 +704,10 @@ async fn fail_on_engine_error(
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 // Skipped in debug builds, where DuckDB compiles its own assertions in: the
 // concurrent reads trip storage-layer assertions and abort the test binary
-#[cfg_attr(debug_assertions, ignore = "trips DuckDB's own assertions in debug builds; run with --release")]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "trips DuckDB's own assertions in debug builds; run with --release"
+)]
 async fn upsert_with_retention_under_query_load_does_not_grow_memory(
     #[case] pk_shape: PrimaryKeyShape,
 ) {
@@ -754,8 +767,16 @@ async fn upsert_with_retention_under_query_load_does_not_grow_memory(
         )
         .await;
         if let Err(e) = write {
-            fail_on_engine_error(&ctx, &dataset, &dataset_name, &cfg, cycle, "refresh write", &e)
-                .await;
+            fail_on_engine_error(
+                &ctx,
+                &dataset,
+                &dataset_name,
+                &cfg,
+                cycle,
+                "refresh write",
+                &e,
+            )
+            .await;
         }
 
         // `cycle > 0` so that a cadence set high enough to disable the arm
@@ -845,7 +866,9 @@ async fn upsert_with_retention_under_query_load_does_not_grow_memory(
         cfg.key_space
     );
 
-    let Some(baseline_start) = samples.iter().position(|(cycle, _)| *cycle >= cfg.warmup_cycles)
+    let Some(baseline_start) = samples
+        .iter()
+        .position(|(cycle, _)| *cycle >= cfg.warmup_cycles)
     else {
         tracing::warn!("no RSS samples were collected on this platform; skipping memory assertion");
         return;
