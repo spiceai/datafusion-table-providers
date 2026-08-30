@@ -18,3 +18,8 @@ test-integration:
 .PHONY: check-integration
 check-integration:
 	cargo test --test integration --no-default-features --features postgres,sqlite,mysql,flight,clickhouse,mongodb,adbc --no-run
+
+# The DuckDB integration suite; in release to validate DuckDB behavior using producation configuration
+.PHONY: test-integration-duckdb
+test-integration-duckdb:
+	RUST_LOG=info cargo test --release --test integration --no-default-features --features duckdb,duckdb-federation -- --nocapture --test-threads 1
