@@ -44,6 +44,7 @@ pub struct AdbcConnectionPoolBuilder<D>
 where
     D: Database + Send,
     D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
 {
     database: D,
     connection_options: Option<HashMap<String, String>>,
@@ -77,6 +78,7 @@ impl<D> AdbcConnectionPoolBuilder<D>
 where
     D: Database + Send,
     D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
 {
     pub fn new(database: D) -> Self {
         Self {
@@ -147,6 +149,7 @@ pub struct ADBCPool<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
 {
     pool: Arc<r2d2::Pool<AdbcConnectionManager<D>>>,
     join_push_down: JoinPushDown,
@@ -156,6 +159,7 @@ impl<D> std::fmt::Debug for ADBCPool<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "ADBCPool")
@@ -166,6 +170,7 @@ impl<D> ADBCPool<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
 {
     pub fn new(db: D, conn_options: Option<HashMap<String, String>>) -> Result<Self> {
         let builder = AdbcConnectionPoolBuilder::new(db);
@@ -195,6 +200,7 @@ impl<D> DbConnectionPool<r2d2::PooledConnection<AdbcConnectionManager<D>>, Recor
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
 {
     async fn connect(
         &self,

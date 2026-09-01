@@ -78,6 +78,7 @@ pub struct AdbcTableFactory<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
 {
     pool: Arc<ADBCPool<D>>,
     #[cfg(feature = "adbc-federation")]
@@ -92,6 +93,7 @@ impl<D> AdbcTableFactory<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
 {
     #[must_use]
     pub fn new(pool: Arc<ADBCPool<D>>) -> Self {
@@ -200,6 +202,7 @@ pub struct ADBC<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
 {
     table_name: String,
     pool: Arc<DynAdbcConnectionPool<D>>,
@@ -209,6 +212,7 @@ impl<D> ADBC<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
 {
     #[must_use]
     pub fn table_name(&self) -> &str {
