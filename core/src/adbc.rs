@@ -24,6 +24,8 @@ use crate::{
 use crate::util::supported_functions::FunctionSupport;
 use adbc_core::{Connection, Database};
 use arrow::array::RecordBatch;
+#[cfg(feature = "adbc-federation")]
+use datafusion::optimizer::OptimizerRule;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::{
     catalog::Session,
@@ -82,6 +84,8 @@ where
     federation_enabled: bool,
     #[cfg(feature = "adbc-federation")]
     function_support: Option<FunctionSupport>,
+    #[cfg(feature = "adbc-federation")]
+    pre_federation_optimizer_rules: Vec<Arc<dyn OptimizerRule + Send + Sync>>,
 }
 
 impl<D> AdbcTableFactory<D>
@@ -97,6 +101,8 @@ where
             federation_enabled: true, // enabled by default when the feature is available
             #[cfg(feature = "adbc-federation")]
             function_support: None,
+            #[cfg(feature = "adbc-federation")]
+            pre_federation_optimizer_rules: vec![],
         }
     }
 
@@ -111,6 +117,16 @@ where
     #[must_use]
     pub fn with_function_support(mut self, function_support: FunctionSupport) -> Self {
         self.function_support = Some(function_support);
+        self
+    }
+
+    #[cfg(feature = "adbc-federation")]
+    #[must_use]
+    pub fn with_pre_federation_optimizer_rules(
+        mut self,
+        rules: Vec<Arc<dyn OptimizerRule + Send + Sync>>,
+    ) -> Self {
+        self.pre_federation_optimizer_rules = rules;
         self
     }
 
@@ -150,6 +166,8 @@ where
             dialect,
             #[cfg(feature = "adbc-federation")]
             self.function_support.clone(),
+            #[cfg(feature = "adbc-federation")]
+            self.pre_federation_optimizer_rules.clone(),
         ));
 
         #[cfg(feature = "adbc-federation")]
