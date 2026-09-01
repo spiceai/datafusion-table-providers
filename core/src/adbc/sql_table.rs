@@ -13,6 +13,8 @@
 use crate::sql::db_connection_pool::DbConnectionPool;
 #[cfg(feature = "adbc-federation")]
 use crate::util::supported_functions::FunctionSupport;
+#[cfg(feature = "adbc-federation")]
+use datafusion::optimizer::OptimizerRule;
 
 use async_trait::async_trait;
 use futures::TryStreamExt;
@@ -42,6 +44,8 @@ use datafusion::{
 
 pub struct AdbcDBTable<T: 'static, P: 'static> {
     pub(crate) base_table: SqlTable<T, P>,
+    #[cfg(feature = "adbc-federation")]
+    pub(crate) pre_federation_optimizer_rules: Vec<Arc<dyn OptimizerRule + Send + Sync>>,
 }
 
 impl<T, P> std::fmt::Debug for AdbcDBTable<T, P> {
@@ -59,6 +63,9 @@ impl<T, P> AdbcDBTable<T, P> {
         table_reference: impl Into<TableReference>,
         dialect: Option<Arc<dyn Dialect + Send + Sync>>,
         #[cfg(feature = "adbc-federation")] function_support: Option<FunctionSupport>,
+        #[cfg(feature = "adbc-federation")] pre_federation_optimizer_rules: Vec<
+            Arc<dyn OptimizerRule + Send + Sync>,
+        >,
     ) -> Self {
         let mut base_table = SqlTable::new_with_schema("adbc", pool, schema, table_reference, None);
 
@@ -69,7 +76,11 @@ impl<T, P> AdbcDBTable<T, P> {
         #[cfg(feature = "adbc-federation")]
         let base_table = base_table.with_function_support(function_support);
 
-        Self { base_table }
+        Self {
+            base_table,
+            #[cfg(feature = "adbc-federation")]
+            pre_federation_optimizer_rules,
+        }
     }
 
     fn create_physical_plan(

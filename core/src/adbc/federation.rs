@@ -15,6 +15,7 @@ use crate::sql::sql_provider_datafusion::{get_stream, to_execution_error};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::optimizer::OptimizerRule;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion_federation::sql::{
     RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
@@ -74,6 +75,10 @@ impl<T, P> SQLExecutor for AdbcDBTable<T, P> {
 
     fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
         self.base_table.can_execute_plan(plan)
+    }
+
+    fn pre_federation_optimizer_rules(&self) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
+        self.pre_federation_optimizer_rules.clone()
     }
 
     fn execute(
