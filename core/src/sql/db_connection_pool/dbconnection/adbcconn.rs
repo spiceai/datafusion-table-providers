@@ -27,7 +27,8 @@ use r2d2_adbc::AdbcConnectionManager;
 use snafu::{prelude::*, ResultExt};
 use std::marker::Send;
 use std::marker::Sync;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
 
 use crate::sql::db_connection_pool::runtime::run_sync_with_tokio;
@@ -136,6 +137,70 @@ impl CancellableStatement for adbc_driver_manager::ManagedStatement {
     }
 }
 
+/// How long a cancel is re-sent for before the query is left to finish.
+///
+/// The caller has gone and is not waiting for this, so the bound only stops a
+/// driver that never honours cancellation from being asked forever.
+const CANCEL_RETRY_LIMIT: Duration = Duration::from_secs(30);
+
+/// How long to wait between attempts.
+const CANCEL_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Set once the thread running the query is done with it, however it ended.
+type QueryFinished = Arc<(Mutex<bool>, Condvar)>;
+
+/// Reports the query as over on every way out of the thread running it,
+/// including a panic, so a retrying cancel cannot outlive it.
+struct ReportFinished(QueryFinished);
+
+impl Drop for ReportFinished {
+    fn drop(&mut self) {
+        let (lock, signal) = &*self.0;
+        *lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        signal.notify_all();
+    }
+}
+
+/// Re-sends the cancel until the query is over.
+///
+/// The handle is published before [`Statement::execute`] is entered, and the
+/// lock cannot be held across that call — holding it would make `Drop` wait for
+/// the whole query. A caller that goes away inside that window hands the driver
+/// a cancel with no running query to apply it to, and a driver is free to drop
+/// it; the query then starts anyway and holds its pooled connection for the rest
+/// of its life, which is what cancelling is supposed to prevent. Sending once is
+/// therefore not enough. A later attempt lands after the driver has the query,
+/// so this keeps asking until the thread running it reports that it is over.
+fn retry_cancel_until_finished<S>(mut handle: S, finished: &QueryFinished)
+where
+    S: StatementCancelHandle,
+{
+    let deadline = Instant::now() + CANCEL_RETRY_LIMIT;
+    let (lock, signal) = &**finished;
+    loop {
+        if let Err(error) = handle.cancel() {
+            tracing::debug!("Failed to cancel abandoned ADBC query: {error}");
+        }
+        let done = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *done {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            tracing::debug!(
+                "Gave up cancelling an abandoned ADBC query after {CANCEL_RETRY_LIMIT:?}"
+            );
+            return;
+        }
+        let (done, _) = signal
+            .wait_timeout(done, CANCEL_RETRY_INTERVAL.min(remaining))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *done {
+            return;
+        }
+    }
+}
+
 /// Shared between the stream handed to the caller and the thread running the
 /// query, so a caller that goes away can stop a query that has already started.
 enum QueryCancellation<S> {
@@ -159,6 +224,7 @@ enum QueryCancellation<S> {
 struct CancelOnDrop<S: StatementCancelHandle> {
     inner: SendableRecordBatchStream,
     cancellation: Arc<Mutex<QueryCancellation<S>>>,
+    finished: QueryFinished,
 }
 
 impl<S> futures::Stream for CancelOnDrop<S>
@@ -191,12 +257,19 @@ impl<S: StatementCancelHandle> Drop for CancelOnDrop<S> {
             Err(poisoned) => poisoned.into_inner(),
         };
         match std::mem::replace(&mut *cancellation, QueryCancellation::Abandoned) {
-            QueryCancellation::Running(mut statement) => {
-                // `AdbcStatementCancel` is the one statement call a driver must
-                // accept while another is in flight, and it only signals; it does
-                // not wait for the query to unwind.
-                if let Err(error) = statement.cancel() {
-                    tracing::debug!("Failed to cancel abandoned ADBC query: {error}");
+            QueryCancellation::Running(statement) => {
+                // Off this thread: `Drop` runs on whichever thread released the
+                // stream, often an async worker, and the retry deliberately
+                // outlives it.
+                let finished = Arc::clone(&self.finished);
+                if std::thread::Builder::new()
+                    .name("adbc-cancel".to_string())
+                    .spawn(move || retry_cancel_until_finished(statement, &finished))
+                    .is_err()
+                {
+                    tracing::warn!(
+                        "Failed to start the thread that cancels an abandoned ADBC query, so it runs to completion"
+                    );
                 }
             }
             QueryCancellation::Finished => {
@@ -397,8 +470,13 @@ where
 
             let cancellation = Arc::new(Mutex::new(QueryCancellation::Preparing));
             let task_cancellation = Arc::clone(&cancellation);
+            let finished: QueryFinished = Arc::new((Mutex::new(false), Condvar::new()));
+            let task_finished = Arc::clone(&finished);
 
             let join_handle = tokio::task::spawn_blocking(move || {
+                // Reports the query as over however this thread leaves, so a
+                // retrying cancel stops with it.
+                let _finished = ReportFinished(task_finished);
                 let conn_mx = cloned_conn.lock().unwrap();
                 let mut conn = conn_mx.borrow_mut();
                 let mut stmt = conn
@@ -488,6 +566,7 @@ where
             Ok(Box::pin(CancelOnDrop {
                 inner: Box::pin(RecordBatchStreamAdapter::new(schema, output_stream)),
                 cancellation,
+                finished,
             }))
         };
 
@@ -539,6 +618,9 @@ mod tests {
         executing: Mutex<bool>,
         started: Condvar,
         cancels: AtomicUsize,
+        /// How many cancels to swallow before one takes effect, standing in for
+        /// a driver with no running query to apply the first one to.
+        cancels_to_ignore: AtomicUsize,
         executes: AtomicUsize,
         /// How many times the result reader was read from.
         reads: Arc<AtomicUsize>,
@@ -654,6 +736,15 @@ mod tests {
         }
         fn cancel(&mut self) -> AdbcResult<()> {
             self.activity.cancels.fetch_add(1, Ordering::SeqCst);
+            if self
+                .activity
+                .cancels_to_ignore
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                .is_ok()
+            {
+                // Arrived before the driver had a query to cancel.
+                return Ok(());
+            }
             let (lock, signal) = &*self.cancelled;
             let mut cancelled = lock.lock().unwrap_or_else(|e| e.into_inner());
             *cancelled = true;
@@ -945,6 +1036,52 @@ mod tests {
         );
     }
 
+    /// A driver that drops a cancel because it has no query to apply it to yet
+    /// must not be left with the query running: one cancel that lands nowhere
+    /// keeps the abandoned query — and the pooled connection it holds — alive
+    /// for the query's whole duration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cancel_the_driver_drops_is_retried_until_the_query_stops() {
+        use crate::sql::db_connection_pool::DbConnectionPool;
+
+        let activity = Arc::new(DriverActivity::default());
+        activity.cancels_to_ignore.store(1, Ordering::SeqCst);
+        let pool = fake_pool(
+            &activity,
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(AtomicBool::new(false)),
+        );
+
+        let conn = pool
+            .connect()
+            .await
+            .expect("a connection should be available");
+        let stream = super::super::query_arrow(conn, "SELECT 1".to_string(), None)
+            .await
+            .expect("the query should start");
+
+        assert!(
+            activity.wait_until_executing(Duration::from_secs(10)),
+            "the driver never started executing"
+        );
+
+        drop(stream);
+
+        // The pool holds one connection, so it comes back only once a cancel
+        // has actually reached the running query.
+        let second = tokio::time::timeout(Duration::from_secs(10), pool.connect())
+            .await
+            .expect("the dropped cancel was never retried, so the query kept the connection")
+            .expect("a connection should be available");
+        drop(second);
+
+        assert!(
+            activity.cancels.load(Ordering::SeqCst) >= 2,
+            "only {} cancel was sent, so the one the driver dropped was the only one",
+            activity.cancels.load(Ordering::SeqCst)
+        );
+    }
+
     /// A caller that goes away while the statement is still being prepared must
     /// stop the query from starting at all.
     #[test]
@@ -958,6 +1095,7 @@ mod tests {
                 futures::stream::empty(),
             )),
             cancellation: Arc::clone(&cancellation),
+            finished: Arc::new((Mutex::new(false), Condvar::new())),
         };
         drop(guard);
 
@@ -1068,6 +1206,7 @@ mod tests {
                 futures::stream::empty(),
             )),
             cancellation: Arc::clone(&cancellation),
+            finished: Arc::new((Mutex::new(false), Condvar::new())),
         };
         drop(guard);
 
