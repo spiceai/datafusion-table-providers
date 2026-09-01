@@ -160,11 +160,20 @@ impl Drop for ReportFinished {
     }
 }
 
+/// How many abandoned queries may wait for the cancellation thread.
+///
+/// Only queries it has not picked up yet sit here, and each one is holding a
+/// pooled connection, so this is generous. Overflowing it costs a query its
+/// retries, not its cancel.
+const CANCEL_QUEUE_LIMIT: usize = 1024;
+
 /// An abandoned query to keep cancelling until it is over.
 struct CancelJob {
     handle: Box<dyn StatementCancelHandle>,
     finished: QueryFinished,
     deadline: Instant,
+    /// Whether the driver has been asked to cancel this query even once.
+    asked: bool,
 }
 
 impl CancelJob {
@@ -173,12 +182,17 @@ impl CancelJob {
         if self.finished.load(Ordering::SeqCst) {
             return false;
         }
-        if Instant::now() >= self.deadline {
+        // The deadline bounds the retrying, so it cannot be what stops the
+        // first attempt: a query that waited out its whole deadline reaching
+        // this thread would otherwise be dropped having never been cancelled at
+        // all, which is worse than not retrying.
+        if self.asked && Instant::now() >= self.deadline {
             tracing::debug!(
                 "Gave up cancelling an abandoned ADBC query after {CANCEL_RETRY_LIMIT:?}"
             );
             return false;
         }
+        self.asked = true;
         if let Err(error) = self.handle.cancel() {
             tracing::debug!("Failed to cancel an abandoned ADBC query: {error}");
         }
@@ -188,8 +202,8 @@ impl CancelJob {
 
 /// The queue the cancellation thread takes work from, or `None` if that thread
 /// could not be started.
-static CANCELLATIONS: LazyLock<Option<mpsc::Sender<CancelJob>>> = LazyLock::new(|| {
-    let (sender, receiver) = mpsc::channel();
+static CANCELLATIONS: LazyLock<Option<mpsc::SyncSender<CancelJob>>> = LazyLock::new(|| {
+    let (sender, receiver) = mpsc::sync_channel(CANCEL_QUEUE_LIMIT);
     match std::thread::Builder::new()
         .name("adbc-cancel".to_string())
         .spawn(move || cancel_abandoned_queries(&receiver))
@@ -258,17 +272,31 @@ fn cancel_abandoned_queries(queue: &mpsc::Receiver<CancelJob>) {
     }
 }
 
-/// Hands a query to the cancellation thread, or cancels it once here if there
-/// is no such thread to hand it to.
+/// Hands a query to the cancellation thread.
 fn cancel_until_finished(job: CancelJob) {
-    let mut job = job;
-    if let Some(queue) = CANCELLATIONS.as_ref() {
-        match queue.send(job) {
+    queue_or_cancel(CANCELLATIONS.as_ref(), job);
+}
+
+/// Queues a query for cancellation, or cancels it once here when there is
+/// nowhere to queue it.
+///
+/// No thread to hand it to, or no room to hand it over, costs the query its
+/// retries. It must not cost it the cancel itself.
+fn queue_or_cancel(queue: Option<&mpsc::SyncSender<CancelJob>>, job: CancelJob) {
+    let mut job = match queue {
+        Some(queue) => match queue.try_send(job) {
             Ok(()) => return,
+            Err(mpsc::TrySendError::Full(job)) => {
+                tracing::debug!(
+                    "{CANCEL_QUEUE_LIMIT} ADBC queries are already waiting to be cancelled, so this one is cancelled once instead of until it stops"
+                );
+                job
+            }
             // Only if the cancellation thread is gone, which it never is.
-            Err(mpsc::SendError(returned)) => job = returned,
-        }
-    }
+            Err(mpsc::TrySendError::Disconnected(job)) => job,
+        },
+        None => job,
+    };
     if let Err(error) = job.handle.cancel() {
         tracing::debug!("Failed to cancel an abandoned ADBC query: {error}");
     }
@@ -338,6 +366,7 @@ impl<S: StatementCancelHandle> Drop for CancelOnDrop<S> {
                     handle: Box::new(statement),
                     finished: Arc::clone(&self.finished),
                     deadline: Instant::now() + CANCEL_RETRY_LIMIT,
+                    asked: false,
                 });
             }
             QueryCancellation::Finished => {
@@ -1120,7 +1149,58 @@ mod tests {
             handle: Box::new(CountingHandle(Arc::clone(counter))),
             finished: Arc::new(AtomicBool::new(false)),
             deadline: Instant::now() + alive,
+            asked: false,
         }
+    }
+
+    /// A query that waited out its whole deadline before the cancellation thread
+    /// reached it must still be cancelled.
+    ///
+    /// The deadline is there to stop the retrying, so letting it stop the first
+    /// attempt would leave the query running and holding its pooled connection
+    /// having never been cancelled at all.
+    #[test]
+    fn a_query_that_waited_past_its_deadline_is_still_cancelled_once() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let cancels = Arc::new(AtomicUsize::new(0));
+        sender
+            .try_send(counting_job(&cancels, Duration::ZERO))
+            .expect("the queue should take the query");
+        drop(sender);
+
+        cancel_abandoned_queries(&receiver);
+
+        assert_eq!(
+            cancels.load(Ordering::SeqCst),
+            1,
+            "a query already past its deadline was dropped without being cancelled"
+        );
+    }
+
+    /// A query that does not fit the queue is cancelled where it is, rather than
+    /// left running because there was nowhere to put it.
+    #[test]
+    fn a_query_that_does_not_fit_the_queue_is_still_cancelled_once() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let queued = Arc::new(AtomicUsize::new(0));
+        sender
+            .try_send(counting_job(&queued, CANCEL_RETRY_LIMIT))
+            .expect("the queue should take the first query");
+
+        let cancels = Arc::new(AtomicUsize::new(0));
+        queue_or_cancel(Some(&sender), counting_job(&cancels, CANCEL_RETRY_LIMIT));
+
+        assert_eq!(
+            cancels.load(Ordering::SeqCst),
+            1,
+            "a query that did not fit the queue was not cancelled at all"
+        );
+        assert_eq!(
+            queued.load(Ordering::SeqCst),
+            0,
+            "the queued query was cancelled by the caller instead of by the thread"
+        );
+        drop(receiver);
     }
 
     /// Queries arriving to be cancelled must not raise the rate at which any
