@@ -221,28 +221,40 @@ static CANCELLATIONS: LazyLock<Option<mpsc::Sender<CancelJob>>> = LazyLock::new(
 /// makes cancellation work at all here.
 fn cancel_abandoned_queries(queue: &mpsc::Receiver<CancelJob>) {
     let mut pending: Vec<CancelJob> = Vec::new();
+    let mut next_retry = Instant::now() + CANCEL_RETRY_INTERVAL;
     loop {
-        // Wait for work when there is none, and only as long as the retry
-        // interval when there is.
+        let mut arrived: Vec<CancelJob> = Vec::new();
+        // Wait for work when there is none, and otherwise only until the next
+        // retry is due.
         if pending.is_empty() {
             match queue.recv() {
-                Ok(job) => pending.push(job),
+                Ok(job) => arrived.push(job),
                 // Only if the sender is dropped, which the static never is.
                 Err(mpsc::RecvError) => return,
             }
+            next_retry = Instant::now() + CANCEL_RETRY_INTERVAL;
         } else {
-            match queue.recv_timeout(CANCEL_RETRY_INTERVAL) {
-                Ok(job) => pending.push(job),
+            let wait = next_retry.saturating_duration_since(Instant::now());
+            match queue.recv_timeout(wait) {
+                Ok(job) => arrived.push(job),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    std::thread::sleep(CANCEL_RETRY_INTERVAL);
-                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => std::thread::sleep(wait),
             }
         }
         while let Ok(job) = queue.try_recv() {
-            pending.push(job);
+            arrived.push(job);
         }
-        pending.retain_mut(CancelJob::attempt);
+
+        // A new job is cancelled as soon as it arrives, but everything already
+        // pending waits for the retry deadline. Arrivals therefore cost one
+        // cancel each rather than a pass over the whole queue, so a burst of
+        // them cannot raise the rate at which any driver is asked.
+        arrived.retain_mut(CancelJob::attempt);
+        if Instant::now() >= next_retry {
+            pending.retain_mut(CancelJob::attempt);
+            next_retry = Instant::now() + CANCEL_RETRY_INTERVAL;
+        }
+        pending.append(&mut arrived);
     }
 }
 
@@ -1090,6 +1102,83 @@ mod tests {
             waited.elapsed() < Duration::from_secs(20),
             "the pool connection took {:?} to come back",
             waited.elapsed()
+        );
+    }
+
+    /// Counts the cancels sent to one abandoned query.
+    struct CountingHandle(Arc<AtomicUsize>);
+
+    impl StatementCancelHandle for CountingHandle {
+        fn cancel(&mut self) -> AdbcResult<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn counting_job(counter: &Arc<AtomicUsize>, alive: Duration) -> CancelJob {
+        CancelJob {
+            handle: Box::new(CountingHandle(Arc::clone(counter))),
+            finished: Arc::new(AtomicBool::new(false)),
+            deadline: Instant::now() + alive,
+        }
+    }
+
+    /// Queries arriving to be cancelled must not raise the rate at which any
+    /// one of them is cancelled.
+    ///
+    /// A cancellation burst is exactly when the driver is under most pressure,
+    /// so retrying every pending query on each arrival — rather than on a fixed
+    /// deadline — would ask each of them once per arrival and turn a burst of
+    /// `n` into `n^2` cancels.
+    #[test]
+    fn a_burst_of_abandoned_queries_does_not_speed_up_the_retries() {
+        const ARRIVALS: usize = 40;
+        const SPACING: Duration = Duration::from_millis(2);
+        const ALIVE: Duration = Duration::from_millis(300);
+
+        let (sender, receiver) = mpsc::channel();
+        let watched = Arc::new(AtomicUsize::new(0));
+
+        // One query that stays abandoned for the whole test, to count the
+        // cancels it is asked for.
+        sender
+            .send(counting_job(&watched, ALIVE))
+            .expect("the worker should accept the watched query");
+
+        let others = Arc::new(AtomicUsize::new(0));
+        let arrivals = Arc::clone(&others);
+        let feeder = std::thread::spawn(move || {
+            for _ in 0..ARRIVALS {
+                std::thread::sleep(SPACING);
+                if sender.send(counting_job(&arrivals, ALIVE)).is_err() {
+                    return;
+                }
+            }
+            // Dropping the last sender is what lets the worker return.
+        });
+
+        let started = Instant::now();
+        cancel_abandoned_queries(&receiver);
+        let ran_for = started.elapsed();
+        feeder.join().expect("the feeder should not panic");
+
+        // Each arrival is cancelled once on arrival; the watched query is
+        // cancelled once on arrival and once per retry interval after that.
+        let expected = 1 + ran_for.as_millis() / CANCEL_RETRY_INTERVAL.as_millis() + 2;
+        let watched = watched.load(Ordering::SeqCst);
+        assert!(
+            u128::try_from(watched).unwrap_or(u128::MAX) <= expected,
+            "one query was cancelled {watched} times in {ran_for:?}, more than the \
+             {expected} its retry interval allows, so {ARRIVALS} arrivals raised its retry rate"
+        );
+        assert!(
+            watched >= 2,
+            "the watched query was cancelled {watched} times, so it was never retried at all"
+        );
+        assert_eq!(
+            others.load(Ordering::SeqCst).min(ARRIVALS),
+            ARRIVALS,
+            "not every arriving query was cancelled"
         );
     }
 
