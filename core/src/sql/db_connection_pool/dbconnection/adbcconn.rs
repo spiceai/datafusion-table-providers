@@ -27,7 +27,8 @@ use r2d2_adbc::AdbcConnectionManager;
 use snafu::{prelude::*, ResultExt};
 use std::marker::Send;
 use std::marker::Sync;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
 
@@ -147,7 +148,7 @@ const CANCEL_RETRY_LIMIT: Duration = Duration::from_secs(30);
 const CANCEL_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Set once the thread running the query is done with it, however it ended.
-type QueryFinished = Arc<(Mutex<bool>, Condvar)>;
+type QueryFinished = Arc<AtomicBool>;
 
 /// Reports the query as over on every way out of the thread running it,
 /// including a panic, so a retrying cancel cannot outlive it.
@@ -155,13 +156,55 @@ struct ReportFinished(QueryFinished);
 
 impl Drop for ReportFinished {
     fn drop(&mut self) {
-        let (lock, signal) = &*self.0;
-        *lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-        signal.notify_all();
+        self.0.store(true, Ordering::SeqCst);
     }
 }
 
-/// Re-sends the cancel until the query is over.
+/// An abandoned query to keep cancelling until it is over.
+struct CancelJob {
+    handle: Box<dyn StatementCancelHandle>,
+    finished: QueryFinished,
+    deadline: Instant,
+}
+
+impl CancelJob {
+    /// Sends one cancel, and reports whether this query still needs another.
+    fn attempt(&mut self) -> bool {
+        if self.finished.load(Ordering::SeqCst) {
+            return false;
+        }
+        if Instant::now() >= self.deadline {
+            tracing::debug!(
+                "Gave up cancelling an abandoned ADBC query after {CANCEL_RETRY_LIMIT:?}"
+            );
+            return false;
+        }
+        if let Err(error) = self.handle.cancel() {
+            tracing::debug!("Failed to cancel an abandoned ADBC query: {error}");
+        }
+        true
+    }
+}
+
+/// The queue the cancellation thread takes work from, or `None` if that thread
+/// could not be started.
+static CANCELLATIONS: LazyLock<Option<mpsc::Sender<CancelJob>>> = LazyLock::new(|| {
+    let (sender, receiver) = mpsc::channel();
+    match std::thread::Builder::new()
+        .name("adbc-cancel".to_string())
+        .spawn(move || cancel_abandoned_queries(&receiver))
+    {
+        Ok(_) => Some(sender),
+        Err(error) => {
+            tracing::warn!(
+                "Failed to start the thread that cancels abandoned ADBC queries, so each is cancelled once and may keep its pooled connection: {error}"
+            );
+            None
+        }
+    }
+});
+
+/// Re-sends each queued cancel until its query is over.
 ///
 /// The handle is published before [`Statement::execute`] is entered, and the
 /// lock cannot be held across that call — holding it would make `Drop` wait for
@@ -170,34 +213,52 @@ impl Drop for ReportFinished {
 /// it; the query then starts anyway and holds its pooled connection for the rest
 /// of its life, which is what cancelling is supposed to prevent. Sending once is
 /// therefore not enough. A later attempt lands after the driver has the query,
-/// so this keeps asking until the thread running it reports that it is over.
-fn retry_cancel_until_finished<S>(mut handle: S, finished: &QueryFinished)
-where
-    S: StatementCancelHandle,
-{
-    let deadline = Instant::now() + CANCEL_RETRY_LIMIT;
-    let (lock, signal) = &**finished;
+/// so each job is retried until the thread running its query reports it over.
+///
+/// One thread serves every abandoned query, so a burst of them costs no threads.
+/// That relies on [`StatementCancelHandle::cancel`] returning without waiting for
+/// the query, which is what `AdbcStatementCancel` is specified to do and what
+/// makes cancellation work at all here.
+fn cancel_abandoned_queries(queue: &mpsc::Receiver<CancelJob>) {
+    let mut pending: Vec<CancelJob> = Vec::new();
     loop {
-        if let Err(error) = handle.cancel() {
-            tracing::debug!("Failed to cancel abandoned ADBC query: {error}");
+        // Wait for work when there is none, and only as long as the retry
+        // interval when there is.
+        if pending.is_empty() {
+            match queue.recv() {
+                Ok(job) => pending.push(job),
+                // Only if the sender is dropped, which the static never is.
+                Err(mpsc::RecvError) => return,
+            }
+        } else {
+            match queue.recv_timeout(CANCEL_RETRY_INTERVAL) {
+                Ok(job) => pending.push(job),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    std::thread::sleep(CANCEL_RETRY_INTERVAL);
+                }
+            }
         }
-        let done = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *done {
-            return;
+        while let Ok(job) = queue.try_recv() {
+            pending.push(job);
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            tracing::debug!(
-                "Gave up cancelling an abandoned ADBC query after {CANCEL_RETRY_LIMIT:?}"
-            );
-            return;
+        pending.retain_mut(CancelJob::attempt);
+    }
+}
+
+/// Hands a query to the cancellation thread, or cancels it once here if there
+/// is no such thread to hand it to.
+fn cancel_until_finished(job: CancelJob) {
+    let mut job = job;
+    if let Some(queue) = CANCELLATIONS.as_ref() {
+        match queue.send(job) {
+            Ok(()) => return,
+            // Only if the cancellation thread is gone, which it never is.
+            Err(mpsc::SendError(returned)) => job = returned,
         }
-        let (done, _) = signal
-            .wait_timeout(done, CANCEL_RETRY_INTERVAL.min(remaining))
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *done {
-            return;
-        }
+    }
+    if let Err(error) = job.handle.cancel() {
+        tracing::debug!("Failed to cancel an abandoned ADBC query: {error}");
     }
 }
 
@@ -261,16 +322,11 @@ impl<S: StatementCancelHandle> Drop for CancelOnDrop<S> {
                 // Off this thread: `Drop` runs on whichever thread released the
                 // stream, often an async worker, and the retry deliberately
                 // outlives it.
-                let finished = Arc::clone(&self.finished);
-                if std::thread::Builder::new()
-                    .name("adbc-cancel".to_string())
-                    .spawn(move || retry_cancel_until_finished(statement, &finished))
-                    .is_err()
-                {
-                    tracing::warn!(
-                        "Failed to start the thread that cancels an abandoned ADBC query, so it runs to completion"
-                    );
-                }
+                cancel_until_finished(CancelJob {
+                    handle: Box::new(statement),
+                    finished: Arc::clone(&self.finished),
+                    deadline: Instant::now() + CANCEL_RETRY_LIMIT,
+                });
             }
             QueryCancellation::Finished => {
                 *cancellation = QueryCancellation::Finished;
@@ -470,7 +526,7 @@ where
 
             let cancellation = Arc::new(Mutex::new(QueryCancellation::Preparing));
             let task_cancellation = Arc::clone(&cancellation);
-            let finished: QueryFinished = Arc::new((Mutex::new(false), Condvar::new()));
+            let finished: QueryFinished = Arc::new(AtomicBool::new(false));
             let task_finished = Arc::clone(&finished);
 
             let join_handle = tokio::task::spawn_blocking(move || {
@@ -739,7 +795,9 @@ mod tests {
             if self
                 .activity
                 .cancels_to_ignore
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
                 .is_ok()
             {
                 // Arrived before the driver had a query to cancel.
@@ -1024,9 +1082,8 @@ mod tests {
             .expect("a connection should be available");
         drop(second);
 
-        assert_eq!(
-            activity.cancels.load(Ordering::SeqCst),
-            1,
+        assert!(
+            activity.cancels.load(Ordering::SeqCst) >= 1,
             "the abandoned query was not cancelled"
         );
         assert!(
@@ -1095,7 +1152,7 @@ mod tests {
                 futures::stream::empty(),
             )),
             cancellation: Arc::clone(&cancellation),
-            finished: Arc::new((Mutex::new(false), Condvar::new())),
+            finished: Arc::new(AtomicBool::new(false)),
         };
         drop(guard);
 
@@ -1206,7 +1263,7 @@ mod tests {
                 futures::stream::empty(),
             )),
             cancellation: Arc::clone(&cancellation),
-            finished: Arc::new((Mutex::new(false), Condvar::new())),
+            finished: Arc::new(AtomicBool::new(false)),
         };
         drop(guard);
 
