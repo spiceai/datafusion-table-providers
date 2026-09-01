@@ -51,7 +51,7 @@ pub struct AdbcDbConnection<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Send + Sync,
-    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     pub conn: Arc<Mutex<RefCell<r2d2::PooledConnection<AdbcConnectionManager<D>>>>>,
 }
@@ -61,7 +61,7 @@ impl<D> DbConnection<r2d2::PooledConnection<AdbcConnectionManager<D>>, RecordBat
 where
     D: Database + Send + 'static,
     D::ConnectionType: Send + Sync,
-    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     fn as_any(&self) -> &dyn Any {
         self
@@ -79,17 +79,58 @@ where
     }
 }
 
-/// Shared between the stream handed to the caller and the thread running the
-/// query, so a caller that goes away can stop a query that has already started.
+/// A handle that cancels the query its statement is running.
+pub trait StatementCancelHandle: Send + 'static {
+    /// Cancels the in-flight query on the statement this handle came from.
+    ///
+    /// Called while that statement is inside [`Statement::execute`], which is
+    /// the one moment ADBC defines `AdbcStatementCancel` for, and must not wait
+    /// for the query to unwind.
+    fn cancel(&mut self) -> adbc_core::error::Result<()>;
+}
+
+/// A statement that can hand out a handle for cancelling its in-flight query.
 ///
 /// The thread inside [`Statement::execute`] holds the only `&mut` to the
-/// statement for as long as the query runs, so cancelling needs a second handle
-/// to the same statement — which is why the statement type has to be `Clone`.
+/// statement for as long as the query runs, so cancelling it needs a second
+/// handle — and that handle has to address *the same* driver statement.
+/// `Clone` alone does not promise this: a `Clone` implementation is free to
+/// produce independent cancellation state, and cancelling through such a clone
+/// would return success while the query kept running. Implement this only where
+/// the handle genuinely aliases the statement it came from.
+pub trait CancellableStatement: Statement {
+    /// The handle type. Cancelling through it must interrupt a call already
+    /// running on the statement that produced it.
+    type CancelHandle: StatementCancelHandle;
+
+    /// Returns a handle for cancelling this statement's in-flight query.
+    fn cancel_handle(&self) -> Self::CancelHandle;
+}
+
+/// `ManagedStatement` clones share one `Arc`'d FFI statement, so a clone
+/// addresses the same driver statement and `AdbcStatementCancel` through it
+/// reaches the running call.
+impl StatementCancelHandle for adbc_driver_manager::ManagedStatement {
+    fn cancel(&mut self) -> adbc_core::error::Result<()> {
+        Statement::cancel(self)
+    }
+}
+
+impl CancellableStatement for adbc_driver_manager::ManagedStatement {
+    type CancelHandle = Self;
+
+    fn cancel_handle(&self) -> Self::CancelHandle {
+        self.clone()
+    }
+}
+
+/// Shared between the stream handed to the caller and the thread running the
+/// query, so a caller that goes away can stop a query that has already started.
 enum QueryCancellation<S> {
     /// The statement has not been created yet.
     Preparing,
     /// The query is running and can be cancelled through this handle.
-    Running(S),
+    Running(S), // handle, not the statement itself
     /// The caller went away. If the query has not started, it must not start.
     Abandoned,
     /// The query ended on its own; there is nothing to cancel.
@@ -103,14 +144,14 @@ enum QueryCancellation<S> {
 /// blocking thread stays inside `Statement::execute` until the remote query
 /// finishes on its own, holding its pooled connection for that whole time, and
 /// the remote database keeps doing the work nobody is waiting for.
-struct CancelOnDrop<S: Statement> {
+struct CancelOnDrop<S: StatementCancelHandle> {
     inner: SendableRecordBatchStream,
     cancellation: Arc<Mutex<QueryCancellation<S>>>,
 }
 
 impl<S> futures::Stream for CancelOnDrop<S>
 where
-    S: Statement + Send + Unpin,
+    S: StatementCancelHandle,
 {
     type Item = datafusion::common::Result<RecordBatch>;
 
@@ -124,14 +165,14 @@ where
 
 impl<S> datafusion::execution::RecordBatchStream for CancelOnDrop<S>
 where
-    S: Statement + Send + Unpin,
+    S: StatementCancelHandle,
 {
     fn schema(&self) -> SchemaRef {
         self.inner.schema()
     }
 }
 
-impl<S: Statement> Drop for CancelOnDrop<S> {
+impl<S: StatementCancelHandle> Drop for CancelOnDrop<S> {
     fn drop(&mut self) {
         let mut cancellation = match self.cancellation.lock() {
             Ok(cancellation) => cancellation,
@@ -178,8 +219,7 @@ impl<D> SyncDbConnection<r2d2::PooledConnection<AdbcConnectionManager<D>>, Recor
 where
     D: Database + Send + 'static,
     D::ConnectionType: Send + Sync,
-    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
-    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     fn new(conn: r2d2::PooledConnection<AdbcConnectionManager<D>>) -> Self {
         AdbcDbConnection {
@@ -371,19 +411,28 @@ where
                         // nobody, and hold this pooled connection while it did.
                         return Ok(());
                     }
-                    *state = QueryCancellation::Running(stmt.clone());
+                    *state = QueryCancellation::Running(stmt.cancel_handle());
                 }
 
-                let results = stmt
-                    .execute()
-                    .boxed()
-                    .context(super::UnableToQueryArrowSnafu)?;
-                for batch in results {
-                    let b = batch.boxed().context(super::UnableToQueryArrowSnafu)?;
-                    blocking_channel_send(&batch_tx, b)?;
-                }
+                // Every non-panicking way out of the query — success, a failed
+                // execute, a bad batch, a receiver that has gone — leaves the
+                // query over. Record that before returning, so a consumer that
+                // drops the stream on the error does not then cancel an
+                // operation that has already ended.
+                let outcome =
+                    (|| -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                        let results = stmt
+                            .execute()
+                            .boxed()
+                            .context(super::UnableToQueryArrowSnafu)?;
+                        for batch in results {
+                            let b = batch.boxed().context(super::UnableToQueryArrowSnafu)?;
+                            blocking_channel_send(&batch_tx, b)?;
+                        }
+                        Ok(())
+                    })();
                 *lock_cancellation(&task_cancellation) = QueryCancellation::Finished;
-                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+                outcome
             });
 
             let output_stream = stream! {
@@ -449,7 +498,7 @@ mod tests {
     };
     use adbc_core::{Optionable, PartitionedResult};
     use arrow_schema::Schema;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Condvar;
     use std::time::{Duration, Instant};
 
@@ -489,6 +538,9 @@ mod tests {
     struct FakeStatement {
         activity: Arc<DriverActivity>,
         cancelled: Arc<(Mutex<bool>, Condvar)>,
+        /// Makes `execute` fail at once instead of blocking, so a test can take
+        /// the error path out of the query.
+        fail_fast: Arc<AtomicBool>,
     }
 
     /// Long enough that a test failure is a failure rather than a flake, short
@@ -521,6 +573,22 @@ mod tests {
         )
     }
 
+    // The fake shares its cancellation state through `Arc`s, so a handle taken
+    // from a statement really does cancel that statement's query.
+    impl StatementCancelHandle for FakeStatement {
+        fn cancel(&mut self) -> AdbcResult<()> {
+            Statement::cancel(self)
+        }
+    }
+
+    impl CancellableStatement for FakeStatement {
+        type CancelHandle = Self;
+
+        fn cancel_handle(&self) -> Self::CancelHandle {
+            self.clone()
+        }
+    }
+
     impl Statement for FakeStatement {
         fn bind(&mut self, _batch: RecordBatch) -> AdbcResult<()> {
             Ok(())
@@ -538,6 +606,12 @@ mod tests {
         }
         fn execute(&mut self) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
             self.activity.executes.fetch_add(1, Ordering::SeqCst);
+            if self.fail_fast.load(Ordering::SeqCst) {
+                return Err(AdbcError::with_message_and_status(
+                    "query failed",
+                    Status::Internal,
+                ));
+            }
             {
                 let mut executing = self
                     .activity
@@ -592,6 +666,7 @@ mod tests {
     struct FakeConnection {
         activity: Arc<DriverActivity>,
         cancelled: Arc<(Mutex<bool>, Condvar)>,
+        fail_fast: Arc<AtomicBool>,
     }
 
     impl Drop for FakeConnection {
@@ -628,6 +703,7 @@ mod tests {
             Ok(FakeStatement {
                 activity: Arc::clone(&self.activity),
                 cancelled: Arc::clone(&self.cancelled),
+                fail_fast: Arc::clone(&self.fail_fast),
             })
         }
         fn cancel(&mut self) -> AdbcResult<()> {
@@ -691,6 +767,7 @@ mod tests {
     struct FakeDatabase {
         activity: Arc<DriverActivity>,
         cancelled: Arc<(Mutex<bool>, Condvar)>,
+        fail_fast: Arc<AtomicBool>,
     }
 
     impl Optionable for FakeDatabase {
@@ -722,6 +799,7 @@ mod tests {
             Ok(FakeConnection {
                 activity: Arc::clone(&self.activity),
                 cancelled: Arc::clone(&self.cancelled),
+                fail_fast: Arc::clone(&self.fail_fast),
             })
         }
 
@@ -735,21 +813,19 @@ mod tests {
 
     fn fake_pool(
         activity: &Arc<DriverActivity>,
-    ) -> (
-        Arc<crate::sql::db_connection_pool::adbcpool::ADBCPool<FakeDatabase>>,
-        Arc<(Mutex<bool>, Condvar)>,
-    ) {
-        let cancelled = Arc::new((Mutex::new(false), Condvar::new()));
+        fail_fast: &Arc<AtomicBool>,
+    ) -> Arc<crate::sql::db_connection_pool::adbcpool::ADBCPool<FakeDatabase>> {
         let database = FakeDatabase {
             activity: Arc::clone(activity),
-            cancelled: Arc::clone(&cancelled),
+            cancelled: Arc::new((Mutex::new(false), Condvar::new())),
+            fail_fast: Arc::clone(fail_fast),
         };
         let pool =
             crate::sql::db_connection_pool::adbcpool::AdbcConnectionPoolBuilder::new(database)
                 .with_max_size(Some(1))
                 .build()
                 .expect("the pool should build");
-        (Arc::new(pool), cancelled)
+        Arc::new(pool)
     }
 
     /// Dropping the stream must cancel the running query and give the pooled
@@ -759,7 +835,7 @@ mod tests {
         use crate::sql::db_connection_pool::DbConnectionPool;
 
         let activity = Arc::new(DriverActivity::default());
-        let (pool, _cancelled) = fake_pool(&activity);
+        let pool = fake_pool(&activity, &Arc::new(AtomicBool::new(false)));
 
         let conn = pool
             .connect()
@@ -819,6 +895,39 @@ mod tests {
                 QueryCancellation::Abandoned
             ),
             "the query was not marked abandoned, so it would still be started"
+        );
+    }
+
+    /// A query that ends in an error must not be cancelled when its stream is
+    /// dropped: it is over either way, and cancelling reaches a statement that
+    /// has already been released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_query_is_finalized_and_not_cancelled() {
+        use crate::sql::db_connection_pool::DbConnectionPool;
+        use futures::StreamExt;
+
+        let activity = Arc::new(DriverActivity::default());
+        let pool = fake_pool(&activity, &Arc::new(AtomicBool::new(true)));
+
+        let conn = pool
+            .connect()
+            .await
+            .expect("a connection should be available");
+        let mut stream = super::super::query_arrow(conn, "SELECT 1".to_string(), None)
+            .await
+            .expect("the stream should be created");
+
+        let first = stream.next().await;
+        assert!(
+            matches!(first, Some(Err(_))),
+            "the failed query should surface its error, got {first:?}"
+        );
+        drop(stream);
+
+        assert_eq!(
+            activity.cancels.load(Ordering::SeqCst),
+            0,
+            "a query that had already failed was cancelled"
         );
     }
 

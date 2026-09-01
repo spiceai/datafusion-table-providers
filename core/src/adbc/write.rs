@@ -12,6 +12,7 @@
 
 use crate::adbc::ADBC;
 use crate::sql::db_connection_pool::adbcpool::ADBCPool;
+use crate::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement;
 use crate::util::retriable_error::{check_and_mark_retriable_error, to_retriable_data_write_error};
 use adbc_core::options::{IngestMode, OptionStatement, OptionValue};
 use adbc_core::{Connection, Database, Optionable, Statement};
@@ -45,7 +46,7 @@ pub struct ADBCTableWriterBuilder<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
-    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     read_provider: Option<Arc<dyn TableProvider>>,
     pool: Option<Arc<ADBCPool<D>>>,
@@ -56,7 +57,7 @@ impl<D> ADBCTableWriterBuilder<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
-    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     #[must_use]
     pub fn new() -> Self {
@@ -111,7 +112,7 @@ pub struct ADBCTableWriter<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
-    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     pub read_provider: Arc<dyn TableProvider>,
     pool: Arc<ADBCPool<D>>,
@@ -122,7 +123,7 @@ impl<D> std::fmt::Debug for ADBCTableWriter<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
-    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ADBCTableWriter")
@@ -136,7 +137,7 @@ impl<D> TableProvider for ADBCTableWriter<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
-    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     fn schema(&self) -> SchemaRef {
         self.read_provider.schema()
@@ -182,7 +183,7 @@ pub(crate) struct AdbcDataSink<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
-    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     pool: Arc<ADBCPool<D>>,
     table_reference: TableReference,
@@ -194,7 +195,7 @@ impl<D> std::fmt::Debug for AdbcDataSink<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
-    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.debug_struct("AdbcDataSink")
@@ -209,7 +210,7 @@ impl<D> DisplayAs for AdbcDataSink<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
-    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
@@ -225,7 +226,7 @@ impl<D> DataSink for AdbcDataSink<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
-    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     fn metrics(&self) -> Option<MetricsSet> {
         None
@@ -291,7 +292,7 @@ impl<D> AdbcDataSink<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
-    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     pub(crate) fn new(
         pool: Arc<ADBCPool<D>>,
@@ -318,7 +319,7 @@ fn bulk_insert<D>(
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
-    <D::ConnectionType as Connection>::StatementType: Clone + Send + Unpin + 'static,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     let mut db_conn = pool
         .connect_sync()
