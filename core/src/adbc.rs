@@ -10,6 +10,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement;
 use crate::{
     adbc::write::{ADBCTableWriterBuilder, AdbcDataSink},
     sql::db_connection_pool::{
@@ -78,6 +79,7 @@ pub struct AdbcTableFactory<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     pool: Arc<ADBCPool<D>>,
     #[cfg(feature = "adbc-federation")]
@@ -92,6 +94,7 @@ impl<D> AdbcTableFactory<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     #[must_use]
     pub fn new(pool: Arc<ADBCPool<D>>) -> Self {
@@ -200,6 +203,7 @@ pub struct ADBC<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     table_name: String,
     pool: Arc<DynAdbcConnectionPool<D>>,
@@ -209,6 +213,7 @@ impl<D> ADBC<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     #[must_use]
     pub fn table_name(&self) -> &str {

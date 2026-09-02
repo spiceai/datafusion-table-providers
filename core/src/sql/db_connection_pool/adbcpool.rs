@@ -20,6 +20,7 @@ use snafu::{prelude::*, ResultExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement;
 use crate::sql::db_connection_pool::dbconnection::{
     adbcconn::AdbcDbConnection, DbConnection, SyncDbConnection,
 };
@@ -44,6 +45,7 @@ pub struct AdbcConnectionPoolBuilder<D>
 where
     D: Database + Send,
     D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     database: D,
     connection_options: Option<HashMap<String, String>>,
@@ -77,6 +79,7 @@ impl<D> AdbcConnectionPoolBuilder<D>
 where
     D: Database + Send,
     D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     pub fn new(database: D) -> Self {
         Self {
@@ -147,6 +150,7 @@ pub struct ADBCPool<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     pool: Arc<r2d2::Pool<AdbcConnectionManager<D>>>,
     join_push_down: JoinPushDown,
@@ -156,6 +160,7 @@ impl<D> std::fmt::Debug for ADBCPool<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "ADBCPool")
@@ -166,6 +171,7 @@ impl<D> ADBCPool<D>
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     pub fn new(db: D, conn_options: Option<HashMap<String, String>>) -> Result<Self> {
         let builder = AdbcConnectionPoolBuilder::new(db);
@@ -195,6 +201,7 @@ impl<D> DbConnectionPool<r2d2::PooledConnection<AdbcConnectionManager<D>>, Recor
 where
     D: Database + Send + 'static,
     D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     async fn connect(
         &self,
