@@ -41,7 +41,7 @@ arrow-json = "58.0"
 arrow-odbc = { version = "23.1" }
 datafusion = { version = "54.0", default-features = false }
 datafusion-expr = { version = "54.0" }
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "59060680199aed42d0f5930ece4ba81962ebb957" } # branch: phillip/federate-subquery-only-tables
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "238c00768fd6488545072478fa4754482601efe1" } # branch: phillip/federate-subquery-only-tables
 datafusion-ffi = { version = "54.0" }
 datafusion-proto = { version = "54.0" }
 datafusion-physical-expr = { version = "54.0" }
