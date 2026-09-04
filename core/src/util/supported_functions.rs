@@ -155,10 +155,7 @@ impl FunctionSupport {
     /// Adds a per-call check, consulted for every aggregate call the name-based
     /// restriction allows. See [`AggregateCallSupport`].
     #[must_use]
-    pub fn with_aggregate_call_support(
-        mut self,
-        aggregate_call: AggregateCallSupport,
-    ) -> Self {
+    pub fn with_aggregate_call_support(mut self, aggregate_call: AggregateCallSupport) -> Self {
         self.aggregate_call = Some(aggregate_call);
         self
     }
@@ -380,9 +377,7 @@ mod tests {
     /// rewrite, and cannot rewrite for every aggregate.
     fn unfiltered_aggregate_support() -> FunctionSupport {
         FunctionSupport::new(None, None, None).with_aggregate_call_support(Arc::new(
-            |call: &AggregateFunction| {
-                call.func.name() != "count" || call.params.filter.is_none()
-            },
+            |call: &AggregateFunction| call.func.name() != "count" || call.params.filter.is_none(),
         ))
     }
 
@@ -625,24 +620,19 @@ mod tests {
     /// still federates.
     #[test]
     fn an_aggregate_call_check_refuses_only_the_shape_it_names() {
-        let bare = projection_of(
-            datafusion::functions_aggregate::expr_fn::count(col("val")),
-        );
+        let bare = projection_of(datafusion::functions_aggregate::expr_fn::count(col("val")));
         assert!(
-            !contains_unsupported_functions(&bare, &unfiltered_aggregate_support())
-                .expect("check"),
+            !contains_unsupported_functions(&bare, &unfiltered_aggregate_support()).expect("check"),
             "an unfiltered count is a shape the check allows, so it federates"
         );
 
-        let filtered = projection_of(
-            {
-                use datafusion::logical_expr::ExprFunctionExt as _;
-                datafusion::functions_aggregate::expr_fn::count(col("val"))
-                    .filter(col("val").is_not_null())
-                    .build()
-                    .expect("filtered count")
-            },
-        );
+        let filtered = projection_of({
+            use datafusion::logical_expr::ExprFunctionExt as _;
+            datafusion::functions_aggregate::expr_fn::count(col("val"))
+                .filter(col("val").is_not_null())
+                .build()
+                .expect("filtered count")
+        });
         assert!(
             contains_unsupported_functions(&filtered, &unfiltered_aggregate_support())
                 .expect("check"),
@@ -654,15 +644,13 @@ mod tests {
     /// restriction allows still federates — the hook is additive.
     #[test]
     fn no_aggregate_call_check_leaves_every_allowed_aggregate_federating() {
-        let filtered = projection_of(
-            {
-                use datafusion::logical_expr::ExprFunctionExt as _;
-                datafusion::functions_aggregate::expr_fn::count(col("val"))
-                    .filter(col("val").is_not_null())
-                    .build()
-                    .expect("filtered count")
-            },
-        );
+        let filtered = projection_of({
+            use datafusion::logical_expr::ExprFunctionExt as _;
+            datafusion::functions_aggregate::expr_fn::count(col("val"))
+                .filter(col("val").is_not_null())
+                .build()
+                .expect("filtered count")
+        });
         assert!(
             !contains_unsupported_functions(&filtered, &FunctionSupport::new(None, None, None))
                 .expect("check"),
@@ -699,9 +687,9 @@ mod tests {
     /// clause in a window either.
     #[test]
     fn a_window_call_check_refuses_the_shape_the_engine_cannot_express() {
-        let support = FunctionSupport::new(None, None, None).with_window_call_support(
-            Arc::new(|call: &WindowFunction| call.params.filter.is_none()),
-        );
+        let support = FunctionSupport::new(None, None, None).with_window_call_support(Arc::new(
+            |call: &WindowFunction| call.params.filter.is_none(),
+        ));
 
         let filtered = projection_of(windowed_count(Some(col("val").is_not_null())));
         assert!(
