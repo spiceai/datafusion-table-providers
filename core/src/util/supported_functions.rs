@@ -9,7 +9,7 @@ use datafusion::{
     common::tree_node::{TreeNode, TreeNodeRecursion},
     error::DataFusionError,
     logical_expr::{
-        expr::{AggregateFunction, ScalarFunction},
+        expr::{AggregateFunction, ScalarFunction, WindowFunction},
         AggregateUDF, Expr, LogicalPlan, ScalarUDF, WindowFunctionDefinition, WindowUDF,
     },
 };
@@ -66,12 +66,50 @@ pub fn contains_unsupported_functions(
 /// returns `true` for the functions it has no opinion about.
 pub type ScalarCallSupport = Arc<dyn Fn(&ScalarFunction) -> bool + Send + Sync>;
 
+/// Whether a backend can evaluate *this call* of an aggregate its
+/// [`FunctionRestriction`] already allows.
+///
+/// The aggregate counterpart of [`ScalarCallSupport`], and needed for the same
+/// reason with one difference that matters: an aggregate call carries more than
+/// its arguments. `FILTER (WHERE …)`, `ORDER BY` and `DISTINCT` are part of the
+/// call, and a dialect may be able to translate an aggregate in one of those
+/// shapes and not another — a `FILTER` an engine has no clause for can move
+/// inside the aggregate for `count`, and cannot for an aggregate whose result
+/// depends on input order.
+///
+/// A name-based restriction cannot express that. Denying the *name* is not an
+/// option either, because these are names like `count` and `sum` that every
+/// query uses; only the untranslatable *shapes* should stay local. A backend
+/// supplies this to refuse exactly those, leaving them for the local engine.
+///
+/// Consulted for every aggregate call the name check allows, so an
+/// implementation returns `true` for the shapes it has no opinion about.
+pub type AggregateCallSupport = Arc<dyn Fn(&AggregateFunction) -> bool + Send + Sync>;
+
+/// Whether a backend can evaluate *this* window call — the aggregate or window
+/// function, together with the `FILTER`, `ORDER BY`, `DISTINCT` and frame the
+/// `OVER` clause carries.
+///
+/// Needed separately from [`AggregateCallSupport`] rather than folded into it,
+/// because an aggregate used as a window function is not the same shape: its
+/// `ORDER BY` is the window's ordering, not an ordering of the aggregate's
+/// input, so a rule about one does not transfer to the other. What *does*
+/// transfer is `FILTER`: an engine with no `FILTER` clause refuses
+/// `COUNT(x) FILTER (WHERE p) OVER (…)` exactly as it refuses the plain
+/// aggregate form.
+///
+/// Consulted for every window call the name check allows, so an implementation
+/// returns `true` for the shapes it has no opinion about.
+pub type WindowCallSupport = Arc<dyn Fn(&WindowFunction) -> bool + Send + Sync>;
+
 #[derive(Clone)]
 pub struct FunctionSupport {
     scalar: Option<FunctionRestriction>,
     window: Option<FunctionRestriction>,
     aggregate: Option<FunctionRestriction>,
     scalar_call: Option<ScalarCallSupport>,
+    aggregate_call: Option<AggregateCallSupport>,
+    window_call: Option<WindowCallSupport>,
 }
 
 impl std::fmt::Debug for FunctionSupport {
@@ -81,6 +119,11 @@ impl std::fmt::Debug for FunctionSupport {
             .field("window", &self.window)
             .field("aggregate", &self.aggregate)
             .field("scalar_call", &self.scalar_call.as_ref().map(|_| "<fn>"))
+            .field(
+                "aggregate_call",
+                &self.aggregate_call.as_ref().map(|_| "<fn>"),
+            )
+            .field("window_call", &self.window_call.as_ref().map(|_| "<fn>"))
             .finish()
     }
 }
@@ -96,6 +139,8 @@ impl FunctionSupport {
             window,
             aggregate,
             scalar_call: None,
+            aggregate_call: None,
+            window_call: None,
         }
     }
 
@@ -104,6 +149,22 @@ impl FunctionSupport {
     #[must_use]
     pub fn with_scalar_call_support(mut self, scalar_call: ScalarCallSupport) -> Self {
         self.scalar_call = Some(scalar_call);
+        self
+    }
+
+    /// Adds a per-call check, consulted for every aggregate call the name-based
+    /// restriction allows. See [`AggregateCallSupport`].
+    #[must_use]
+    pub fn with_aggregate_call_support(mut self, aggregate_call: AggregateCallSupport) -> Self {
+        self.aggregate_call = Some(aggregate_call);
+        self
+    }
+
+    /// Adds a per-call check, consulted for every window call the name-based
+    /// restriction allows. See [`WindowCallSupport`].
+    #[must_use]
+    pub fn with_window_call_support(mut self, window_call: WindowCallSupport) -> Self {
+        self.window_call = Some(window_call);
         self
     }
 
@@ -126,6 +187,8 @@ impl FunctionSupport {
             window,
             aggregate,
             scalar_call: None,
+            aggregate_call: None,
+            window_call: None,
         }
     }
 
@@ -148,6 +211,8 @@ impl FunctionSupport {
             window,
             aggregate,
             scalar_call: None,
+            aggregate_call: None,
+            window_call: None,
         }
     }
 
@@ -158,13 +223,18 @@ impl FunctionSupport {
                 Expr::ScalarFunction(call) => {
                     self.supports_scalar(&call.func) && self.supports_scalar_call(call)
                 }
-                Expr::AggregateFunction(AggregateFunction { func, .. }) => {
-                    self.supports_aggregate(func)
+                Expr::AggregateFunction(call) => {
+                    self.supports_aggregate(&call.func) && self.supports_aggregate_call(call)
                 }
-                Expr::WindowFunction(wind) => match &wind.fun {
-                    WindowFunctionDefinition::AggregateUDF(func) => self.supports_aggregate(func),
-                    WindowFunctionDefinition::WindowUDF(func) => self.supports_window(func),
-                },
+                Expr::WindowFunction(wind) => {
+                    let name_ok = match &wind.fun {
+                        WindowFunctionDefinition::AggregateUDF(func) => {
+                            self.supports_aggregate(func)
+                        }
+                        WindowFunctionDefinition::WindowUDF(func) => self.supports_window(func),
+                    };
+                    name_ok && self.supports_window_call(wind)
+                }
                 _ => true,
             };
             if !support_child {
@@ -187,6 +257,26 @@ impl FunctionSupport {
     /// say about call shapes behaves exactly as before.
     pub fn supports_scalar_call(&self, call: &ScalarFunction) -> bool {
         self.scalar_call
+            .as_ref()
+            .map(|supports| supports(call))
+            .unwrap_or(true)
+    }
+
+    /// Whether the backend can evaluate this particular aggregate call. `true`
+    /// when no per-call check is installed, so a backend that has nothing to say
+    /// about call shapes behaves exactly as before.
+    pub fn supports_aggregate_call(&self, call: &AggregateFunction) -> bool {
+        self.aggregate_call
+            .as_ref()
+            .map(|supports| supports(call))
+            .unwrap_or(true)
+    }
+
+    /// Whether the backend can evaluate this particular window call. `true` when
+    /// no per-call check is installed, so a backend that has nothing to say about
+    /// window shapes behaves exactly as before.
+    pub fn supports_window_call(&self, call: &WindowFunction) -> bool {
+        self.window_call
             .as_ref()
             .map(|supports| supports(call))
             .unwrap_or(true)
@@ -279,6 +369,15 @@ mod tests {
                     .skip(1)
                     .all(|arg| matches!(arg, Expr::Literal(_, _)))
             },
+        ))
+    }
+
+    /// A `FunctionSupport` that allows every name but refuses a `count` call
+    /// carrying a `FILTER` — the shape a dialect with no `FILTER` clause has to
+    /// rewrite, and cannot rewrite for every aggregate.
+    fn unfiltered_aggregate_support() -> FunctionSupport {
+        FunctionSupport::new(None, None, None).with_aggregate_call_support(Arc::new(
+            |call: &AggregateFunction| call.func.name() != "count" || call.params.filter.is_none(),
         ))
     }
 
@@ -513,6 +612,107 @@ mod tests {
         assert!(
             contains_unsupported_functions(&outer, &sup).expect("check"),
             "should detect denied function inside EXISTS subquery"
+        );
+    }
+
+    /// A per-call aggregate check refuses only the shapes it names, so an
+    /// aggregate whose name is allowed and whose shape it has no opinion about
+    /// still federates.
+    #[test]
+    fn an_aggregate_call_check_refuses_only_the_shape_it_names() {
+        let bare = projection_of(datafusion::functions_aggregate::expr_fn::count(col("val")));
+        assert!(
+            !contains_unsupported_functions(&bare, &unfiltered_aggregate_support()).expect("check"),
+            "an unfiltered count is a shape the check allows, so it federates"
+        );
+
+        let filtered = projection_of({
+            use datafusion::logical_expr::ExprFunctionExt as _;
+            datafusion::functions_aggregate::expr_fn::count(col("val"))
+                .filter(col("val").is_not_null())
+                .build()
+                .expect("filtered count")
+        });
+        assert!(
+            contains_unsupported_functions(&filtered, &unfiltered_aggregate_support())
+                .expect("check"),
+            "a filtered count is the shape the check refuses, so it stays local"
+        );
+    }
+
+    /// With no per-call aggregate check installed, every aggregate the name
+    /// restriction allows still federates — the hook is additive.
+    #[test]
+    fn no_aggregate_call_check_leaves_every_allowed_aggregate_federating() {
+        let filtered = projection_of({
+            use datafusion::logical_expr::ExprFunctionExt as _;
+            datafusion::functions_aggregate::expr_fn::count(col("val"))
+                .filter(col("val").is_not_null())
+                .build()
+                .expect("filtered count")
+        });
+        assert!(
+            !contains_unsupported_functions(&filtered, &FunctionSupport::new(None, None, None))
+                .expect("check"),
+            "without a per-call check the shape is irrelevant"
+        );
+    }
+
+    /// A windowed `count`, with or without a `FILTER`.
+    fn windowed_count(filter: Option<Expr>) -> Expr {
+        Expr::from(WindowFunction {
+            fun: WindowFunctionDefinition::AggregateUDF(
+                datafusion::functions_aggregate::count::count_udaf(),
+            ),
+            params: datafusion::logical_expr::expr::WindowFunctionParams {
+                args: vec![col("val")],
+                partition_by: vec![col("id")],
+                order_by: vec![],
+                window_frame: datafusion::logical_expr::WindowFrame::new(None),
+                null_treatment: None,
+                filter: filter.map(Box::new),
+                distinct: false,
+            },
+        })
+    }
+
+    /// The window arm consults its own per-call check, so a shape an engine
+    /// cannot express is refused there too.
+    ///
+    /// Without this the aggregate check is trivially bypassed: writing the same
+    /// aggregate as `COUNT(x) FILTER (WHERE p) OVER (…)` reaches the window arm,
+    /// which only ever checked the *name*. Measured against a real BigQuery
+    /// project, that federated as-written and came back
+    /// `Syntax error: Expected ")" but got "("` — BigQuery has no `FILTER`
+    /// clause in a window either.
+    #[test]
+    fn a_window_call_check_refuses_the_shape_the_engine_cannot_express() {
+        let support = FunctionSupport::new(None, None, None).with_window_call_support(Arc::new(
+            |call: &WindowFunction| call.params.filter.is_none(),
+        ));
+
+        let filtered = projection_of(windowed_count(Some(col("val").is_not_null())));
+        assert!(
+            contains_unsupported_functions(&filtered, &support).expect("check"),
+            "a filtered window call is the shape the check refuses"
+        );
+
+        let unfiltered = projection_of(windowed_count(None));
+        assert!(
+            !contains_unsupported_functions(&unfiltered, &support).expect("check"),
+            "an unfiltered window call is untouched by the check"
+        );
+    }
+
+    /// With no per-call window check installed, every window call the name
+    /// restriction allows still federates — the hook is additive.
+    #[test]
+    fn no_window_call_check_leaves_every_allowed_window_call_federating() {
+        let filtered = projection_of(windowed_count(Some(col("val").is_not_null())));
+        assert!(
+            !contains_unsupported_functions(&filtered, &FunctionSupport::new(None, None, None))
+                .expect("check"),
+            "without a per-call check the window shape is irrelevant"
         );
     }
 }
