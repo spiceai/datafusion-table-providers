@@ -100,6 +100,7 @@ impl<T, P> DuckDBTable<T, P> {
             sql,
             self.table_functions.clone(),
             self.base_table.dialect_arc(),
+            self.indexes.clone(),
         )?))
     }
 }
@@ -174,13 +175,14 @@ impl<T: 'static, P: 'static> DuckSqlExec<T, P> {
         sql: String,
         table_functions: Option<HashMap<String, String>>,
         dialect: Arc<dyn Dialect + Send + Sync>,
+        indexes: Vec<(ColumnReference, IndexType)>,
     ) -> DataFusionResult<Self> {
         let base_exec = SqlExec::new(projection, schema, pool, sql, dialect)?;
 
         Ok(Self {
             base_exec,
             table_functions,
-            indexes: Vec::new(),
+            indexes,
             optimized_sql: None,
             optimized_sql_schema: None,
             optimized_sql_properties: None,
@@ -418,5 +420,67 @@ pub(crate) fn get_cte(table_functions: &Option<HashMap<String, String>>) -> Stri
         format!("WITH {inner} ")
     } else {
         String::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::duckdb::DynDuckDbConnectionPool;
+    use crate::sql::db_connection_pool::dbconnection::duckdbconn::DuckDBParameter;
+    use crate::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::prelude::SessionContext;
+    use duckdb::DuckdbConnectionManager;
+
+    /// `DuckSqlExec::indexes()` is what the intermediate index materialization
+    /// optimizer rule reads to decide whether it can rewrite a scan. The list has
+    /// twice been dropped by refactors that kept the field and defaulted it to
+    /// empty, which silently disables the rule, so pin the wiring here.
+    #[tokio::test]
+    async fn scan_propagates_indexes_to_exec() {
+        let pool: Arc<DynDuckDbConnectionPool> =
+            Arc::new(DuckDbConnectionPool::new_memory().expect("memory pool"));
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, false),
+        ]));
+
+        let indexes = vec![(
+            ColumnReference::try_from("b").expect("column reference"),
+            IndexType::Enabled,
+        )];
+
+        let table = DuckDBTable::new_with_schema(
+            &pool,
+            Arc::clone(&schema),
+            TableReference::bare("t"),
+            None,
+            None,
+            None,
+            None,
+            indexes,
+        );
+
+        let ctx = SessionContext::new();
+        let plan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan builds a plan");
+
+        let plan_any: &dyn std::any::Any = plan.as_ref();
+        let exec = plan_any
+            .downcast_ref::<DuckSqlExec<
+                r2d2::PooledConnection<DuckdbConnectionManager>,
+                DuckDBParameter,
+            >>()
+            .expect("scan returns a DuckSqlExec");
+
+        assert_eq!(
+            exec.indexes().len(),
+            1,
+            "the table's indexes must reach the exec node, or the optimizer rule cannot fire"
+        );
     }
 }
