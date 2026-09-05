@@ -7,6 +7,7 @@ use std::sync::Arc;
 use datafusion::{
     catalog::Session,
     common::tree_node::{TreeNode, TreeNodeRecursion},
+    common::DFSchema,
     error::DataFusionError,
     logical_expr::{
         expr::{AggregateFunction, ScalarFunction, WindowFunction},
@@ -30,9 +31,10 @@ pub fn contains_unsupported_functions(
 ) -> Result<bool, DataFusionError> {
     let mut found_unsupported = false;
     plan.apply_with_subqueries(|plan| {
+        let schema = expression_scope(plan);
         for expr in plan.expressions() {
             expr.apply(|expr| {
-                if sup.supports(expr) {
+                if sup.supports(expr, schema.as_deref()) {
                     Ok(TreeNodeRecursion::Continue)
                 } else {
                     found_unsupported = true;
@@ -46,6 +48,33 @@ pub fn contains_unsupported_functions(
         Ok(TreeNodeRecursion::Continue)
     })?;
     Ok(found_unsupported)
+}
+
+/// The schema a node's expressions resolve against.
+///
+/// **Not** `plan.schema()`. That is the node's *output* schema: a `Projection`
+/// computing `f(doc)` has only the result in it, and looking `doc` up there
+/// fails. An expression resolves against the node's **inputs**, so those are
+/// what a per-call check needs to read an operand's type.
+///
+/// `None` means the type cannot be proven here — a leaf with no inputs, or a
+/// join whose sides cannot be merged. A check that depends on the type must
+/// treat that as "unknown" and take the safe branch rather than guess; for a
+/// rendering that is only correct for one of two column types, the safe branch
+/// is to refuse the call and let the local engine evaluate it.
+fn expression_scope(plan: &LogicalPlan) -> Option<Arc<DFSchema>> {
+    let inputs = plan.inputs();
+    match inputs.as_slice() {
+        [] => None,
+        [only] => Some(Arc::clone(only.schema())),
+        many => {
+            let mut merged = DFSchema::empty();
+            for input in many {
+                merged = merged.join(input.schema()).ok()?;
+            }
+            Some(Arc::new(merged))
+        }
+    }
 }
 
 /// Whether a backend can evaluate *this call* of a scalar function its
@@ -64,7 +93,14 @@ pub fn contains_unsupported_functions(
 /// translate, so those are left for the local engine to evaluate instead. It is
 /// consulted for every scalar call the name check allows, so an implementation
 /// returns `true` for the functions it has no opinion about.
-pub type ScalarCallSupport = Arc<dyn Fn(&ScalarFunction) -> bool + Send + Sync>;
+///
+/// The schema is the one the call's arguments resolve against — see
+/// [`expression_scope`] — and is `None` where the type cannot be proven. A
+/// backend whose rendering depends on an operand's type must refuse on `None`
+/// rather than assume one: for a document that is a native JSON column in one
+/// engine and a string in another, guessing wrong is a wrong answer, and
+/// refusing only costs the pushdown.
+pub type ScalarCallSupport = Arc<dyn Fn(&ScalarFunction, Option<&DFSchema>) -> bool + Send + Sync>;
 
 /// Whether a backend can evaluate *this call* of an aggregate its
 /// [`FunctionRestriction`] already allows.
@@ -216,12 +252,12 @@ impl FunctionSupport {
         }
     }
 
-    pub fn supports(&self, expr: &Expr) -> bool {
+    pub fn supports(&self, expr: &Expr, schema: Option<&DFSchema>) -> bool {
         let mut supports = true;
         let _ = expr.apply(|e| {
             let support_child = match e {
                 Expr::ScalarFunction(call) => {
-                    self.supports_scalar(&call.func) && self.supports_scalar_call(call)
+                    self.supports_scalar(&call.func) && self.supports_scalar_call(call, schema)
                 }
                 Expr::AggregateFunction(call) => {
                     self.supports_aggregate(&call.func) && self.supports_aggregate_call(call)
@@ -255,10 +291,10 @@ impl FunctionSupport {
     /// Whether the backend can evaluate this particular scalar call. `true`
     /// when no per-call check is installed, so a backend that has nothing to
     /// say about call shapes behaves exactly as before.
-    pub fn supports_scalar_call(&self, call: &ScalarFunction) -> bool {
+    pub fn supports_scalar_call(&self, call: &ScalarFunction, schema: Option<&DFSchema>) -> bool {
         self.scalar_call
             .as_ref()
-            .map(|supports| supports(call))
+            .map(|supports| supports(call, schema))
             .unwrap_or(true)
     }
 
@@ -355,12 +391,61 @@ mod tests {
             .expect("build")
     }
 
+    /// The scope handed to a per-call check is the one the call's arguments
+    /// resolve against, so a backend can read an operand's declared type.
+    ///
+    /// This is the whole point of passing a schema, and it is easy to get
+    /// wrong: `plan.schema()` is a `Projection`'s *output*, which holds only the
+    /// computed result — looking the argument's column up there fails, every
+    /// call looks unprovable, and a check that refuses on an unknown type
+    /// silently refuses everything. Asserting the column resolves is what
+    /// separates "the schema arrived" from "a schema arrived".
+    #[test]
+    fn the_scope_resolves_the_arguments_not_the_projected_output() {
+        use datafusion::logical_expr::ExprSchemable as _;
+        use std::sync::Mutex;
+
+        // What the check saw, recorded so the assertions can be made outside it.
+        let seen: Arc<Mutex<Vec<(bool, Option<DataType>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+
+        let support = FunctionSupport::new(None, None, None).with_scalar_call_support(Arc::new(
+            move |call: &ScalarFunction, schema: Option<&DFSchema>| {
+                let resolved = schema
+                    .and_then(|schema| call.args.first().and_then(|arg| arg.get_type(schema).ok()));
+                recorder
+                    .lock()
+                    .expect("record what the check saw")
+                    .push((schema.is_some(), resolved));
+                true
+            },
+        ));
+
+        let plan = projection_of(call("any_fn", vec![col("val")]));
+        assert!(
+            !contains_unsupported_functions(&plan, &support).expect("walk the plan"),
+            "the check allows everything; this is about what it was handed"
+        );
+
+        let seen = seen.lock().expect("read what the check saw");
+        assert!(!seen.is_empty(), "the per-call check has to be consulted");
+        assert!(
+            seen.iter().all(|(had_schema, _)| *had_schema),
+            "every call must be handed a scope, not None"
+        );
+        assert!(
+            seen.iter().any(|(_, resolved)| resolved.is_some()),
+            "the argument's column has to resolve against the scope — if this \
+             fails the output schema was passed instead of the input's"
+        );
+    }
+
     /// A `FunctionSupport` that allows every name but refuses calls of
     /// `carved_out_fn` whose second argument is not a literal — the shape a
     /// dialect that rewrites a literal path can translate.
     fn literal_argument_support() -> FunctionSupport {
         FunctionSupport::new(None, None, None).with_scalar_call_support(Arc::new(
-            |call: &ScalarFunction| {
+            |call: &ScalarFunction, _: Option<&DFSchema>| {
                 if call.func.name() != "carved_out_fn" {
                     return true;
                 }
@@ -442,7 +527,7 @@ mod tests {
             None,
             None,
         )
-        .with_scalar_call_support(Arc::new(|_: &ScalarFunction| true));
+        .with_scalar_call_support(Arc::new(|_: &ScalarFunction, _: Option<&DFSchema>| true));
         let plan = projection_of(call(
             "denied_fn",
             vec![col("val"), Expr::Literal(ScalarValue::from("key"), None)],
