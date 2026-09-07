@@ -340,6 +340,12 @@ impl<T, P> TableProvider for SqlTable<T, P> {
         let dialect = self.dialect_arc();
         let unparser = Unparser::new(dialect.as_ref());
 
+        // A filter here resolves against the table's own schema, which is also
+        // what carries the source-declared column metadata a per-call check may
+        // need. `None` would be safe but pessimistic: a check that refuses on an
+        // unknown type would drop every such filter from the pushdown.
+        let scope = datafusion::common::DFSchema::try_from(self.schema()).ok();
+
         let filter_push_down: Vec<TableProviderFilterPushDown> = filters
             .iter()
             .map(|f| {
@@ -357,7 +363,7 @@ impl<T, P> TableProvider for SqlTable<T, P> {
                 if self
                     .function_support
                     .as_ref()
-                    .is_some_and(|func_support| !func_support.supports(f))
+                    .is_some_and(|func_support| !func_support.supports(f, scope.as_ref()))
                 {
                     return TableProviderFilterPushDown::Unsupported;
                 }
