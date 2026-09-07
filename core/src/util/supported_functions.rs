@@ -406,7 +406,7 @@ mod tests {
         use std::sync::Mutex;
 
         // What the check saw, recorded so the assertions can be made outside it.
-        let seen: Arc<Mutex<Vec<(bool, Option<DataType>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
         let recorder = Arc::clone(&seen);
 
         let support = FunctionSupport::new(None, None, None).with_scalar_call_support(Arc::new(
