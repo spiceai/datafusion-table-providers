@@ -41,7 +41,7 @@ arrow-json = "58.0"
 arrow-odbc = { version = "23.1" }
 datafusion = { version = "54.0", default-features = false }
 datafusion-expr = { version = "54.0" }
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "7c2ee8e8c599b0b12267694d1e4800ecbcfa57f0" } # branch: bjchambers/recursive-cte-work-table-is-neutral (spiceai/datafusion-federation#84; contains merged #83)
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "99391738a84c6e1dcde8e3f4fb57eabb2ec3d9a1" } # branch: spiceai-54 (spiceai/datafusion-federation#84)
 datafusion-ffi = { version = "54.0" }
 datafusion-proto = { version = "54.0" }
 datafusion-physical-expr = { version = "54.0" }
