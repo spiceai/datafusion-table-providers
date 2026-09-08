@@ -602,3 +602,85 @@ mod sort_limit_pushdown {
         assert_eq!(total, 7, "LIMIT without ORDER BY must still cap rows");
     }
 }
+
+/// Regression tests for empty-projection scans (`COUNT(*)` / `COUNT(1)`) on the
+/// non-federated SQLite scan path. See the DuckDB counterpart for the full
+/// explanation of the underlying plan-schema mismatch this guards against.
+mod empty_projection {
+    use super::*;
+    use datafusion::arrow::array::Int64Array;
+
+    async fn setup_orders(ctx: &SessionContext, name: &str) {
+        let factory = SqliteTableProviderFactory::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("amount", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(datafusion::arrow::array::Float64Array::from(vec![
+                    1.5, 2.5, 3.5,
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let cmd = CreateExternalTable {
+            schema: Arc::new(batch.schema().to_dfschema().unwrap()),
+            name: name.into(),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: false,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::from([("mode".to_string(), "memory".to_string())]),
+            constraints: Constraints::default(),
+            column_defaults: HashMap::new(),
+            temporary: false,
+        };
+        let table = factory.create(&ctx.state(), &cmd).await.unwrap();
+        let mem = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+            &[vec![batch.clone()]],
+            batch.schema(),
+            None,
+        )
+        .unwrap();
+        let insert = table
+            .insert_into(&ctx.state(), mem, InsertOp::Append)
+            .await
+            .unwrap();
+        let _ = collect(insert, ctx.task_ctx()).await.unwrap();
+        ctx.register_table(name, table).unwrap();
+    }
+
+    async fn count_of(ctx: &SessionContext, sql: &str) -> i64 {
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count column is Int64")
+            .value(0)
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn count_star_and_count_one_empty_projection() {
+        let ctx = SessionContext::new();
+        setup_orders(&ctx, "orders").await;
+
+        assert_eq!(count_of(&ctx, "SELECT count(1) AS n FROM orders").await, 3);
+        assert_eq!(count_of(&ctx, "SELECT count(*) AS n FROM orders").await, 3);
+        assert_eq!(
+            count_of(&ctx, "SELECT count(*) AS n FROM orders WHERE id > 1").await,
+            2
+        );
+        assert_eq!(count_of(&ctx, "SELECT count(id) AS n FROM orders").await, 3);
+    }
+}
