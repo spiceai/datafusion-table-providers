@@ -1491,6 +1491,31 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_microsecond_insert_preserves_fraction_and_offset() {
+        for (timezone, expected) in [
+            ("UTC", "1970-01-01 00:00:00.123456 +00:00"),
+            ("Asia/Seoul", "1970-01-01 09:00:00.123456 +09:00"),
+            ("America/Los_Angeles", "1969-12-31 16:00:00.123456 -08:00"),
+        ] {
+            let values = array::TimestampMicrosecondArray::from(vec![Some(123_456), None])
+                .with_timezone(timezone);
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                values.data_type().clone(),
+                true,
+            )]));
+            let batches = vec![RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap()];
+            let sql = InsertBuilder::new(&TableReference::from("timestamps"), &batches)
+                .build_postgres(None)
+                .unwrap();
+            assert_eq!(
+                sql,
+                format!("INSERT INTO \"timestamps\" (\"ts\") VALUES ('{expected}'), (NULL)")
+            );
+        }
+    }
+
+    #[test]
     fn test_table_insertion() {
         let schema1 = Schema::new(vec![
             Field::new("id", DataType::Int32, false),

@@ -5777,7 +5777,7 @@ checksum = "c1257cd4248b4132760d6524d6dda4e053bc648c9070b960929bf50cfb1e7add"
 [[package]]
 name = "sea-query"
 version = "0.32.0-rc.1"
-source = "git+https://github.com/spiceai/sea-query.git?rev=213b6b876068f58159ebdd5852604a021afaebf9#213b6b876068f58159ebdd5852604a021afaebf9"
+source = "git+https://github.com/spiceai/sea-query.git?rev=b18fecfa59c5e5742c81e16f58eef6ae18e95e0d#b18fecfa59c5e5742c81e16f58eef6ae18e95e0d"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -5790,7 +5790,7 @@ dependencies = [
 [[package]]
 name = "sea-query-derive"
 version = "0.4.1"
-source = "git+https://github.com/spiceai/sea-query.git?rev=213b6b876068f58159ebdd5852604a021afaebf9#213b6b876068f58159ebdd5852604a021afaebf9"
+source = "git+https://github.com/spiceai/sea-query.git?rev=b18fecfa59c5e5742c81e16f58eef6ae18e95e0d#b18fecfa59c5e5742c81e16f58eef6ae18e95e0d"
 dependencies = [
  "heck 0.4.1",
  "proc-macro2",

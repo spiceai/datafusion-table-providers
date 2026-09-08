@@ -86,7 +86,7 @@ fundu = "2.0.1"
 geo-types = "0.7.13"
 sha2 = "0.10"
 hickory-resolver = "0.26"
-sea-query = { git = "https://github.com/spiceai/sea-query.git", rev = "213b6b876068f58159ebdd5852604a021afaebf9", features = [
+sea-query = { git = "https://github.com/spiceai/sea-query.git", rev = "b18fecfa59c5e5742c81e16f58eef6ae18e95e0d", features = [
   "backend-sqlite",
   "backend-postgres",
   "postgres-array",
