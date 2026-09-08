@@ -376,11 +376,9 @@ where
                 match stmt.execute_schema() {
                     Ok(s) => schema = s.into(),
                     // not all drivers implement execute_schema, so fall back to executing
-                    // with LIMIT 0 to get the schema.
+                    // a row-free form of the query to get the schema.
                     Err(_) => {
-                        stmt.set_sql_query(format!(
-                            "WITH fetch_schema AS ({sql}) SELECT * FROM fetch_schema LIMIT 0"
-                        ))?;
+                        stmt.set_sql_query(schema_probe_query(sql))?;
                         let result = stmt
                             .execute()
                             .boxed()
@@ -519,6 +517,84 @@ where
     }
 }
 
+/// How a query whose schema is wanted can be made to return no rows.
+#[derive(Debug, PartialEq, Eq)]
+enum SchemaProbe {
+    /// Wrap the query in a CTE that is then selected from with `LIMIT 0`.
+    Wrap,
+    /// Append `LIMIT 0` to the query itself.
+    AppendLimit,
+    /// Run the query unchanged; it already bounds its own row count.
+    AsIs,
+}
+
+/// Picks how to ask a driver for a query's schema without materialising it.
+///
+/// Wrapping is the general form, but it is not always legal: `WITH RECURSIVE`
+/// is only allowed at the top level of a `BigQuery` statement, so wrapping a
+/// recursive query turns valid SQL into a syntax error. A query that opens its
+/// own `WITH` therefore keeps its text — and its CTE's position — and takes the
+/// row limit at the end instead, or runs unchanged when it already has one.
+///
+/// Decided on the text rather than by parsing it. A leading `WITH` is
+/// unambiguous — nothing may precede it, so no literal or comment can spell one
+/// — and parsing is both a needless second pass over every federated statement
+/// and, measured on a 6.8 KB generated one, deep enough to overflow the stack
+/// of the thread this runs on.
+fn schema_probe_for(sql: &str) -> SchemaProbe {
+    let sql = sql.trim_start();
+    if !starts_with_keyword(sql, "WITH") {
+        return SchemaProbe::Wrap;
+    }
+    if ends_with_row_limit(sql) {
+        SchemaProbe::AsIs
+    } else {
+        SchemaProbe::AppendLimit
+    }
+}
+
+/// Whether `sql` opens with `keyword` as a word of its own.
+fn starts_with_keyword(sql: &str, keyword: &str) -> bool {
+    let Some(rest) = sql.get(..keyword.len()) else {
+        return false;
+    };
+    if !rest.eq_ignore_ascii_case(keyword) {
+        return false;
+    }
+    // A statement that is only the keyword is not one we can reason about.
+    sql[keyword.len()..]
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_whitespace() || c == '(')
+}
+
+/// Whether `sql` already bounds its own rows, so a `LIMIT` cannot be appended.
+///
+/// Conservative: anything that is not plainly free of a trailing limit is
+/// treated as having one, which costs an unbounded schema fetch rather than a
+/// statement the remote refuses to parse.
+fn ends_with_row_limit(sql: &str) -> bool {
+    let tail = sql.trim_end().to_ascii_uppercase();
+    let tail = tail
+        .rsplit_once(')')
+        .map_or(tail.as_str(), |(_, after)| after);
+    ["LIMIT", "OFFSET", "FETCH"]
+        .iter()
+        .any(|keyword| tail.contains(keyword))
+}
+
+/// Builds the query to execute to learn the schema of `sql` without returning
+/// its rows. See [`schema_probe_for`].
+fn schema_probe_query(sql: &str) -> String {
+    match schema_probe_for(sql) {
+        SchemaProbe::Wrap => {
+            format!("WITH fetch_schema AS ({sql}) SELECT * FROM fetch_schema LIMIT 0")
+        }
+        SchemaProbe::AppendLimit => format!("{sql}\nLIMIT 0"),
+        SchemaProbe::AsIs => sql.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,6 +607,100 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Condvar;
     use std::time::{Duration, Instant};
+
+    /// A query with no CTE of its own is wrapped, as it always was.
+    #[test]
+    fn a_plain_query_is_wrapped_to_fetch_its_schema() {
+        assert_eq!(
+            schema_probe_query("SELECT `a` FROM `t`"),
+            "WITH fetch_schema AS (SELECT `a` FROM `t`) SELECT * FROM fetch_schema LIMIT 0"
+        );
+    }
+
+    /// Wrapping a recursive query is a syntax error on `BigQuery`, which allows
+    /// `WITH RECURSIVE` only at the top level, so the limit goes at the end and
+    /// the query text is left alone.
+    #[test]
+    fn a_query_with_its_own_cte_keeps_its_text_and_takes_a_trailing_limit() {
+        let sql = "WITH RECURSIVE `grid` AS ((SELECT 0 AS `n`) UNION ALL \
+                   (SELECT `n` + 1 FROM `grid` WHERE `n` < 9)) SELECT * FROM `grid`";
+
+        let probe = schema_probe_query(sql);
+
+        assert_eq!(probe, format!("{sql}\nLIMIT 0"));
+        assert!(
+            probe.starts_with("WITH RECURSIVE"),
+            "the recursive CTE left the top level: {probe}"
+        );
+    }
+
+    /// A non-recursive `WITH` takes the same path: the parser cannot tell what
+    /// the remote will accept nested, so no query that opens a `WITH` is wrapped.
+    #[test]
+    fn a_non_recursive_cte_is_also_not_wrapped() {
+        assert_eq!(
+            schema_probe_for("WITH `x` AS (SELECT 1 AS `n`) SELECT * FROM `x`"),
+            SchemaProbe::AppendLimit
+        );
+    }
+
+    /// A second `LIMIT` would not parse, so a query that already limits itself
+    /// runs unchanged — it is bounded already.
+    #[test]
+    fn a_cte_query_that_already_limits_itself_runs_unchanged() {
+        let sql = "WITH `x` AS (SELECT 1 AS `n`) SELECT * FROM `x` LIMIT 5";
+        assert_eq!(schema_probe_for(sql), SchemaProbe::AsIs);
+        assert_eq!(schema_probe_query(sql), sql);
+    }
+
+    /// A trailing `ORDER BY` still leaves room for the limit.
+    #[test]
+    fn an_ordered_cte_query_takes_a_trailing_limit() {
+        assert_eq!(
+            schema_probe_for("WITH `x` AS (SELECT 1 AS `n`) SELECT * FROM `x` ORDER BY `n`"),
+            SchemaProbe::AppendLimit
+        );
+    }
+
+    /// A `WITH` that is only the tail of a longer word is not a CTE.
+    #[test]
+    fn a_word_beginning_with_with_is_not_a_cte() {
+        assert_eq!(
+            schema_probe_for("WITHDRAWN SELECT 1"),
+            SchemaProbe::Wrap,
+            "`WITHDRAWN` is not a `WITH` clause"
+        );
+        assert_eq!(schema_probe_for("WITH"), SchemaProbe::Wrap);
+    }
+
+    /// The real statement that motivated this: a 6.8 KB generated recursive
+    /// query. The first version of this check parsed the SQL to make the same
+    /// decision and overflowed the stack of the thread it ran on, so the wrapper
+    /// went back on and the statement was refused by the remote as before.
+    #[test]
+    fn a_large_generated_recursive_statement_is_not_wrapped() {
+        let sql = format!(
+            "WITH RECURSIVE `g` AS ((SELECT 0 AS `n`) UNION ALL \
+             (SELECT `g`.`n` + 1 FROM `g` WHERE `g`.`n` < 720)) SELECT {} FROM `g`",
+            (0..400)
+                .map(|i| format!("CASE WHEN `g`.`n` = {i} THEN {i} ELSE 0 END AS `c{i}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        assert!(sql.len() > 6_000, "the statement under test got smaller");
+        assert_eq!(schema_probe_for(&sql), SchemaProbe::AppendLimit);
+        assert!(schema_probe_query(&sql).starts_with("WITH RECURSIVE"));
+    }
+
+    /// Leading whitespace does not hide the `WITH`.
+    #[test]
+    fn leading_whitespace_does_not_hide_the_cte() {
+        assert_eq!(
+            schema_probe_for("\n  WITH `x` AS (SELECT 1 AS `n`) SELECT * FROM `x`"),
+            SchemaProbe::AppendLimit
+        );
+    }
 
     /// What the fake driver did, so a test can assert on it rather than on
     /// timing alone.
