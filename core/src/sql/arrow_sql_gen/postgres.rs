@@ -279,7 +279,7 @@ macro_rules! append_composite_fields_to_struct {
 ///
 /// A fixed pair keeps the column deterministic and carries every value with up
 /// to 20 decimal places exactly; a value needing more is rounded to it (see
-/// `numeric_coefficient`).
+/// `numeric_text_coefficient`).
 const NUMERIC_UNDECLARED_PRECISION: u8 = 38;
 const NUMERIC_UNDECLARED_SCALE: i8 = 20;
 
@@ -289,70 +289,6 @@ enum NumericFit {
     /// The value needs more digits than the column's precision even after
     /// rounding to its scale.
     PrecisionTooNarrow,
-}
-
-/// The `Decimal128` coefficient of `value` rounded to `precision` and `scale`,
-/// or why it does not fit them.
-///
-/// Deliberately not `Decimal::rescale`. `rust_decimal` holds a 96-bit
-/// coefficient, and rescaling toward a scale whose coefficient will not fit
-/// silently stops at the widest scale that does — leaving a number that is then
-/// read back at the scale the column declares, which is a different number.
-/// Rescaling `1000000000` toward 20 stops at 19, so it reads back as
-/// `100000000`; an 18-digit integer stops at 11 and comes back nine orders of
-/// magnitude out. `i128` spans the whole `Decimal128` range, so shift the
-/// coefficient here instead.
-///
-/// A value can carry more decimal places than `scale` — federation pushes an
-/// aggregate or division expression to Postgres, whose own `NUMERIC`
-/// arithmetic settles on a scale of its own, often wider than the one the
-/// caller's schema already committed to for that column (e.g. `AVG` on a
-/// `NUMERIC(15,2)` column widens the expected scale by a fixed few digits,
-/// while Postgres computes the average to its own, larger scale). Rounding
-/// away the extra digits — half away from zero, at this exact integer
-/// coefficient rather than through `rescale` — reproduces what casting the
-/// value to `NUMERIC(precision, scale)` at the source would have produced, so
-/// it is widening (which can only ever add trailing zeros) that is exact here,
-/// never narrowing.
-fn numeric_coefficient(value: &Decimal, precision: u8, scale: i8) -> Result<i128, NumericFit> {
-    let value_scale = i32::try_from(value.scale()).unwrap_or(i32::MAX);
-    let shift = i32::from(scale) - value_scale;
-    let mantissa = value.mantissa();
-
-    let coefficient = if let Ok(widen) = u32::try_from(shift) {
-        10i128
-            .checked_pow(widen)
-            .and_then(|factor| mantissa.checked_mul(factor))
-            .ok_or(NumericFit::PrecisionTooNarrow)?
-    } else {
-        // The column holds fewer decimal places than the value carries — a
-        // negative scale holds none at all and counts trailing zeros instead,
-        // so `NUMERIC(2, -3)` stores `12000` as the coefficient `12`. Round to
-        // the nearest multiple of the divisor rather than requiring an exact
-        // one, so a value that merely carries more precision than the column
-        // declares is still represented — just at the precision the column
-        // actually has room for.
-        let divisor = 10i128
-            .checked_pow(shift.unsigned_abs())
-            .ok_or(NumericFit::PrecisionTooNarrow)?;
-        let truncated = mantissa / divisor;
-        let remainder = mantissa % divisor;
-        let round_away_from_zero =
-            remainder.unsigned_abs().saturating_mul(2) >= divisor.unsigned_abs();
-        if round_away_from_zero {
-            truncated + mantissa.signum()
-        } else {
-            truncated
-        }
-    };
-
-    let limit = 10u128
-        .checked_pow(u32::from(precision))
-        .ok_or(NumericFit::PrecisionTooNarrow)?;
-    if coefficient.unsigned_abs() >= limit {
-        return Err(NumericFit::PrecisionTooNarrow);
-    }
-    Ok(coefficient)
 }
 
 /// Converts Postgres `Row`s to an Arrow `RecordBatch`. Assumes that all rows have the same schema and
@@ -1885,15 +1821,20 @@ fn append_numeric_to_destination(
 }
 
 /// The `Decimal128` coefficient of a finite `NumericText` at `precision` and
-/// `scale`, or why it does not fit them — the exact-digits counterpart of
-/// `numeric_coefficient`, with the same contract: widening to the column's
-/// scale is exact, narrowing rounds half away from zero at the exact digits
-/// (what casting to `NUMERIC(precision, scale)` at the source would produce),
-/// and a coefficient of `precision` digits or more is refused. Working from
-/// the digits rather than a `Decimal` means a value wider than `rust_decimal`'s
-/// 28-digit coefficient — a 37-digit `sum` over a `numeric` column, say — lands
-/// on a `Decimal128(38, s)` it fits with every digit intact instead of being
-/// rounded on decode without a word.
+/// `scale`, or why it does not fit them.
+///
+/// Widening to the column's scale is exact (it only appends zeros). Narrowing
+/// rounds half away from zero at the exact digits, which reproduces what
+/// casting the value to `NUMERIC(precision, scale)` at the source would have
+/// produced — and narrowing is routine: federation pushes an aggregate or a
+/// division to Postgres, whose own `NUMERIC` arithmetic settles on a scale of
+/// its own, often wider than the one the plan committed to (`AVG` on a
+/// `NUMERIC(15,2)` column is planned as `Decimal128(38, 6)`, while Postgres
+/// computes it to 16 places). A coefficient of more than `precision` digits is
+/// refused. Working from the digits rather than a `rust_decimal::Decimal` means
+/// a value wider than that type's 28-digit coefficient — a 37-digit `sum` over
+/// a `numeric` column, say — lands on a `Decimal128(38, s)` it fits with every
+/// digit intact instead of being rounded on decode without a word.
 fn numeric_text_coefficient(text: &str, precision: u8, scale: i8) -> Result<i128, NumericFit> {
     let (negative, unsigned) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -2312,51 +2253,6 @@ mod tests {
         let negative_result = Decimal::from_sql(&Type::NUMERIC, negative_raw.as_slice())
             .expect("Failed to run FromSql");
         assert_eq!(negative_result, negative);
-    }
-
-    #[test]
-    fn test_numeric_coefficient_rounds_when_value_has_more_scale_than_column() {
-        // Mirrors AVG/division pushed down to Postgres: the value comes back
-        // with more decimal places than the destination scale (e.g. the
-        // schema already committed to `Decimal128(38, 6)` for an average, but
-        // Postgres computed it to 16 places).
-        let value = Decimal::from_str("24.1234567890123456").expect("valid decimal");
-        let coefficient = numeric_coefficient(&value, 38, 6).expect("rounds instead of refusing");
-        assert_eq!(coefficient, 24_123_457);
-
-        let negative = Decimal::from_str("-24.1234567890123456").expect("valid decimal");
-        let negative_coefficient =
-            numeric_coefficient(&negative, 38, 6).expect("rounds instead of refusing");
-        assert_eq!(negative_coefficient, -24_123_457);
-    }
-
-    #[test]
-    fn test_numeric_coefficient_rounds_half_away_from_zero() {
-        let half_up = Decimal::from_str("1.25").expect("valid decimal");
-        assert_eq!(numeric_coefficient(&half_up, 38, 1).expect("rounds"), 13);
-
-        let half_down = Decimal::from_str("-1.25").expect("valid decimal");
-        assert_eq!(numeric_coefficient(&half_down, 38, 1).expect("rounds"), -13);
-
-        let exact = Decimal::from_str("1.20").expect("valid decimal");
-        assert_eq!(numeric_coefficient(&exact, 38, 1).expect("rounds"), 12);
-    }
-
-    #[test]
-    fn test_numeric_coefficient_rounding_can_still_overflow_precision() {
-        // Rounding `9.99...` up at scale 0 needs a 3-digit coefficient, which
-        // a `NUMERIC(2, 0)` column has no room for.
-        let value = Decimal::from_str("99.9").expect("valid decimal");
-        assert!(matches!(
-            numeric_coefficient(&value, 2, 0),
-            Err(NumericFit::PrecisionTooNarrow)
-        ));
-    }
-
-    #[test]
-    fn test_numeric_coefficient_widens_exactly() {
-        let value = Decimal::from_str("1.5").expect("valid decimal");
-        assert_eq!(numeric_coefficient(&value, 38, 4).expect("widens"), 15_000);
     }
 
     #[test]
