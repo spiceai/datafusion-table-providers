@@ -55,6 +55,16 @@ pub enum Error {
         column_scale: i8,
     },
 
+    #[snafu(display(
+        "Failed to read column '{column}': the value {value} cannot be represented as {target}, the type the query expects for this column. \
+        Cast the expression to a wider type at the source, or declare the column with a type that holds the value."
+    ))]
+    NumericNotRepresentable {
+        column: String,
+        value: String,
+        target: DataType,
+    },
+
     #[snafu(display("Failed to downcast builder for {postgres_type}"))]
     FailedToDowncastBuilder { postgres_type: String },
 
@@ -274,7 +284,7 @@ const NUMERIC_UNDECLARED_PRECISION: u8 = 38;
 const NUMERIC_UNDECLARED_SCALE: i8 = 20;
 
 /// Why a `NUMERIC` value cannot be carried by the column it was read into.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum NumericFit {
     /// The value needs more digits than the column's precision even after
     /// rounding to its scale.
@@ -362,7 +372,8 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
 
     if !rows.is_empty() {
         let row = &rows[0];
-        for column in row.columns() {
+        let column_count = row.columns().len();
+        for (column_index, column) in row.columns().iter().enumerate() {
             let column_name = column.name();
             let column_type = column.type_();
             let projected_json_complex_field =
@@ -375,16 +386,29 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
             let mut numeric_scale: Option<u32> = None;
 
             let mut data_type = if *column_type == Type::NUMERIC {
-                let declared = projected_schema
-                    .as_ref()
-                    .and_then(|schema| get_decimal_column_precision_and_scale(column_name, schema));
-                match declared {
-                    Some((precision, scale)) => {
-                        numeric_scale = Some(u32::try_from(scale).unwrap_or_default());
-                        Some(DataType::Decimal128(precision, scale))
+                let destination = numeric_destination_field(
+                    projected_schema.as_ref(),
+                    column_name,
+                    column_index,
+                    column_count,
+                )
+                .map(Field::data_type);
+                match destination {
+                    Some(DataType::Decimal128(precision, scale)) => {
+                        numeric_scale = Some(u32::try_from(*scale).unwrap_or_default());
+                        Some(DataType::Decimal128(*precision, *scale))
                     }
+                    // The plan has already committed to a type that is not a
+                    // decimal, so produce it directly from the value's own
+                    // digits rather than through a `Decimal128` whose fixed
+                    // precision the value may not fit. See `NumericText` and
+                    // `append_numeric_to_destination`, which reads every
+                    // scalar `NUMERIC` from those digits.
+                    Some(
+                        destination @ (DataType::Float64 | DataType::Float32 | DataType::Int64),
+                    ) => Some(destination.clone()),
                     // Undeclared scale: see `NUMERIC_UNDECLARED_SCALE`.
-                    None => {
+                    _ => {
                         numeric_scale =
                             Some(u32::try_from(NUMERIC_UNDECLARED_SCALE).unwrap_or_default());
                         Some(DataType::Decimal128(
@@ -646,81 +670,14 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                     }
                 }
                 Type::NUMERIC => {
-                    let v: Option<Decimal> = row.try_get(i).context(FailedToGetRowValueSnafu {
-                        pg_type: Type::NUMERIC,
-                    })?;
-                    let scale = {
-                        if let Some(v) = &v {
-                            v.scale()
-                        } else {
-                            0
-                        }
+                    let v: Option<NumericText> =
+                        row.try_get(i).context(FailedToGetRowValueSnafu {
+                            pg_type: Type::NUMERIC,
+                        })?;
+                    let Some(field) = arrow_field.as_ref() else {
+                        return NoArrowFieldForIndexSnafu { index: i }.fail();
                     };
-
-                    let dec_builder = builder.get_or_insert_with(|| {
-                        Box::new(
-                            Decimal128Builder::new()
-                                .with_precision_and_scale(38, scale.try_into().unwrap_or_default())
-                                .unwrap_or_default(),
-                        )
-                    });
-
-                    let Some(dec_builder) =
-                        dec_builder.as_any_mut().downcast_mut::<Decimal128Builder>()
-                    else {
-                        return FailedToDowncastBuilderSnafu {
-                            postgres_type: format!("{postgres_type}"),
-                        }
-                        .fail();
-                    };
-
-                    if arrow_field.is_none() {
-                        let Some(field_name) = column_names.get(i) else {
-                            return NoColumnNameForIndexSnafu { index: i }.fail();
-                        };
-                        let new_arrow_field = Field::new(
-                            field_name,
-                            DataType::Decimal128(38, scale.try_into().unwrap_or_default()),
-                            true,
-                        );
-
-                        *arrow_field = Some(new_arrow_field);
-                    }
-
-                    if postgres_numeric_scale.is_none() {
-                        *postgres_numeric_scale = Some(scale);
-                    };
-
-                    let Some(v) = v else {
-                        dec_builder.append_null();
-                        continue;
-                    };
-
-                    // Every value of the column lands on the one scale the
-                    // column carries — the declared one, or
-                    // `NUMERIC_UNDECLARED_SCALE` when the schema declares none.
-                    // Widening to it is exact; narrowing rounds to it (see
-                    // `numeric_coefficient`).
-                    let column_name = || column_names.get(i).cloned().unwrap_or_default();
-                    // The field is the authority on both: a negative scale
-                    // survives into it (`numeric(2,-3)`), and cannot be carried
-                    // by the unsigned scale tracked for the array path.
-                    let (dest_precision, dest_scale) =
-                        match arrow_field.as_ref().map(Field::data_type) {
-                            Some(DataType::Decimal128(precision, scale)) => (*precision, *scale),
-                            _ => (NUMERIC_UNDECLARED_PRECISION, NUMERIC_UNDECLARED_SCALE),
-                        };
-                    let coefficient = numeric_coefficient(&v, dest_precision, dest_scale).map_err(
-                        |NumericFit::PrecisionTooNarrow| {
-                            NumericValueTooLargeSnafu {
-                                column: column_name(),
-                                column_precision: dest_precision,
-                                column_scale: dest_scale,
-                            }
-                            .build()
-                        },
-                    )?;
-                    dec_builder.append_value(coefficient);
+                    append_numeric_to_destination(builder, i, field, v)?;
                 }
                 Type::NUMERIC_ARRAY => {
                     let v: Option<Vec<Option<Decimal>>> =
@@ -1596,15 +1553,409 @@ impl<'a> FromSql<'a> for GeometryFromSql<'a> {
     }
 }
 
-fn get_decimal_column_precision_and_scale(
+/// The projected field a `NUMERIC` result column is read into.
+///
+/// By position when the projection has exactly one field per result column,
+/// and by name otherwise. Every caller derives the statement and the schema
+/// from one ordered source — `SqlTable::scan` spells its SELECT list out of the
+/// projected fields, and a federated statement is unparsed from the plan whose
+/// schema this is — so when the widths agree the columns line up one-to-one.
+/// Names do not: the unparser emits a bare call, so Postgres names an aggregate
+/// `avg` where the plan names it `avg(hits.UserID)`, and two aggregates over
+/// the same function, or a user alias that happens to spell a bare function
+/// name (`sum(x) AS avg`), collide on it. A name lookup first would bind the
+/// first `avg` to whichever field is *called* `avg`, which is the alias, and
+/// decode a fractional average as the alias's `Int64`.
+fn numeric_destination_field<'a>(
+    projected_schema: Option<&'a SchemaRef>,
     column_name: &str,
-    projected_schema: &SchemaRef,
-) -> Option<(u8, i8)> {
-    let field = projected_schema.field_with_name(column_name).ok()?;
-    match field.data_type() {
-        DataType::Decimal128(precision, scale) => Some((*precision, *scale)),
-        _ => None,
+    column_index: usize,
+    column_count: usize,
+) -> Option<&'a Field> {
+    let schema = projected_schema?;
+    if schema.fields().len() == column_count {
+        return schema.fields().get(column_index).map(Arc::as_ref);
     }
+    schema.field_with_name(column_name).ok()
+}
+
+/// A `NUMERIC` value as the exact decimal digits Postgres sent, before any
+/// representation narrows them.
+///
+/// `rust_decimal` holds a 96-bit coefficient, so a value wider than 28 digits
+/// is rounded on decode without a word — a `numeric` column holds up to 131072
+/// digits before the point, and Postgres's own arithmetic on one (`sum`, a
+/// division) settles on whatever scale it needs. Its float conversion is not
+/// correctly rounded either. A destination that is not `Decimal128` needs
+/// neither loss: `str::parse` rounds the exact digits to the nearest float once,
+/// and an integer either fits `i64` or does not.
+#[derive(Debug, PartialEq, Eq)]
+enum NumericText {
+    /// The value's decimal digits, `-` prefixed when negative, with exactly the
+    /// `dscale` fractional digits Postgres itself would print.
+    Finite(String),
+    NaN,
+    Infinity {
+        negative: bool,
+    },
+}
+
+/// `NumericText`'s wire encoding: a sign word of `0x4000` is negative, and the
+/// three values that carry no digits each have a sign word of their own.
+/// `NUMERIC_DSCALE_MASK` in `numeric.c`: the widest `dscale` Postgres itself
+/// accepts on receive, and the widest it sends — `round(5::numeric, 16383)`
+/// goes out with exactly this scale word, measured on Postgres 16.
+const NUMERIC_MAX_DSCALE: u16 = 0x3FFF;
+const NUMERIC_SIGN_NEGATIVE: u16 = 0x4000;
+const NUMERIC_SIGN_NAN: u16 = 0xC000;
+const NUMERIC_SIGN_POSITIVE_INFINITY: u16 = 0xD000;
+const NUMERIC_SIGN_NEGATIVE_INFINITY: u16 = 0xF000;
+
+impl<'a> FromSql<'a> for NumericText {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        decode_numeric_wire(raw).map_err(Into::into)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::NUMERIC
+    }
+}
+
+/// Decodes Postgres's binary `NUMERIC` (`numeric_send`): `ndigits`, `weight`,
+/// `sign` and `dscale` as 16-bit words, then `ndigits` base-10000 digits, the
+/// first of which is the coefficient of `10000^weight`.
+fn decode_numeric_wire(raw: &[u8]) -> std::result::Result<NumericText, String> {
+    let mut cursor = std::io::Cursor::new(raw);
+    let truncated = |what: &str| format!("the NUMERIC value on the wire ends before its {what}");
+    let ndigits = cursor
+        .read_u16::<BigEndian>()
+        .map_err(|_| truncated("digit count"))?;
+    // Signed: a value below 1 has a negative weight.
+    let weight = cursor
+        .read_i16::<BigEndian>()
+        .map_err(|_| truncated("weight"))?;
+    let sign = cursor
+        .read_u16::<BigEndian>()
+        .map_err(|_| truncated("sign"))?;
+    let dscale = cursor
+        .read_u16::<BigEndian>()
+        .map_err(|_| truncated("scale"))?;
+    // `numeric_recv` refuses the same, so a wider scale is not a value Postgres
+    // sent but a malformed one — and it bounds the text rendered per value.
+    if dscale > NUMERIC_MAX_DSCALE {
+        return Err(format!(
+            "the NUMERIC value on the wire has a display scale of {dscale}, past the {NUMERIC_MAX_DSCALE} Postgres allows"
+        ));
+    }
+
+    let negative = match sign {
+        0 => false,
+        NUMERIC_SIGN_NEGATIVE => true,
+        NUMERIC_SIGN_NAN => return Ok(NumericText::NaN),
+        NUMERIC_SIGN_POSITIVE_INFINITY => return Ok(NumericText::Infinity { negative: false }),
+        NUMERIC_SIGN_NEGATIVE_INFINITY => return Ok(NumericText::Infinity { negative: true }),
+        other => {
+            return Err(format!(
+                "the NUMERIC value on the wire has an unknown sign word {other:#06x}"
+            ))
+        }
+    };
+
+    let mut digits = Vec::with_capacity(usize::from(ndigits));
+    for _ in 0..ndigits {
+        let digit = cursor
+            .read_u16::<BigEndian>()
+            .map_err(|_| truncated("digits"))?;
+        if digit > 9999 {
+            return Err(format!(
+                "the NUMERIC value on the wire has a base-10000 digit of {digit}"
+            ));
+        }
+        digits.push(digit);
+    }
+
+    Ok(NumericText::Finite(render_numeric_text(
+        negative, weight, dscale, &digits,
+    )))
+}
+
+/// Renders the decoded groups the way Postgres's own text output does: every
+/// integer group after the first zero-padded to four digits, and exactly
+/// `dscale` fractional digits, zero-filled past the last stored group.
+fn render_numeric_text(negative: bool, weight: i16, dscale: u16, digits: &[u16]) -> String {
+    // Groups the value does not store are zero: leading ones before the first
+    // stored group when `weight` is negative, trailing ones Postgres trimmed.
+    let group = |index: i32| -> u16 {
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| digits.get(index).copied())
+            .unwrap_or(0)
+    };
+    let push_group = |text: &mut String, value: u16, padded: bool| {
+        let rendered = value.to_string();
+        if padded {
+            text.extend(std::iter::repeat_n(
+                '0',
+                4_usize.saturating_sub(rendered.len()),
+            ));
+        }
+        text.push_str(&rendered);
+    };
+
+    let dscale = usize::from(dscale);
+    let mut text = String::with_capacity(digits.len() * 4 + dscale + 3);
+    if negative {
+        text.push('-');
+    }
+    if weight < 0 {
+        text.push('0');
+    } else {
+        for index in 0..=i32::from(weight) {
+            push_group(&mut text, group(index), index != 0);
+        }
+    }
+    if dscale > 0 {
+        text.push('.');
+        let mut fraction = String::with_capacity(dscale + 4);
+        let mut index = i32::from(weight) + 1;
+        while fraction.len() < dscale {
+            push_group(&mut fraction, group(index), true);
+            index += 1;
+        }
+        fraction.truncate(dscale);
+        text.push_str(&fraction);
+    }
+    text
+}
+
+impl NumericText {
+    /// The nearest `f64`, or `None` for a finite value beyond the type's range.
+    /// Rounding happens once, from the exact digits.
+    fn to_f64(&self) -> Option<f64> {
+        match self {
+            NumericText::Finite(text) => text.parse::<f64>().ok().filter(|v| v.is_finite()),
+            NumericText::NaN => Some(f64::NAN),
+            NumericText::Infinity { negative: false } => Some(f64::INFINITY),
+            NumericText::Infinity { negative: true } => Some(f64::NEG_INFINITY),
+        }
+    }
+
+    /// The nearest `f32`, rounded once from the exact digits rather than
+    /// through `f64`.
+    fn to_f32(&self) -> Option<f32> {
+        match self {
+            NumericText::Finite(text) => text.parse::<f32>().ok().filter(|v| v.is_finite()),
+            NumericText::NaN => Some(f32::NAN),
+            NumericText::Infinity { negative: false } => Some(f32::INFINITY),
+            NumericText::Infinity { negative: true } => Some(f32::NEG_INFINITY),
+        }
+    }
+
+    /// The value truncated toward zero as `i64`, or `None` when its integer
+    /// part is out of range or it is not a number at all.
+    ///
+    /// An `Int64` destination is DataFusion's type for integer arithmetic it
+    /// pushed down — a bare `sum` over integers, but also `sum(x) / count(*)`,
+    /// which DataFusion evaluates as integer division and Postgres answers as
+    /// the exact `numeric` `1.5`. Truncating toward zero is what integer
+    /// division does with that quotient, and what the `Decimal128` → `Int64`
+    /// cast this read replaces did with it, so `1.5` reads as `1` and `-1.5`
+    /// as `-1`. Only a value past `i64` is refused, as the local aggregate
+    /// would refuse it.
+    fn to_i64(&self) -> Option<i64> {
+        let NumericText::Finite(text) = self else {
+            return None;
+        };
+        let integer = text
+            .split_once('.')
+            .map_or(text.as_str(), |(integer, _)| integer);
+        integer.parse::<i64>().ok()
+    }
+}
+
+impl std::fmt::Display for NumericText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NumericText::Finite(text) => f.write_str(text),
+            NumericText::NaN => f.write_str("NaN"),
+            NumericText::Infinity { negative: false } => f.write_str("Infinity"),
+            NumericText::Infinity { negative: true } => f.write_str("-Infinity"),
+        }
+    }
+}
+
+/// Appends a `NUMERIC` value to the builder of a `Float64`, `Float32` or
+/// `Int64` destination field.
+fn append_numeric_to_destination(
+    builder: &mut Option<Box<dyn ArrayBuilder>>,
+    index: usize,
+    field: &Field,
+    value: Option<NumericText>,
+) -> Result<()> {
+    let Some(builder) = builder else {
+        return NoBuilderForIndexSnafu { index }.fail();
+    };
+    let not_representable = |value: &NumericText| {
+        NumericNotRepresentableSnafu {
+            column: field.name().clone(),
+            value: value.to_string(),
+            target: field.data_type().clone(),
+        }
+        .build()
+    };
+    match field.data_type() {
+        DataType::Float64 => {
+            let Some(builder) = builder.as_any_mut().downcast_mut::<Float64Builder>() else {
+                return FailedToDowncastBuilderSnafu {
+                    postgres_type: format!("{}", Type::NUMERIC),
+                }
+                .fail();
+            };
+            match value {
+                Some(value) => {
+                    builder.append_value(value.to_f64().ok_or_else(|| not_representable(&value))?)
+                }
+                None => builder.append_null(),
+            }
+        }
+        DataType::Float32 => {
+            let Some(builder) = builder.as_any_mut().downcast_mut::<Float32Builder>() else {
+                return FailedToDowncastBuilderSnafu {
+                    postgres_type: format!("{}", Type::NUMERIC),
+                }
+                .fail();
+            };
+            match value {
+                Some(value) => {
+                    builder.append_value(value.to_f32().ok_or_else(|| not_representable(&value))?)
+                }
+                None => builder.append_null(),
+            }
+        }
+        DataType::Int64 => {
+            let Some(builder) = builder.as_any_mut().downcast_mut::<Int64Builder>() else {
+                return FailedToDowncastBuilderSnafu {
+                    postgres_type: format!("{}", Type::NUMERIC),
+                }
+                .fail();
+            };
+            match value {
+                Some(value) => {
+                    builder.append_value(value.to_i64().ok_or_else(|| not_representable(&value))?)
+                }
+                None => builder.append_null(),
+            }
+        }
+        DataType::Decimal128(precision, scale) => {
+            let Some(builder) = builder.as_any_mut().downcast_mut::<Decimal128Builder>() else {
+                return FailedToDowncastBuilderSnafu {
+                    postgres_type: format!("{}", Type::NUMERIC),
+                }
+                .fail();
+            };
+            match value {
+                Some(NumericText::Finite(text)) => {
+                    let coefficient = numeric_text_coefficient(&text, *precision, *scale).map_err(
+                        |NumericFit::PrecisionTooNarrow| {
+                            NumericValueTooLargeSnafu {
+                                column: field.name().clone(),
+                                column_precision: *precision,
+                                column_scale: *scale,
+                            }
+                            .build()
+                        },
+                    )?;
+                    builder.append_value(coefficient);
+                }
+                Some(value) => return Err(not_representable(&value)),
+                None => builder.append_null(),
+            }
+        }
+        other => {
+            return FailedToDowncastBuilderSnafu {
+                postgres_type: format!("{} read as {other}", Type::NUMERIC),
+            }
+            .fail();
+        }
+    }
+    Ok(())
+}
+
+/// The `Decimal128` coefficient of a finite `NumericText` at `precision` and
+/// `scale`, or why it does not fit them — the exact-digits counterpart of
+/// `numeric_coefficient`, with the same contract: widening to the column's
+/// scale is exact, narrowing rounds half away from zero at the exact digits
+/// (what casting to `NUMERIC(precision, scale)` at the source would produce),
+/// and a coefficient of `precision` digits or more is refused. Working from
+/// the digits rather than a `Decimal` means a value wider than `rust_decimal`'s
+/// 28-digit coefficient — a 37-digit `sum` over a `numeric` column, say — lands
+/// on a `Decimal128(38, s)` it fits with every digit intact instead of being
+/// rounded on decode without a word.
+fn numeric_text_coefficient(text: &str, precision: u8, scale: i8) -> Result<i128, NumericFit> {
+    let (negative, unsigned) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (integer, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+
+    // The digit string of the coefficient at `scale`, and the digits dropped
+    // below it — the first of those decides the rounding.
+    let (kept, dropped): (String, String) = if scale >= 0 {
+        let scale = usize::from(scale.unsigned_abs());
+        if fraction.len() <= scale {
+            (
+                format!("{integer}{fraction}{}", "0".repeat(scale - fraction.len())),
+                String::new(),
+            )
+        } else {
+            (
+                format!("{integer}{}", &fraction[..scale]),
+                fraction[scale..].to_string(),
+            )
+        }
+    } else {
+        // A negative scale counts trailing integer digits the coefficient
+        // does not carry: `NUMERIC(2, -3)` stores `12000` as `12`.
+        let drop = usize::from(scale.unsigned_abs());
+        if integer.len() <= drop {
+            // Every integer digit is dropped; the ones the value does not
+            // spell are zeros, and they come first — `50` into `(2, -3)` drops
+            // `050`, whose first digit decides the rounding, not the `5`.
+            (String::new(), format!("{integer:0>drop$}{fraction}"))
+        } else {
+            (
+                integer[..integer.len() - drop].to_string(),
+                format!("{}{fraction}", &integer[integer.len() - drop..]),
+            )
+        }
+    };
+
+    let kept = kept.trim_start_matches('0');
+    let mut coefficient: i128 = if kept.is_empty() {
+        0
+    } else {
+        kept.parse().map_err(|_| NumericFit::PrecisionTooNarrow)?
+    };
+    let round_away_from_zero = dropped
+        .as_bytes()
+        .first()
+        .is_some_and(|digit| *digit >= b'5');
+    if round_away_from_zero {
+        coefficient = coefficient
+            .checked_add(1)
+            .ok_or(NumericFit::PrecisionTooNarrow)?;
+    }
+
+    let limit = 10u128
+        .checked_pow(u32::from(precision))
+        .ok_or(NumericFit::PrecisionTooNarrow)?;
+    if coefficient.unsigned_abs() >= limit {
+        return Err(NumericFit::PrecisionTooNarrow);
+    }
+    Ok(if negative { -coefficient } else { coefficient })
 }
 
 fn get_decimal_array_column_precision_and_scale(
@@ -1633,6 +1984,309 @@ mod tests {
     use geo_types::{point, polygon, Geometry};
     use geozero::{CoordDimensions, ToWkb};
     use std::str::FromStr;
+
+    /// Big-endian 16-bit words, the way `numeric_send` lays a value out.
+    fn numeric_wire(words: &[u16]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_be_bytes()).collect()
+    }
+
+    #[test]
+    fn numeric_text_renders_the_digits_postgres_would_print() {
+        // (ndigits, weight, sign, dscale, digits...) and the text Postgres prints for it.
+        let cases: &[(&[u16], &str)] = &[
+            (&[0, 0, 0, 0], "0"),
+            (&[1, 0, 0, 0, 1], "1"),
+            (&[1, 0, NUMERIC_SIGN_NEGATIVE, 1, 1], "-1.0"),
+            // A weight of -1: the first stored group is the first fractional one.
+            (&[1, 0xFFFF, 0, 4, 1], "0.0001"),
+            (&[1, 0xFFFE, 0, 8, 1], "0.00000001"),
+            // Trailing zero groups Postgres trimmed are zero-filled back in.
+            (&[1, 2, 0, 0, 1], "100000000"),
+            (&[2, 1, 0, 2, 1, 5], "10005.00"),
+            // An inner group below 1000 is zero-padded; the leading one is not.
+            (&[3, 1, 0, 1, 1234, 5678, 9000], "12345678.9"),
+            (&[3, 2, 0, 0, 1, 42, 7], "100420007"),
+            // Fewer fractional digits printed than stored groups carry.
+            (&[2, 0, 0, 2, 5, 1234], "5.12"),
+            // 35 significant digits, past what `rust_decimal` can hold.
+            (
+                &[
+                    9, 4, 0, 16, 252, 8953, 297, 8971, 5791, 8666, 6666, 6666, 6667,
+                ],
+                "2528953029789715791.8666666666666667",
+            ),
+        ];
+        for (words, expected) in cases {
+            let decoded = NumericText::from_sql(&Type::NUMERIC, &numeric_wire(words))
+                .expect("a well-formed NUMERIC decodes");
+            assert_eq!(
+                decoded,
+                NumericText::Finite((*expected).to_string()),
+                "words {words:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_text_decodes_the_three_special_values() {
+        for (sign, expected) in [
+            (NUMERIC_SIGN_NAN, NumericText::NaN),
+            (
+                NUMERIC_SIGN_POSITIVE_INFINITY,
+                NumericText::Infinity { negative: false },
+            ),
+            (
+                NUMERIC_SIGN_NEGATIVE_INFINITY,
+                NumericText::Infinity { negative: true },
+            ),
+        ] {
+            let decoded = NumericText::from_sql(&Type::NUMERIC, &numeric_wire(&[0, 0, sign, 0]))
+                .expect("a special NUMERIC decodes");
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn numeric_text_refuses_a_malformed_wire_value() {
+        let truncated = NumericText::from_sql(&Type::NUMERIC, &numeric_wire(&[1, 0, 0]))
+            .expect_err("a header cut short is refused");
+        assert!(
+            truncated.to_string().contains("ends before its scale"),
+            "{truncated}"
+        );
+        let missing_digit = NumericText::from_sql(&Type::NUMERIC, &numeric_wire(&[2, 0, 0, 0, 1]))
+            .expect_err("fewer digits than announced is refused");
+        assert!(
+            missing_digit.to_string().contains("ends before its digits"),
+            "{missing_digit}"
+        );
+        let bad_sign = NumericText::from_sql(&Type::NUMERIC, &numeric_wire(&[0, 0, 0x1234, 0]))
+            .expect_err("an unknown sign word is refused");
+        assert!(bad_sign.to_string().contains("0x1234"), "{bad_sign}");
+        let bad_digit = NumericText::from_sql(&Type::NUMERIC, &numeric_wire(&[1, 0, 0, 0, 10000]))
+            .expect_err("a base-10000 digit of 10000 is refused");
+        assert!(bad_digit.to_string().contains("10000"), "{bad_digit}");
+    }
+
+    #[test]
+    fn numeric_text_keeps_every_digit_rust_decimal_would_round_away() {
+        let wire = numeric_wire(&[
+            9, 4, 0, 16, 252, 8953, 297, 8971, 5791, 8666, 6666, 6666, 6667,
+        ]);
+        let text = NumericText::from_sql(&Type::NUMERIC, &wire).expect("decodes");
+        // 35 significant digits: past `rust_decimal`'s 28, which rounds the value
+        // to 2528953029789715791.866666667 on decode.
+        let exact = "2528953029789715791.8666666666666667";
+        let through_rust_decimal = Decimal::from_sql(&Type::NUMERIC, &wire)
+            .expect("decodes")
+            .to_string();
+        assert!(
+            through_rust_decimal != exact
+                && through_rust_decimal.starts_with("2528953029789715791.8666")
+                && through_rust_decimal.len() < exact.len(),
+            "rust_decimal rounds the value to its 28-digit coefficient: {through_rust_decimal}"
+        );
+        assert_eq!(text, NumericText::Finite(exact.to_string()));
+        assert_eq!(
+            text.to_f64().expect("finite"),
+            exact.parse::<f64>().expect("parses"),
+            "one correctly rounded conversion from the exact digits"
+        );
+    }
+
+    #[test]
+    fn numeric_text_to_i64_truncates_toward_zero_within_range() {
+        let finite = |text: &str| NumericText::Finite(text.to_string());
+        assert_eq!(finite("5.000").to_i64(), Some(5));
+        assert_eq!(finite("-0").to_i64(), Some(0));
+        // `sum(x) / count(*)` pushed down: integer division's answer, not floor's.
+        assert_eq!(finite("1.5").to_i64(), Some(1));
+        assert_eq!(finite("-1.5").to_i64(), Some(-1));
+        assert_eq!(finite("-0.9").to_i64(), Some(0));
+        assert_eq!(finite("0.9999").to_i64(), Some(0));
+        assert_eq!(finite("9223372036854775807").to_i64(), Some(i64::MAX));
+        assert_eq!(finite("9223372036854775808").to_i64(), None);
+        assert_eq!(finite("-9223372036854775808").to_i64(), Some(i64::MIN));
+        assert_eq!(NumericText::NaN.to_i64(), None);
+        assert_eq!(NumericText::Infinity { negative: false }.to_i64(), None);
+    }
+
+    #[test]
+    fn numeric_text_float_conversions_round_once_from_the_digits() {
+        let finite = |text: &str| NumericText::Finite(text.to_string());
+        assert_eq!(finite("47.5").to_f64(), Some(47.5));
+        assert_eq!(finite("0.1").to_f64(), Some(0.1));
+        assert_eq!(finite("0.1").to_f32(), Some(0.1_f32));
+        // Rounded once from the digits rather than through f64 first, so it agrees
+        // with the standard library's own decimal-to-f32 parse on a value that
+        // carries more digits than either float holds.
+        let long = "1.00000005960464477539062500001";
+        assert_eq!(
+            finite(long).to_f32(),
+            Some(long.parse::<f32>().expect("parses"))
+        );
+        let huge = finite(&format!("1{}", "0".repeat(400)));
+        assert_eq!(
+            huge.to_f64(),
+            None,
+            "beyond f64's range is not representable"
+        );
+        assert!(NumericText::NaN.to_f64().expect("NaN maps").is_nan());
+        assert_eq!(
+            NumericText::Infinity { negative: true }.to_f64(),
+            Some(f64::NEG_INFINITY)
+        );
+    }
+
+    #[test]
+    fn numeric_text_coefficient_widens_exactly_and_narrows_half_away_from_zero() {
+        // Widening only appends zeros.
+        assert_eq!(numeric_text_coefficient("1.5", 38, 6), Ok(1_500_000));
+        assert_eq!(numeric_text_coefficient("-1.5", 38, 6), Ok(-1_500_000));
+        assert_eq!(
+            numeric_text_coefficient("1000000000", 38, 20),
+            Ok(100_000_000_000_000_000_000_000_000_000)
+        );
+        // Narrowing rounds half away from zero, on both sides of zero.
+        assert_eq!(
+            numeric_text_coefficient("1.6666666666666667", 38, 6),
+            Ok(1_666_667)
+        );
+        assert_eq!(numeric_text_coefficient("1.2345", 38, 2), Ok(123));
+        assert_eq!(numeric_text_coefficient("1.2350", 38, 2), Ok(124));
+        assert_eq!(numeric_text_coefficient("-1.2350", 38, 2), Ok(-124));
+        assert_eq!(numeric_text_coefficient("0.0049", 38, 2), Ok(0));
+        assert_eq!(numeric_text_coefficient("-0.0050", 38, 2), Ok(-1));
+        // A carry can add a digit.
+        assert_eq!(numeric_text_coefficient("9.9999", 38, 2), Ok(1000));
+        // Zero, however spelled.
+        assert_eq!(numeric_text_coefficient("0", 38, 20), Ok(0));
+        assert_eq!(numeric_text_coefficient("-0.000", 38, 2), Ok(0));
+    }
+
+    #[test]
+    fn numeric_text_coefficient_handles_a_negative_scale() {
+        // `NUMERIC(2, -3)` stores 12000 as the coefficient 12.
+        assert_eq!(numeric_text_coefficient("12000", 2, -3), Ok(12));
+        assert_eq!(numeric_text_coefficient("12500", 2, -3), Ok(13));
+        assert_eq!(numeric_text_coefficient("12499.9", 2, -3), Ok(12));
+        assert_eq!(numeric_text_coefficient("-12500", 2, -3), Ok(-13));
+        assert_eq!(numeric_text_coefficient("400", 2, -3), Ok(0));
+        assert_eq!(numeric_text_coefficient("500", 2, -3), Ok(1));
+        // Fewer integer digits than the scale drops: the missing ones are
+        // leading zeros, so 50 is nowhere near the 500 that would round up.
+        assert_eq!(numeric_text_coefficient("50", 2, -3), Ok(0));
+        assert_eq!(numeric_text_coefficient("-50", 2, -3), Ok(0));
+        assert_eq!(numeric_text_coefficient("499.9", 2, -3), Ok(0));
+        assert_eq!(numeric_text_coefficient("5", 2, -1), Ok(1));
+        assert_eq!(numeric_text_coefficient("4.9", 2, -1), Ok(0));
+    }
+
+    #[test]
+    fn numeric_text_coefficient_refuses_what_the_precision_cannot_hold() {
+        // 19 integer digits at scale 20 need 39: the issue's failure, still refused
+        // where the plan really asks for Decimal128(38, 20).
+        assert!(matches!(
+            numeric_text_coefficient("2528953029789715791", 38, 20),
+            Err(NumericFit::PrecisionTooNarrow)
+        ));
+        // 18 integer digits fit.
+        assert_eq!(
+            numeric_text_coefficient("252895302978971580", 38, 20),
+            Ok(25_289_530_297_897_158_000_000_000_000_000_000_000)
+        );
+        // `precision` digits fit; one more does not — including by carry.
+        assert!(numeric_text_coefficient(&"9".repeat(38), 38, 0).is_ok());
+        assert!(matches!(
+            numeric_text_coefficient(&format!("1{}", "0".repeat(38)), 38, 0),
+            Err(NumericFit::PrecisionTooNarrow)
+        ));
+        assert!(matches!(
+            numeric_text_coefficient(&format!("{}.5", "9".repeat(38)), 38, 0),
+            Err(NumericFit::PrecisionTooNarrow)
+        ));
+        assert_eq!(
+            numeric_text_coefficient(&format!("{}.5", "9".repeat(37)), 38, 0),
+            Ok(10_i128.pow(37))
+        );
+    }
+
+    #[test]
+    fn numeric_text_coefficient_keeps_every_digit_of_a_wide_value() {
+        // 35 significant digits into Decimal128(38, 16): exact, where `rust_decimal`
+        // would have rounded the value on decode.
+        assert_eq!(
+            numeric_text_coefficient("2528953029789715791.8666666666666667", 38, 16),
+            Ok(25_289_530_297_897_157_918_666_666_666_666_667)
+        );
+        // 37 digits into Decimal128(38, 12).
+        assert_eq!(
+            numeric_text_coefficient("1234567890123456789012345.123456789013", 38, 12),
+            Ok(1_234_567_890_123_456_789_012_345_123_456_789_013)
+        );
+    }
+
+    #[test]
+    fn numeric_destination_field_matches_by_position_when_the_widths_agree() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("avg(hits.UserID)", DataType::Float64, true),
+            Field::new("sum(hits.UserID)", DataType::Int64, true),
+        ]));
+        // A bare `avg`/`sum` the unparser emitted is matched to its position.
+        assert_eq!(
+            numeric_destination_field(Some(&schema), "avg", 0, 2).map(Field::data_type),
+            Some(&DataType::Float64)
+        );
+        assert_eq!(
+            numeric_destination_field(Some(&schema), "sum", 1, 2).map(Field::data_type),
+            Some(&DataType::Int64)
+        );
+        // No positional match when the projection is not one field per column;
+        // the name decides, and a name the projection lacks resolves to nothing.
+        assert_eq!(
+            numeric_destination_field(Some(&schema), "sum(hits.UserID)", 0, 3)
+                .map(Field::data_type),
+            Some(&DataType::Int64)
+        );
+        assert_eq!(numeric_destination_field(Some(&schema), "sum", 1, 3), None);
+        assert_eq!(numeric_destination_field(None, "sum", 1, 2), None);
+    }
+
+    #[test]
+    fn numeric_destination_field_is_not_captured_by_a_colliding_alias() {
+        // `SELECT avg(x), sum(x) AS avg`: Postgres names both columns `avg`, and the
+        // second plan field is literally called `avg`. Position keeps the first
+        // column on the Float64 the average needs; a name lookup would have bound
+        // it to the alias's Int64 and refused 1.5.
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("avg(t.x)", DataType::Float64, true),
+            Field::new("avg", DataType::Int64, true),
+        ]));
+        assert_eq!(
+            numeric_destination_field(Some(&schema), "avg", 0, 2).map(Field::name),
+            Some(&"avg(t.x)".to_string())
+        );
+        assert_eq!(
+            numeric_destination_field(Some(&schema), "avg", 1, 2).map(Field::name),
+            Some(&"avg".to_string())
+        );
+    }
+
+    #[test]
+    fn numeric_text_refuses_a_display_scale_postgres_would_not_send() {
+        // `round(5::numeric, 16383)` really does arrive with this scale word.
+        let accepted = NumericText::from_sql(&Type::NUMERIC, &numeric_wire(&[1, 0, 0, 0x3FFF, 5]))
+            .expect("the widest scale Postgres allows decodes");
+        assert_eq!(
+            accepted,
+            NumericText::Finite(format!("5.{}", "0".repeat(0x3FFF)))
+        );
+        assert_eq!(accepted.to_i64(), Some(5));
+        assert_eq!(accepted.to_f64(), Some(5.0));
+        let refused = NumericText::from_sql(&Type::NUMERIC, &numeric_wire(&[1, 0, 0, 0x4000, 5]))
+            .expect_err("a scale past NUMERIC_DSCALE_MASK is refused");
+        assert!(refused.to_string().contains("16384"), "{refused}");
+    }
 
     #[allow(clippy::cast_possible_truncation)]
     #[tokio::test]
