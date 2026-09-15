@@ -1,6 +1,7 @@
-//! Utility functions to enable federation support for scalar functions.
+//! Utility functions to describe which expressions a backend can federate.
 //!
-//! Helpful for implementing [`SQLExecutor::can_execute_plan`], when federating Datafusion Scalar UDFs with a `SQLExecutor` that may not support them.
+//! Helpful for implementing [`SQLExecutor::can_execute_plan`] when a
+//! `SQLExecutor` cannot evaluate every DataFusion function or expression shape.
 
 use std::sync::Arc;
 
@@ -15,15 +16,16 @@ use datafusion::{
     },
 };
 
-/// Returns whether any [`ScalarFunction`], [`AggregateFunction`] or [`WindowFunction`]s in the [`LogicalPlan`] are unsupported.
+/// Returns whether [`FunctionSupport`] rejects any expression in the
+/// [`LogicalPlan`].
 ///
 /// # Arguments
-/// * `plan` - The logical plan to check for scalar functions
-/// * `supports` - The support policy (allow-list or deny-list)
+/// * `plan` - The logical plan to inspect
+/// * `supports` - The expression and function support policy
 ///
 /// # Returns
-/// * `Ok(true)` if there are unsupported scalar functions in the plan
-/// * `Ok(false)` if all scalar functions are supported
+/// * `Ok(true)` if the plan contains an unsupported expression
+/// * `Ok(false)` if all expressions are supported
 /// * `Err(DataFusionError)` if an error occurs during traversal
 pub fn contains_unsupported_functions(
     plan: &LogicalPlan,
@@ -76,6 +78,22 @@ fn expression_scope(plan: &LogicalPlan) -> Option<Arc<DFSchema>> {
         }
     }
 }
+
+/// Whether a backend can evaluate an expression node.
+///
+/// Function restrictions and per-call checks cover function names and call
+/// shapes, but some dialect capabilities are represented by other [`Expr`]
+/// variants. For example, case-insensitive `LIKE` is an [`Expr::Like`] rather
+/// than a scalar function. A backend can use this hook to refuse those
+/// expressions so DataFusion evaluates them locally.
+///
+/// The predicate is consulted for every visited expression node and composes
+/// with the existing function checks. Implementations should return `true` for
+/// expression shapes they have no opinion about. Physical filters that
+/// [`crate::sql::sql_provider_datafusion::SqlExec`] can convert back to an
+/// [`Expr`] are checked through the same policy with no schema scope before
+/// they are absorbed into remote SQL.
+pub type ExpressionSupport = Arc<dyn Fn(&Expr, Option<&DFSchema>) -> bool + Send + Sync>;
 
 /// Whether a backend can evaluate *this call* of a scalar function its
 /// [`FunctionRestriction`] already allows.
@@ -143,6 +161,7 @@ pub struct FunctionSupport {
     scalar: Option<FunctionRestriction>,
     window: Option<FunctionRestriction>,
     aggregate: Option<FunctionRestriction>,
+    expression: Option<ExpressionSupport>,
     scalar_call: Option<ScalarCallSupport>,
     aggregate_call: Option<AggregateCallSupport>,
     window_call: Option<WindowCallSupport>,
@@ -154,6 +173,7 @@ impl std::fmt::Debug for FunctionSupport {
             .field("scalar", &self.scalar)
             .field("window", &self.window)
             .field("aggregate", &self.aggregate)
+            .field("expression", &self.expression.as_ref().map(|_| "<fn>"))
             .field("scalar_call", &self.scalar_call.as_ref().map(|_| "<fn>"))
             .field(
                 "aggregate_call",
@@ -174,10 +194,19 @@ impl FunctionSupport {
             scalar,
             window,
             aggregate,
+            expression: None,
             scalar_call: None,
             aggregate_call: None,
             window_call: None,
         }
+    }
+
+    /// Adds an expression check, consulted for every expression node before
+    /// the existing function checks. See [`ExpressionSupport`].
+    #[must_use]
+    pub fn with_expression_support(mut self, expression: ExpressionSupport) -> Self {
+        self.expression = Some(expression);
+        self
     }
 
     /// Adds a per-call check, consulted for every scalar call the name-based
@@ -222,6 +251,7 @@ impl FunctionSupport {
             scalar,
             window,
             aggregate,
+            expression: None,
             scalar_call: None,
             aggregate_call: None,
             window_call: None,
@@ -246,6 +276,7 @@ impl FunctionSupport {
             scalar,
             window,
             aggregate,
+            expression: None,
             scalar_call: None,
             aggregate_call: None,
             window_call: None,
@@ -255,24 +286,25 @@ impl FunctionSupport {
     pub fn supports(&self, expr: &Expr, schema: Option<&DFSchema>) -> bool {
         let mut supports = true;
         let _ = expr.apply(|e| {
-            let support_child = match e {
-                Expr::ScalarFunction(call) => {
-                    self.supports_scalar(&call.func) && self.supports_scalar_call(call, schema)
-                }
-                Expr::AggregateFunction(call) => {
-                    self.supports_aggregate(&call.func) && self.supports_aggregate_call(call)
-                }
-                Expr::WindowFunction(wind) => {
-                    let name_ok = match &wind.fun {
-                        WindowFunctionDefinition::AggregateUDF(func) => {
-                            self.supports_aggregate(func)
-                        }
-                        WindowFunctionDefinition::WindowUDF(func) => self.supports_window(func),
-                    };
-                    name_ok && self.supports_window_call(wind)
-                }
-                _ => true,
-            };
+            let support_child = self.supports_expression(e, schema)
+                && match e {
+                    Expr::ScalarFunction(call) => {
+                        self.supports_scalar(&call.func) && self.supports_scalar_call(call, schema)
+                    }
+                    Expr::AggregateFunction(call) => {
+                        self.supports_aggregate(&call.func) && self.supports_aggregate_call(call)
+                    }
+                    Expr::WindowFunction(wind) => {
+                        let name_ok = match &wind.fun {
+                            WindowFunctionDefinition::AggregateUDF(func) => {
+                                self.supports_aggregate(func)
+                            }
+                            WindowFunctionDefinition::WindowUDF(func) => self.supports_window(func),
+                        };
+                        name_ok && self.supports_window_call(wind)
+                    }
+                    _ => true,
+                };
             if !support_child {
                 supports = false;
                 return Ok(TreeNodeRecursion::Stop);
@@ -280,6 +312,15 @@ impl FunctionSupport {
             Ok(TreeNodeRecursion::Continue)
         });
         supports
+    }
+
+    /// Whether the backend can evaluate this expression node. Returns `true`
+    /// when no expression check is installed.
+    pub fn supports_expression(&self, expr: &Expr, schema: Option<&DFSchema>) -> bool {
+        self.expression
+            .as_ref()
+            .map(|supports| supports(expr, schema))
+            .unwrap_or(true)
     }
 
     pub fn supports_window(&self, fnc: &Arc<WindowUDF>) -> bool {
@@ -354,7 +395,7 @@ mod tests {
     use datafusion::logical_expr::builder::LogicalTableSource;
     use datafusion::logical_expr::expr::ScalarFunction;
     use datafusion::logical_expr::{create_udf, ColumnarValue, LogicalPlanBuilder, Subquery};
-    use datafusion::prelude::col;
+    use datafusion::prelude::{col, lit};
     use datafusion::scalar::ScalarValue;
     use std::sync::Arc;
 
@@ -376,6 +417,56 @@ mod tests {
             None,
             None,
         )
+    }
+
+    fn case_insensitive_like_support() -> FunctionSupport {
+        FunctionSupport::new(None, None, None).with_expression_support(Arc::new(
+            |expr: &Expr, _: Option<&DFSchema>| {
+                !matches!(expr, Expr::Like(like) if like.case_insensitive)
+            },
+        ))
+    }
+
+    #[test]
+    fn expression_check_refuses_case_insensitive_like_and_negation() {
+        let support = case_insensitive_like_support();
+
+        assert!(!support.supports(&col("val").ilike(lit("u%")), None));
+        assert!(!support.supports(&col("val").not_ilike(lit("u%")), None));
+        assert!(support.supports(&col("val").like(lit("u%")), None));
+    }
+
+    #[test]
+    fn no_expression_check_preserves_the_default_allow_behavior() {
+        let support = FunctionSupport::new(None, None, None);
+
+        assert!(support.supports(&col("val").ilike(lit("u%")), None));
+    }
+
+    #[test]
+    fn expression_check_finds_a_nested_unsupported_expression_in_a_plan() {
+        let plan = LogicalPlanBuilder::from(scan_plan("t"))
+            .filter(col("id").gt(lit(0)).and(col("val").not_ilike(lit("u%"))))
+            .expect("filter")
+            .build()
+            .expect("build");
+
+        assert!(
+            contains_unsupported_functions(&plan, &case_insensitive_like_support()).expect("check")
+        );
+    }
+
+    #[test]
+    fn expression_check_composes_with_function_restrictions() {
+        let support = deny_support(&["denied_fn"]).with_expression_support(Arc::new(
+            |expr: &Expr, _: Option<&DFSchema>| {
+                !matches!(expr, Expr::Like(like) if like.case_insensitive)
+            },
+        ));
+
+        assert!(!support.supports(&call("denied_fn", vec![col("val")]), None));
+        assert!(!support.supports(&col("val").ilike(lit("u%")), None));
+        assert!(support.supports(&col("val").like(lit("u%")), None));
     }
 
     fn scan_plan(table: &str) -> LogicalPlan {

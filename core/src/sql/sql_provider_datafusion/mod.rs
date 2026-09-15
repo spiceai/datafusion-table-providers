@@ -287,6 +287,7 @@ impl<T, P> SqlTable<T, P> {
             sql,
             self.dialect_arc(),
         )?
+        .with_function_support(self.function_support.clone())
         .with_allow_physical_filter_pushdown(self.allow_physical_filter_pushdown)
         .with_allow_physical_sort_pushdown(self.allow_physical_sort_pushdown);
         Ok(Arc::new(exec))
@@ -308,6 +309,10 @@ impl<T, P> SqlTable<T, P> {
     #[must_use]
     pub fn clone_pool(&self) -> Arc<dyn DbConnectionPool<T, P> + Send + Sync> {
         Arc::clone(&self.pool)
+    }
+
+    pub(crate) fn function_support(&self) -> Option<FunctionSupport> {
+        self.function_support.clone()
     }
 
     /// Returns a cloneable Arc of the dialect for passing to SqlExec.
@@ -421,6 +426,7 @@ pub struct SqlExec<T, P> {
     sql: String,
     properties: Arc<PlanProperties>,
     dialect: Arc<dyn Dialect + Send + Sync>,
+    function_support: Option<FunctionSupport>,
     allow_physical_filter_pushdown: bool,
     allow_physical_sort_pushdown: bool,
 }
@@ -433,6 +439,7 @@ impl<T, P> Clone for SqlExec<T, P> {
             sql: self.sql.clone(),
             properties: self.properties.clone(),
             dialect: Arc::clone(&self.dialect),
+            function_support: self.function_support.clone(),
             allow_physical_filter_pushdown: self.allow_physical_filter_pushdown,
             allow_physical_sort_pushdown: self.allow_physical_sort_pushdown,
         }
@@ -460,9 +467,18 @@ impl<T, P> SqlExec<T, P> {
                 Boundedness::Bounded,
             )),
             dialect,
+            function_support: None,
             allow_physical_filter_pushdown: true,
             allow_physical_sort_pushdown: true,
         })
+    }
+
+    /// Applies the same expression and function policy used for logical filter
+    /// admission to physical filters before they are absorbed into remote SQL.
+    #[must_use]
+    pub fn with_function_support(mut self, function_support: Option<FunctionSupport>) -> Self {
+        self.function_support = function_support;
+        self
     }
 
     /// Disables physical-level filter pushdown (`handle_child_pushdown_result`).
@@ -614,8 +630,12 @@ fn physical_expr_to_logical_expr(
 fn physical_expr_to_sql(
     expr: &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
     dialect: &dyn Dialect,
+    function_support: Option<&FunctionSupport>,
 ) -> Option<String> {
     let logical_expr = physical_expr_to_logical_expr(expr)?;
+    if function_support.is_some_and(|support| !support.supports(&logical_expr, None)) {
+        return None;
+    }
     let unparser = Unparser::new(dialect);
     unparser
         .expr_to_sql(&logical_expr)
@@ -747,6 +767,7 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
             sql: new_sql,
             properties: self.properties.clone(),
             dialect: Arc::clone(&self.dialect),
+            function_support: self.function_support.clone(),
             allow_physical_filter_pushdown: self.allow_physical_filter_pushdown,
             allow_physical_sort_pushdown: self.allow_physical_sort_pushdown,
         };
@@ -783,6 +804,7 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
             sql: new_sql,
             properties: self.properties.clone(),
             dialect: Arc::clone(&self.dialect),
+            function_support: self.function_support.clone(),
             allow_physical_filter_pushdown: self.allow_physical_filter_pushdown,
             allow_physical_sort_pushdown: self.allow_physical_sort_pushdown,
         }))
@@ -810,7 +832,11 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
         let mut any_accepted = false;
 
         for parent_filter in &child_pushdown_result.parent_filters {
-            match physical_expr_to_sql(&parent_filter.filter, self.dialect()) {
+            match physical_expr_to_sql(
+                &parent_filter.filter,
+                self.dialect(),
+                self.function_support.as_ref(),
+            ) {
                 Some(sql_fragment) => {
                     accepted_filters.push(sql_fragment);
                     filter_results.push(PushedDown::Yes);
@@ -839,6 +865,7 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
             sql: new_sql,
             properties: self.properties.clone(),
             dialect: Arc::clone(&self.dialect),
+            function_support: self.function_support.clone(),
             allow_physical_filter_pushdown: self.allow_physical_filter_pushdown,
             allow_physical_sort_pushdown: self.allow_physical_sort_pushdown,
         };
@@ -1065,6 +1092,7 @@ mod tests {
 
         use async_trait::async_trait;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::DFSchema;
         use datafusion::datasource::TableProvider;
         use datafusion::logical_expr::expr::ScalarFunction;
         use datafusion::logical_expr::{
@@ -1110,8 +1138,8 @@ mod tests {
             }
         }
 
-        /// Builds a table whose function-support policy allows everything except
-        /// `denied_fn`.
+        /// Builds a table whose support policy refuses `denied_fn` and
+        /// case-insensitive `LIKE` expressions.
         fn test_table() -> SqlTable<(), &'static dyn ToString> {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("name", DataType::Utf8, false),
@@ -1123,7 +1151,10 @@ mod tests {
                 Some(FunctionRestriction::Deny(vec!["denied_fn".to_string()])),
                 None,
                 None,
-            );
+            )
+            .with_expression_support(Arc::new(|expr: &Expr, _: Option<&DFSchema>| {
+                !matches!(expr, Expr::Like(like) if like.case_insensitive)
+            }));
             SqlTable::new_with_schema("users", &pool, schema, TableReference::bare("users"), None)
                 .with_dialect(Arc::new(SqliteDialect {}))
                 .with_function_support(Some(function_support))
@@ -1159,6 +1190,38 @@ mod tests {
             assert_pushdown(
                 denied_call().eq(lit("x")),
                 TableProviderFilterPushDown::Unsupported,
+            );
+        }
+
+        #[test]
+        fn case_insensitive_like_is_not_pushed_down() {
+            assert_pushdown(
+                col("name").ilike(lit("u%")),
+                TableProviderFilterPushDown::Unsupported,
+            );
+        }
+
+        #[test]
+        fn negated_case_insensitive_like_is_not_pushed_down() {
+            assert_pushdown(
+                col("name").not_ilike(lit("u%")),
+                TableProviderFilterPushDown::Unsupported,
+            );
+        }
+
+        #[test]
+        fn case_insensitive_like_nested_in_a_filter_is_not_pushed_down() {
+            assert_pushdown(
+                col("age").gt(lit(30)).or(col("name").ilike(lit("u%"))),
+                TableProviderFilterPushDown::Unsupported,
+            );
+        }
+
+        #[test]
+        fn ordinary_like_is_still_pushed_down() {
+            assert_pushdown(
+                col("name").like(lit("u%")),
+                TableProviderFilterPushDown::Exact,
             );
         }
 
@@ -1220,6 +1283,7 @@ mod tests {
 
     mod sort_pushdown_tests {
         use crate::sql::sql_provider_datafusion::{SqlExec, SqlTable};
+        use crate::util::supported_functions::FunctionSupport;
         use arrow::compute::SortOptions;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
         use datafusion::common::config::ConfigOptions;
@@ -1543,6 +1607,97 @@ mod tests {
             }
         }
 
+        #[test]
+        fn test_table_threads_expression_support_into_physical_filter_pushdown() {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, false),
+                Field::new("age", DataType::Int16, false),
+            ]));
+            let pool = Arc::new(MockDBPool {})
+                as Arc<dyn DbConnectionPool<(), &'static dyn ToString> + Send + Sync>;
+            let support = FunctionSupport::new(None, None, None).with_expression_support(Arc::new(
+                |expr, _| {
+                    !matches!(
+                        expr,
+                        datafusion::logical_expr::Expr::BinaryExpr(binary)
+                            if binary.op == Operator::Gt
+                    )
+                },
+            ));
+            let table = SqlTable::new_with_schema(
+                "mock",
+                &pool,
+                Arc::clone(&schema),
+                TableReference::bare("users"),
+                None,
+            )
+            .with_function_support(Some(support));
+            let plan = table
+                .create_physical_plan(None, "SELECT \"name\", \"age\" FROM \"users\"".to_string())
+                .expect("physical plan should be created");
+            let exec = plan
+                .downcast_ref::<SqlExec<(), &'static dyn ToString>>()
+                .expect("plan should be a SqlExec");
+
+            let denied = binary(
+                col("age", &schema).expect("column should resolve"),
+                Operator::Gt,
+                lit(30i16),
+                &schema,
+            )
+            .expect("predicate should build");
+            let denied_result = exec
+                .handle_child_pushdown_result(
+                    FilterPushdownPhase::Pre,
+                    ChildPushdownResult {
+                        parent_filters: vec![ChildFilterPushdownResult {
+                            filter: denied,
+                            child_results: vec![PushedDown::Yes],
+                        }],
+                        self_filters: vec![],
+                    },
+                    &ConfigOptions::default(),
+                )
+                .expect("filter pushdown should succeed");
+            assert!(matches!(denied_result.filters.as_slice(), [PushedDown::No]));
+            assert!(denied_result.updated_node.is_none());
+
+            let allowed = binary(
+                col("age", &schema).expect("column should resolve"),
+                Operator::Eq,
+                lit(30i16),
+                &schema,
+            )
+            .expect("predicate should build");
+            let allowed_result = exec
+                .handle_child_pushdown_result(
+                    FilterPushdownPhase::Pre,
+                    ChildPushdownResult {
+                        parent_filters: vec![ChildFilterPushdownResult {
+                            filter: allowed,
+                            child_results: vec![PushedDown::Yes],
+                        }],
+                        self_filters: vec![],
+                    },
+                    &ConfigOptions::default(),
+                )
+                .expect("filter pushdown should succeed");
+            assert!(matches!(
+                allowed_result.filters.as_slice(),
+                [PushedDown::Yes]
+            ));
+            let rewritten = allowed_result
+                .updated_node
+                .expect("the allowed filter should be absorbed into SQL");
+            let rewritten = rewritten
+                .downcast_ref::<SqlExec<(), &'static dyn ToString>>()
+                .expect("updated plan should be a SqlExec");
+            assert_eq!(
+                rewritten.sql().expect("SQL should be available"),
+                "SELECT \"name\", \"age\" FROM \"users\" WHERE (age = 30)"
+            );
+        }
+
         fn order_by_name() -> Vec<PhysicalSortExpr> {
             vec![PhysicalSortExpr {
                 expr: Arc::new(Column::new("name", 0)),
@@ -1862,25 +2017,25 @@ mod tests {
 
         #[test]
         fn test_column() {
-            let result = physical_expr_to_sql(&col("name"), default_dialect());
+            let result = physical_expr_to_sql(&col("name"), default_dialect(), None);
             assert_eq!(result, Some("\"name\"".to_string()));
         }
 
         #[test]
         fn test_literal_int() {
-            let result = physical_expr_to_sql(&lit_i32(42), default_dialect());
+            let result = physical_expr_to_sql(&lit_i32(42), default_dialect(), None);
             assert_eq!(result, Some("42".to_string()));
         }
 
         #[test]
         fn test_literal_string() {
-            let result = physical_expr_to_sql(&lit_str("hello"), default_dialect());
+            let result = physical_expr_to_sql(&lit_str("hello"), default_dialect(), None);
             assert_eq!(result, Some("'hello'".to_string()));
         }
 
         #[test]
         fn test_literal_string_with_quote() {
-            let result = physical_expr_to_sql(&lit_str("it's"), default_dialect());
+            let result = physical_expr_to_sql(&lit_str("it's"), default_dialect(), None);
             assert_eq!(result, Some("'it''s'".to_string()));
         }
 
@@ -1888,7 +2043,7 @@ mod tests {
         fn test_literal_null() {
             let expr: Arc<dyn datafusion::physical_plan::PhysicalExpr> =
                 Arc::new(Literal::new(ScalarValue::Null));
-            let result = physical_expr_to_sql(&expr, default_dialect());
+            let result = physical_expr_to_sql(&expr, default_dialect(), None);
             assert_eq!(result, Some("NULL".to_string()));
         }
 
@@ -1896,7 +2051,7 @@ mod tests {
         fn test_binary_eq() {
             let expr: Arc<dyn datafusion::physical_plan::PhysicalExpr> =
                 Arc::new(BinaryExpr::new(col("age"), Operator::Gt, lit_i32(30)));
-            let result = physical_expr_to_sql(&expr, default_dialect());
+            let result = physical_expr_to_sql(&expr, default_dialect(), None);
             assert_eq!(result, Some("(age > 30)".to_string()));
         }
 
@@ -1908,7 +2063,7 @@ mod tests {
                 Arc::new(BinaryExpr::new(col("b"), Operator::Eq, lit_str("x")));
             let expr: Arc<dyn datafusion::physical_plan::PhysicalExpr> =
                 Arc::new(BinaryExpr::new(left, Operator::And, right));
-            let result = physical_expr_to_sql(&expr, default_dialect());
+            let result = physical_expr_to_sql(&expr, default_dialect(), None);
             assert_eq!(result, Some("((a > 1) AND (b = 'x'))".to_string()));
         }
 
@@ -1916,7 +2071,7 @@ mod tests {
         fn test_is_null() {
             let expr: Arc<dyn datafusion::physical_plan::PhysicalExpr> =
                 Arc::new(IsNullExpr::new(col("x")));
-            let result = physical_expr_to_sql(&expr, default_dialect());
+            let result = physical_expr_to_sql(&expr, default_dialect(), None);
             assert_eq!(result, Some("x IS NULL".to_string()));
         }
 
@@ -1924,7 +2079,7 @@ mod tests {
         fn test_is_not_null() {
             let expr: Arc<dyn datafusion::physical_plan::PhysicalExpr> =
                 Arc::new(IsNotNullExpr::new(col("x")));
-            let result = physical_expr_to_sql(&expr, default_dialect());
+            let result = physical_expr_to_sql(&expr, default_dialect(), None);
             assert_eq!(result, Some("x IS NOT NULL".to_string()));
         }
 
@@ -1934,7 +2089,7 @@ mod tests {
                 Arc::new(BinaryExpr::new(col("active"), Operator::Eq, lit_i32(1)));
             let expr: Arc<dyn datafusion::physical_plan::PhysicalExpr> =
                 Arc::new(NotExpr::new(inner));
-            let result = physical_expr_to_sql(&expr, default_dialect());
+            let result = physical_expr_to_sql(&expr, default_dialect(), None);
             assert_eq!(result, Some("NOT (active = 1)".to_string()));
         }
 
@@ -1942,7 +2097,7 @@ mod tests {
         fn test_literal_bool() {
             let expr: Arc<dyn datafusion::physical_plan::PhysicalExpr> =
                 Arc::new(Literal::new(ScalarValue::Boolean(Some(true))));
-            let result = physical_expr_to_sql(&expr, default_dialect());
+            let result = physical_expr_to_sql(&expr, default_dialect(), None);
             assert_eq!(result, Some("true".to_string()));
         }
     }

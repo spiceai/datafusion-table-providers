@@ -101,6 +101,7 @@ impl<T, P> DuckDBTable<T, P> {
             self.table_functions.clone(),
             self.base_table.dialect_arc(),
             self.indexes.clone(),
+            self.base_table.function_support(),
         )?))
     }
 }
@@ -176,8 +177,10 @@ impl<T: 'static, P: 'static> DuckSqlExec<T, P> {
         table_functions: Option<HashMap<String, String>>,
         dialect: Arc<dyn Dialect + Send + Sync>,
         indexes: Vec<(ColumnReference, IndexType)>,
+        function_support: Option<FunctionSupport>,
     ) -> DataFusionResult<Self> {
-        let base_exec = SqlExec::new(projection, schema, pool, sql, dialect)?;
+        let base_exec = SqlExec::new(projection, schema, pool, sql, dialect)?
+            .with_function_support(function_support);
 
         Ok(Self {
             base_exec,
