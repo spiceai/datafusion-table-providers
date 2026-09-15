@@ -128,3 +128,118 @@ impl<T, P> SQLExecutor for SqlTable<T, P> {
             .map_err(to_execution_error)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{any::Any, error::Error};
+
+    use datafusion::{
+        arrow::datatypes::{DataType, Field, Schema},
+        common::DFSchema,
+        logical_expr::{builder::LogicalTableSource, col, lit, Expr, LogicalPlanBuilder},
+    };
+
+    use crate::{
+        sql::db_connection_pool::{dbconnection::DbConnection, DbConnectionPool, JoinPushDown},
+        util::supported_functions::FunctionSupport,
+    };
+
+    use super::*;
+
+    struct MockConn;
+
+    impl DbConnection<(), &'static dyn ToString> for MockConn {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
+    struct MockDBPool;
+
+    #[async_trait]
+    impl DbConnectionPool<(), &'static dyn ToString> for MockDBPool {
+        async fn connect(
+            &self,
+        ) -> Result<Box<dyn DbConnection<(), &'static dyn ToString>>, Box<dyn Error + Send + Sync>>
+        {
+            Ok(Box::new(MockConn))
+        }
+
+        fn join_push_down(&self) -> JoinPushDown {
+            JoinPushDown::Disallow
+        }
+    }
+
+    fn schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Utf8, true),
+        ]))
+    }
+
+    fn test_table() -> SqlTable<(), &'static dyn ToString> {
+        let pool = Arc::new(MockDBPool)
+            as Arc<dyn DbConnectionPool<(), &'static dyn ToString> + Send + Sync>;
+        let support = FunctionSupport::new(None, None, None).with_expression_support(Arc::new(
+            |expr: &Expr, _: Option<&DFSchema>| {
+                !matches!(expr, Expr::Like(like) if like.case_insensitive)
+            },
+        ));
+
+        SqlTable::new_with_schema("test", &pool, schema(), "test", None)
+            .with_function_support(Some(support))
+    }
+
+    fn scan_plan() -> LogicalPlan {
+        let source = Arc::new(LogicalTableSource::new(schema()))
+            as Arc<dyn datafusion::logical_expr::TableSource>;
+        LogicalPlanBuilder::scan("test", source, None)
+            .expect("scan")
+            .build()
+            .expect("build")
+    }
+
+    fn filter_plan(predicate: Expr) -> LogicalPlan {
+        LogicalPlanBuilder::from(scan_plan())
+            .filter(predicate)
+            .expect("filter")
+            .build()
+            .expect("build")
+    }
+
+    #[test]
+    fn case_insensitive_like_filter_is_not_federated() {
+        let plan = filter_plan(col("val").ilike(lit("u%")));
+
+        assert!(!SQLExecutor::can_execute_plan(&test_table(), &plan));
+    }
+
+    #[test]
+    fn negated_case_insensitive_like_filter_is_not_federated() {
+        let plan = filter_plan(col("val").not_ilike(lit("u%")));
+
+        assert!(!SQLExecutor::can_execute_plan(&test_table(), &plan));
+    }
+
+    #[test]
+    fn case_insensitive_like_projection_is_not_federated() {
+        let plan = LogicalPlanBuilder::from(scan_plan())
+            .project(vec![col("val").ilike(lit("u%")).alias("matched")])
+            .expect("project")
+            .build()
+            .expect("build");
+
+        assert!(!SQLExecutor::can_execute_plan(&test_table(), &plan));
+    }
+
+    #[test]
+    fn ordinary_like_is_still_federated() {
+        let plan = filter_plan(col("val").like(lit("u%")));
+
+        assert!(SQLExecutor::can_execute_plan(&test_table(), &plan));
+    }
+}

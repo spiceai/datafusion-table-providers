@@ -11,7 +11,6 @@
 // limitations under the License.
 
 use crate::sql::db_connection_pool::DbConnectionPool;
-#[cfg(feature = "adbc-federation")]
 use crate::util::supported_functions::FunctionSupport;
 #[cfg(feature = "adbc-federation")]
 use datafusion::optimizer::OptimizerRule;
@@ -95,6 +94,7 @@ impl<T, P> AdbcDBTable<T, P> {
             self.base_table.clone_pool(),
             sql,
             self.base_table.dialect_arc(),
+            self.base_table.function_support(),
         )?))
     }
 }
@@ -142,8 +142,10 @@ impl<T, P> AdbcSqlExec<T, P> {
         pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
         sql: String,
         dialect: Arc<dyn Dialect + Send + Sync>,
+        function_support: Option<FunctionSupport>,
     ) -> DataFusionResult<Self> {
-        let base_exec = SqlExec::new(projection, schema, pool, sql, dialect)?;
+        let base_exec = SqlExec::new(projection, schema, pool, sql, dialect)?
+            .with_function_support(function_support);
         Ok(Self { base_exec })
     }
 

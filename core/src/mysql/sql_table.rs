@@ -82,6 +82,7 @@ impl MySQLTable {
             Arc::clone(&self.pool),
             sql,
             self.base_table.dialect_arc(),
+            self.base_table.function_support(),
         )?))
     }
 }
@@ -135,8 +136,10 @@ impl MySQLSQLExec {
         pool: Arc<MySQLConnectionPool>,
         sql: String,
         dialect: Arc<dyn Dialect + Send + Sync>,
+        function_support: Option<FunctionSupport>,
     ) -> DataFusionResult<Self> {
-        let base_exec = SqlExec::new(projections, schema, pool, sql, dialect)?;
+        let base_exec = SqlExec::new(projections, schema, pool, sql, dialect)?
+            .with_function_support(function_support);
 
         Ok(Self { base_exec })
     }
