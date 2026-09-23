@@ -21,7 +21,7 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter,
-    sql::TableReference,
+    common::TableReference,
 };
 
 use super::ClickHouseTable;

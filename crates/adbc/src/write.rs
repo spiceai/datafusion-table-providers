@@ -11,9 +11,9 @@
 // limitations under the License.
 
 use crate::adbc::ADBC;
-use crate::sql::db_connection_pool::adbcpool::ADBCPool;
-use crate::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement;
-use crate::util::retriable_error::{check_and_mark_retriable_error, to_retriable_data_write_error};
+use datafusion_table_providers_common::sql::db_connection_pool::adbcpool::ADBCPool;
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement;
+use datafusion_table_providers_common::util::retriable_error::{check_and_mark_retriable_error, to_retriable_data_write_error};
 use adbc_core::options::{IngestMode, OptionStatement, OptionValue};
 use adbc_core::{Connection, Database, Optionable, Statement};
 use arrow::array::{RecordBatch, RecordBatchReader};
@@ -32,7 +32,7 @@ use datafusion::{
     execution::TaskContext,
     logical_expr::{dml::InsertOp, Expr, TableType},
     physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream},
-    sql::TableReference,
+    common::TableReference,
 };
 use futures::StreamExt;
 use snafu::ResultExt;

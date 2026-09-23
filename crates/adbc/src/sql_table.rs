@@ -10,15 +10,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::sql::db_connection_pool::DbConnectionPool;
-use crate::util::supported_functions::FunctionSupport;
-#[cfg(feature = "adbc-federation")]
+use datafusion_table_providers_common::sql::db_connection_pool::DbConnectionPool;
+use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
+#[cfg(feature = "federation")]
 use datafusion::optimizer::OptimizerRule;
 
 use async_trait::async_trait;
 use futures::TryStreamExt;
 
-use crate::sql::sql_provider_datafusion::{
+use datafusion_table_providers_common::sql::sql_provider_datafusion::{
     get_stream, to_execution_error, Result as SqlResult, SqlExec, SqlTable,
 };
 use std::sync::Arc;
@@ -26,6 +26,7 @@ use std::sync::Arc;
 use datafusion::catalog::Session;
 use datafusion::{
     arrow::datatypes::SchemaRef,
+    common::TableReference,
     config::ConfigOptions,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
@@ -38,12 +39,12 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     },
-    sql::{unparser::dialect::Dialect, TableReference},
+    sql::unparser::dialect::Dialect,
 };
 
 pub struct AdbcDBTable<T: 'static, P: 'static> {
     pub(crate) base_table: SqlTable<T, P>,
-    #[cfg(feature = "adbc-federation")]
+    #[cfg(feature = "federation")]
     pub(crate) pre_federation_optimizer_rules: Vec<Arc<dyn OptimizerRule + Send + Sync>>,
 }
 
@@ -61,8 +62,8 @@ impl<T, P> AdbcDBTable<T, P> {
         schema: impl Into<SchemaRef>,
         table_reference: impl Into<TableReference>,
         dialect: Option<Arc<dyn Dialect + Send + Sync>>,
-        #[cfg(feature = "adbc-federation")] function_support: Option<FunctionSupport>,
-        #[cfg(feature = "adbc-federation")] pre_federation_optimizer_rules: Vec<
+        #[cfg(feature = "federation")] function_support: Option<FunctionSupport>,
+        #[cfg(feature = "federation")] pre_federation_optimizer_rules: Vec<
             Arc<dyn OptimizerRule + Send + Sync>,
         >,
     ) -> Self {
@@ -72,12 +73,12 @@ impl<T, P> AdbcDBTable<T, P> {
             base_table = base_table.with_dialect(d);
         }
 
-        #[cfg(feature = "adbc-federation")]
+        #[cfg(feature = "federation")]
         let base_table = base_table.with_function_support(function_support);
 
         Self {
             base_table,
-            #[cfg(feature = "adbc-federation")]
+            #[cfg(feature = "federation")]
             pre_federation_optimizer_rules,
         }
     }
@@ -182,6 +183,15 @@ impl<T: 'static, P: 'static> ExecutionPlan for AdbcSqlExec<T, P> {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         self.base_exec.children()
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        self.base_exec.apply_expressions(f)
     }
 
     fn with_new_children(

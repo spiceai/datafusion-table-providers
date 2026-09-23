@@ -8,7 +8,7 @@ use datafusion::{
     sql::unparser::dialect::{
         DefaultDialect, Dialect, DuckDBDialect, MySqlDialect, PostgreSqlDialect, SqliteDialect,
     },
-    sql::TableReference,
+    common::TableReference,
 };
 
 pub const SECONDS_IN_DAY: i32 = 86_400;
@@ -69,7 +69,7 @@ impl Engine {
 ///
 /// The match is exhaustive over [`Engine`] on purpose: a new engine must state which escaping it
 /// needs rather than inherit whichever arm happens to be the catch-all.
-pub(crate) fn string_literal(value: &str, engine: Option<Engine>) -> String {
+pub fn string_literal(value: &str, engine: Option<Engine>) -> String {
     let escaped = match engine {
         Some(Engine::MySQL | Engine::Spark) => {
             if value.contains(['\\', '\'']) {
@@ -91,7 +91,7 @@ pub(crate) fn string_literal(value: &str, engine: Option<Engine>) -> String {
 
 /// Renders `name` as a double-quoted SQL identifier, doubling any embedded quote so that a
 /// quote in a column name cannot close the identifier early.
-pub(crate) fn quoted_identifier(name: &str) -> String {
+pub fn quoted_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
@@ -1373,7 +1373,7 @@ mod tests {
     fn mixed_qualification_of_one_relation_is_refused() {
         let bare = Expr::Column(datafusion::common::Column::new(Some("t"), "a"));
         let partial = Expr::Column(datafusion::common::Column::new(
-            Some(datafusion::sql::TableReference::partial("public", "t")),
+            Some(datafusion::common::TableReference::partial("public", "t")),
             "b",
         ));
 
@@ -1390,12 +1390,12 @@ mod tests {
     #[test]
     fn two_catalogs_bridged_by_a_bare_reference_are_refused() {
         let left = Expr::Column(datafusion::common::Column::new(
-            Some(datafusion::sql::TableReference::full("a", "public", "t")),
+            Some(datafusion::common::TableReference::full("a", "public", "t")),
             "id",
         ));
         let bridge = Expr::Column(datafusion::common::Column::new(Some("t"), "id"));
         let right = Expr::Column(datafusion::common::Column::new(
-            Some(datafusion::sql::TableReference::full("b", "public", "t")),
+            Some(datafusion::common::TableReference::full("b", "public", "t")),
             "id",
         ));
 

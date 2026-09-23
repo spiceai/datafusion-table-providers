@@ -1,11 +1,11 @@
-use crate::sql::db_connection_pool::DbConnectionPool;
-use crate::sql::sql_provider_datafusion::expr::Engine;
-use crate::sql::sql_provider_datafusion::{
+use datafusion_table_providers_common::sql::db_connection_pool::DbConnectionPool;
+use datafusion_table_providers_common::sql::sql_provider_datafusion::expr::Engine;
+use datafusion_table_providers_common::sql::sql_provider_datafusion::{
     get_stream, to_execution_error, Result as SqlResult, SqlExec, SqlTable,
 };
-use crate::util::column_reference::ColumnReference;
-use crate::util::indexes::IndexType;
-use crate::util::supported_functions::FunctionSupport;
+use datafusion_table_providers_common::util::column_reference::ColumnReference;
+use datafusion_table_providers_common::util::indexes::IndexType;
+use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::Constraints;
@@ -17,6 +17,7 @@ use std::{fmt, sync::Arc};
 
 use datafusion::{
     arrow::datatypes::SchemaRef,
+    common::TableReference,
     config::ConfigOptions,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
@@ -29,7 +30,7 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     },
-    sql::{unparser::dialect::DuckDBDialect, TableReference},
+    sql::unparser::dialect::DuckDBDialect,
 };
 use datafusion_physical_expr::EquivalenceProperties;
 
@@ -279,6 +280,15 @@ impl<T: 'static, P: 'static> ExecutionPlan for DuckSqlExec<T, P> {
         self.base_exec.children()
     }
 
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        self.base_exec.apply_expressions(f)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
@@ -430,8 +440,8 @@ pub(crate) fn get_cte(table_functions: &Option<HashMap<String, String>>) -> Stri
 mod tests {
     use super::*;
     use crate::duckdb::DynDuckDbConnectionPool;
-    use crate::sql::db_connection_pool::dbconnection::duckdbconn::DuckDBParameter;
-    use crate::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+    use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::duckdbconn::DuckDBParameter;
+    use datafusion_table_providers_common::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::prelude::SessionContext;
     use duckdb::DuckdbConnectionManager;

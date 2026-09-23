@@ -1,5 +1,5 @@
-use crate::sql::db_connection_pool::dbconnection::{get_schema, Error as DbError};
-use crate::sql::sql_provider_datafusion::{get_stream, to_execution_error};
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{get_schema, Error as DbError};
+use datafusion_table_providers_common::sql::sql_provider_datafusion::{get_stream, to_execution_error};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::logical_expr::LogicalPlan;
@@ -7,7 +7,7 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::sql::sqlparser::ast::{self, VisitMut};
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion_federation::sql::{
-    ast_analyzer::AstAnalyzer, RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
+    AstAnalyzer, RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
 };
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
 use futures::TryStreamExt;
@@ -22,7 +22,7 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter,
-    sql::TableReference,
+    common::TableReference,
 };
 
 impl<T, P> SQLiteTable<T, P> {
@@ -90,12 +90,12 @@ impl<T, P> SQLExecutor for SQLiteTable<T, P> {
     }
 
     fn ast_analyzer(&self) -> Option<AstAnalyzer> {
-        let rule = Box::new(sqlite_ast_analyzer(self.decimal_between));
-        Some(AstAnalyzer::new(vec![rule]))
+        let rule: AstAnalyzer = Box::new(sqlite_ast_analyzer(self.decimal_between));
+        Some(rule)
     }
 
-    fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
-        self.base_table.can_execute_plan(plan)
+    fn logical_optimizer(&self) -> Option<datafusion_federation::sql::LogicalOptimizer> {
+        self.base_table.logical_optimizer()
     }
 
     fn execute(

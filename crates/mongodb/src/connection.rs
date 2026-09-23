@@ -2,7 +2,7 @@ use async_stream::stream;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::TryStreamExt;
 use mongodb::{
     bson::{doc, Document},

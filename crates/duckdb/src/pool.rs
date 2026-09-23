@@ -685,7 +685,7 @@ mod test {
     use rand::Rng;
 
     use super::*;
-    use crate::sql::db_connection_pool::DbConnectionPool;
+    use datafusion_table_providers_common::sql::db_connection_pool::DbConnectionPool;
 
     fn random_db_name() -> String {
         let mut rng = rand::rng();
@@ -799,7 +799,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(feature = "duckdb-federation")]
+    #[cfg(feature = "federation")]
     async fn test_duckdb_connection_pool_with_attached_databases() {
         let db_base_name = random_db_name();
         let db_attached_name = random_db_name();

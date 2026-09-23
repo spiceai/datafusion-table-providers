@@ -4,7 +4,7 @@ use datafusion::common::Constraints;
 use datafusion::common::ToDFSchema;
 use datafusion::logical_expr::CreateExternalTable;
 use datafusion::prelude::SessionContext;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -62,7 +62,7 @@ async fn test_postgres_schema_inference() {
     let cmd = CreateExternalTable {
         schema: schema.to_dfschema_ref().expect("to df schema"),
         name: table_name.into(),
-        location: "".to_string(),
+        locations: vec![],
         file_type: "".to_string(),
         table_partition_cols: vec![],
         if_not_exists: false,

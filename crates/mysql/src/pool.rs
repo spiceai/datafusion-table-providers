@@ -42,7 +42,7 @@ pub enum Error {
 
     #[snafu(display("Cannot connect to MySQL on {host}:{port}. Ensure the host and port are correct and reachable."))]
     InvalidHostOrPortError {
-        source: crate::util::ns_lookup::Error,
+        source: datafusion_table_providers_common::util::ns_lookup::Error,
         host: String,
         port: u16,
     },

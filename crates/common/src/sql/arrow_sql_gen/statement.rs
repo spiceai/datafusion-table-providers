@@ -9,7 +9,7 @@ use datafusion::arrow::{
     datatypes::{DataType, Field, Fields, IntervalUnit, Schema, SchemaRef, TimeUnit},
     util::display::array_value_to_string,
 };
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use num_bigint::BigInt;
 use sea_query::{
     Alias, ColumnDef, ColumnType, Expr, GenericBuilder, Index, InsertStatement, IntoIden,
@@ -90,6 +90,24 @@ impl CreateTableBuilder {
             self.build(PostgresQueryBuilder, &|f: &Arc<Field>| -> ColumnType {
                 map_data_type_to_column_type_postgres(f.data_type(), &table_name, f.name())
             });
+
+        // Postgres supports composite types (i.e. Structs) but needs to have the type defined first
+        // https://www.postgresql.org/docs/current/rowtypes.html
+        let mut creation_stmts = Vec::new();
+        for field in schema.fields() {
+            let DataType::Struct(struct_inner_fields) = field.data_type() else {
+                continue;
+            };
+            let type_builder = TypeBuilder::new(
+                get_postgres_composite_type_name(&table_name, field.name()),
+                struct_inner_fields,
+            );
+            creation_stmts.push(type_builder.build());
+        }
+
+        creation_stmts.push(main_table_creation);
+        creation_stmts
+    }
 
     #[must_use]
     pub fn build_sqlite(self) -> String {

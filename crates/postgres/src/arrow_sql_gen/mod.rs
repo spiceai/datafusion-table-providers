@@ -2,8 +2,8 @@ use std::convert;
 use std::io::Read;
 use std::sync::Arc;
 
-use crate::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder_optional;
-use crate::sql::arrow_sql_gen::statement::map_data_type_to_column_type;
+use datafusion_table_providers_common::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder_optional;
+use datafusion_table_providers_common::sql::arrow_sql_gen::statement::map_data_type_to_column_type;
 use arrow::array::{
     new_null_array, Array, ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder,
     Decimal128Builder, FixedSizeListBuilder, Float32Builder, Float64Builder, Int16Builder,
@@ -2829,7 +2829,7 @@ mod tests {
         );
 
         // The builder for this Arrow type must downcast to ListBuilder<StructBuilder>.
-        let mut builder = crate::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder(&dt);
+        let mut builder = datafusion_table_providers_common::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder(&dt);
         assert!(
             builder
                 .as_any_mut()

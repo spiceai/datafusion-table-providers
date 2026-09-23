@@ -286,7 +286,7 @@ impl DbConnectionPool<Connection, &'static (dyn ToSql + Sync)> for SqliteConnect
 mod tests {
     use super::*;
     use datafusion_table_providers_common::sql::db_connection_pool::Mode;
-    use rand::RngExt;
+    use rand::Rng;
     use rstest::rstest;
     use std::time::Duration;
 

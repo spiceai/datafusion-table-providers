@@ -14,14 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::sql::db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
-use crate::sql::{
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
+use datafusion_table_providers_common::sql::{
     db_connection_pool as db_connection_pool_datafusion,
     sql_provider_datafusion::{expr, SqlTable},
 };
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::error::DataFusionError;
-use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion::{datasource::TableProvider, common::TableReference};
 use snafu::prelude::*;
 use std::sync::Arc;
 
@@ -77,7 +77,7 @@ where
 
         let table_provider = Arc::new(table);
 
-        #[cfg(feature = "odbc-federation")]
+        #[cfg(feature = "federation")]
         let table_provider = Arc::new(
             table_provider
                 .create_federated_table_provider()

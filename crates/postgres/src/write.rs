@@ -13,12 +13,12 @@ use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{dml::InsertOp, Expr},
     physical_plan::{metrics::MetricsSet, DisplayAs, DisplayFormatType, ExecutionPlan},
-    sql::TableReference,
+    common::TableReference,
 };
 use futures::StreamExt;
 use snafu::prelude::*;
 
-use crate::util::{
+use datafusion_table_providers_common::util::{
     constraints::{self},
     count_exec::make_count_exec,
     dml::{
@@ -313,7 +313,7 @@ impl DataSink for PostgresDataSink {
             constraints::validate_batch_with_constraints(
                 vec![batch.clone()],
                 self.postgres.constraints(),
-                &crate::util::constraints::UpsertOptions::default(),
+                &datafusion_table_providers_common::util::constraints::UpsertOptions::default(),
             )
             .await
             .context(super::ConstraintViolationSnafu)

@@ -61,7 +61,7 @@ r2d2_adbc = "0.3.0"
 rand = "0.10"
 reqwest = "0.13"
 rstest = "0.26.1"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { workspace = true, features = ["bundled"] }
 secrecy = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -69,7 +69,7 @@ sha2 = "0.11"
 tempfile = "3.27.0"
 test-log = { version = "0.2", features = ["trace"] }
 tokio = { version = "1.52", features = ["macros", "fs", "rt-multi-thread"] }
-tokio-rusqlite = "0.7"
+tokio-rusqlite = { workspace = true }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", features = ["tls-native-roots", "tls-webpki-roots"] }
 tracing = "0.1"

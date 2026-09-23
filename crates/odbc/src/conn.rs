@@ -18,7 +18,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::sql::db_connection_pool::{
+use datafusion_table_providers_common::sql::db_connection_pool::{
     dbconnection::{self, AsyncDbConnection, DbConnection, GenericError},
     runtime::run_async_with_tokio,
     DbConnectionPool,
@@ -38,7 +38,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use dyn_clone::DynClone;
 use futures::lock::Mutex;
 use secrecy::{ExposeSecret, SecretBox, SecretString};

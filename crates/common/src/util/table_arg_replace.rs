@@ -1,10 +1,8 @@
 use std::ops::ControlFlow;
 
-use datafusion::sql::{
-    sqlparser::ast::{
-        FunctionArg, Ident, ObjectName, TableAlias, TableFactor, TableFunctionArgs, VisitorMut,
-    },
-    TableReference,
+use datafusion::common::TableReference;
+use datafusion::sql::sqlparser::ast::{
+    FunctionArg, Ident, ObjectName, TableAlias, TableFactor, TableFunctionArgs, VisitorMut,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -44,8 +42,8 @@ impl TableArgReplace {
     }
 
     #[cfg(feature = "federation")]
-    /// Converts the `TableArgReplace` instance into an `AstAnalyzerRule`.
-    pub fn into_analyzer(self) -> datafusion_federation::sql::ast_analyzer::AstAnalyzerRule {
+    /// Converts the `TableArgReplace` instance into an `AstAnalyzer`.
+    pub fn into_analyzer(self) -> datafusion_federation::sql::AstAnalyzer {
         let mut visitor = self;
         let x = move |mut statement: datafusion::sql::sqlparser::ast::Statement| {
             let _ = datafusion::sql::sqlparser::ast::VisitMut::visit(&mut statement, &mut visitor);

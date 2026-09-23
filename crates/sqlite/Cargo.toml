@@ -11,6 +11,7 @@ description = "DataFusion sqlite table provider"
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
 async-trait = "0.1"
+bigdecimal = { workspace = true }
 chrono = "0.4.44"
 datafusion = { workspace = true, default-features = false, features = ["sql"] }
 datafusion-federation = { workspace = true, features = ["sql"], optional = true }
@@ -20,7 +21,9 @@ futures = "0.3"
 rusqlite = { workspace = true }
 sea-query = { workspace = true }
 secrecy = { workspace = true }
+serde_json = { workspace = true }
 snafu = { workspace = true }
+time = { workspace = true }
 tokio = { workspace = true }
 tokio-rusqlite = { workspace = true }
 tracing = { workspace = true }

@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::sql::db_connection_pool::dbconnection::odbcconn::ODBCConnection;
-use crate::sql::db_connection_pool::dbconnection::odbcconn::{ODBCDbConnection, ODBCParameter};
-use crate::sql::db_connection_pool::{
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::odbcconn::ODBCConnection;
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::odbcconn::{ODBCDbConnection, ODBCParameter};
+use datafusion_table_providers_common::sql::db_connection_pool::{
     runtime::run_async_with_tokio, DbConnectionPool, JoinPushDown,
 };
 use arrow_odbc::odbc_api::{

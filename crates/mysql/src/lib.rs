@@ -14,19 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::mysql::write::MySQLTableWriter;
-use crate::sql::arrow_sql_gen::mysql::MysqlZeroDateBehavior;
-use crate::sql::arrow_sql_gen::statement::{CreateTableBuilder, IndexBuilder, InsertBuilder};
-use crate::sql::db_connection_pool::dbconnection::mysqlconn::MySQLConnection;
-use crate::sql::db_connection_pool::dbconnection::DbConnection;
-use crate::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
-use crate::sql::db_connection_pool::{self, mysqlpool, DbConnectionPool};
-use crate::sql::sql_provider_datafusion::{self, expr, expr::Engine, SqlTable};
-use crate::util::supported_functions::FunctionSupport;
-use crate::util::{
+use datafusion_table_providers_common::sql::arrow_sql_gen::mysql::MysqlZeroDateBehavior;
+use datafusion_table_providers_common::sql::arrow_sql_gen::statement::{CreateTableBuilder, IndexBuilder, InsertBuilder};
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::mysqlconn::MySQLConnection;
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::DbConnection;
+use datafusion_table_providers_common::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
+use datafusion_table_providers_common::sql::db_connection_pool::{self, mysqlpool, DbConnectionPool};
+use datafusion_table_providers_common::sql::sql_provider_datafusion::{self, expr, expr::Engine, SqlTable};
+use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
+use datafusion_table_providers_common::util::{
     self, column_reference::ColumnReference, constraints::get_primary_keys_from_constraints,
     indexes::IndexType, on_conflict::OnConflict, secrets::to_secret_map, to_datafusion_error,
 };
-use crate::util::{column_reference, constraints, on_conflict};
+use datafusion_table_providers_common::util::{column_reference, constraints, on_conflict};
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
@@ -34,7 +34,7 @@ use datafusion::catalog::Session;
 use datafusion::sql::unparser::dialect::MySqlDialect;
 use datafusion::{
     catalog::TableProviderFactory, common::Constraints, datasource::TableProvider,
-    error::DataFusionError, logical_expr::CreateExternalTable, sql::TableReference,
+    error::DataFusionError, logical_expr::CreateExternalTable, common::TableReference,
 };
 use mysql_async::prelude::{Queryable, ToValue};
 use mysql_async::{Metrics, TxOpts};
@@ -49,7 +49,7 @@ pub type DynMySQLConnectionPool =
 
 pub type DynMySQLConnection = dyn DbConnection<mysql_async::Conn, &'static (dyn ToValue + Sync)>;
 
-#[cfg(feature = "mysql-federation")]
+#[cfg(feature = "federation")]
 pub mod federation;
 pub(crate) mod mysql_window;
 pub mod sql_table;
@@ -93,7 +93,7 @@ pub enum Error {
 
     #[snafu(display("Unable to create insertion statement for MySQL table: {source}"))]
     UnableToCreateInsertStatement {
-        source: crate::sql::arrow_sql_gen::statement::Error,
+        source: datafusion_table_providers_common::sql::arrow_sql_gen::statement::Error,
     },
 
     #[snafu(display("The table '{table_name}' doesn't exist in the MySQL server"))]
@@ -155,7 +155,7 @@ impl MySQLTableFactory {
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
         );
 
-        #[cfg(feature = "mysql-federation")]
+        #[cfg(feature = "federation")]
         let table_provider = Arc::new(
             table_provider
                 .create_federated_table_provider()
@@ -328,7 +328,7 @@ impl TableProviderFactory for MySQLTableProviderFactory {
             .with_dialect(Arc::new(MySqlDialect {})),
         );
 
-        #[cfg(feature = "mysql-federation")]
+        #[cfg(feature = "federation")]
         let read_provider = Arc::new(read_provider.create_federated_table_provider()?);
         Ok(MySQLTableWriter::create(read_provider, mysql, on_conflict))
     }

@@ -1,14 +1,14 @@
-use crate::sql::arrow_sql_gen::statement::IndexBuilder;
-use crate::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
-use crate::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-use crate::util::on_conflict::OnConflict;
+use datafusion_table_providers_common::sql::arrow_sql_gen::statement::IndexBuilder;
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
+use datafusion_table_providers_common::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+use datafusion_table_providers_common::util::on_conflict::OnConflict;
 use arrow::{
     array::{RecordBatch, RecordBatchIterator, RecordBatchReader},
     datatypes::SchemaRef,
     ffi_stream::FFI_ArrowArrayStream,
 };
 use datafusion::common::Constraints;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use duckdb::Transaction;
 use itertools::Itertools;
 use snafu::prelude::*;
@@ -17,8 +17,8 @@ use std::fmt::Display;
 use std::sync::{Arc, Mutex};
 
 use super::DuckDB;
-use crate::sql::sql_provider_datafusion::expr;
-use crate::util::{
+use datafusion_table_providers_common::sql::sql_provider_datafusion::expr;
+use datafusion_table_providers_common::util::{
     column_reference::ColumnReference, constraints::get_primary_keys_from_constraints,
     indexes::IndexType,
 };

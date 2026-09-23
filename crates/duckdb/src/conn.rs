@@ -12,7 +12,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::sqlparser::ast::TableFactor;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::{dialect::DuckDbDialect, tokenizer::Tokenizer};
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use duckdb::vtab::to_duckdb_type_id;
 use duckdb::ToSql;
 use duckdb::{Connection, DuckdbConnectionManager};
@@ -21,9 +21,9 @@ use rand::distr::{Alphanumeric, SampleString};
 use snafu::{prelude::*, ResultExt};
 use tokio::sync::mpsc::Sender;
 
-use crate::sql::db_connection_pool::runtime::run_sync_with_tokio;
-use crate::util::schema::SchemaValidator;
-use crate::UnsupportedTypeAction;
+use datafusion_table_providers_common::sql::db_connection_pool::runtime::run_sync_with_tokio;
+use datafusion_table_providers_common::util::schema::SchemaValidator;
+use datafusion_table_providers_common::UnsupportedTypeAction;
 
 use super::DbConnection;
 use super::Result;
@@ -1202,8 +1202,8 @@ mod tests {
         use arrow::datatypes::{Schema, TimeUnit};
         use futures::StreamExt;
 
-        use crate::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-        use crate::sql::db_connection_pool::DbConnectionPool;
+        use datafusion_table_providers_common::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+        use datafusion_table_providers_common::sql::db_connection_pool::DbConnectionPool;
 
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         rt.block_on(async {

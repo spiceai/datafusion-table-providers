@@ -17,7 +17,7 @@ use tokio_postgres;
 use super::{
     runtime::run_async_with_tokio, DbConnectionPool, PasswordProvider, StaticPasswordProvider,
 };
-use crate::sql::db_connection_pool::{
+use datafusion_table_providers_common::sql::db_connection_pool::{
     dbconnection::{
         postgresconn::{variant_from_version, PostgresConnection, PostgresVariant},
         AsyncDbConnection, DbConnection,
@@ -50,7 +50,7 @@ pub enum Error {
 
     #[snafu(display("Cannot connect to PostgreSQL on {host}:{port}. Ensure the host and port are correct and reachable."))]
     InvalidHostOrPortError {
-        source: crate::util::ns_lookup::Error,
+        source: datafusion_table_providers_common::util::ns_lookup::Error,
         host: String,
         port: u16,
     },

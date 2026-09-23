@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use bb8_oracle::OracleConnectionManager;
 use datafusion::{
     arrow::datatypes::SchemaRef, execution::SendableRecordBatchStream,
-    physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
+    physical_plan::stream::RecordBatchStreamAdapter, common::TableReference,
 };
 use std::{any::Any, sync::Arc};
 

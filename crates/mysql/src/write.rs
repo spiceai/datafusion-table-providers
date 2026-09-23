@@ -151,7 +151,7 @@ impl DataSink for MySQLDataSink {
             constraints::validate_batch_with_constraints(
                 vec![batch.clone()],
                 self.mysql.constraints(),
-                &crate::util::constraints::UpsertOptions::default(),
+                &datafusion_table_providers_common::util::constraints::UpsertOptions::default(),
             )
             .await
             .context(super::ConstraintViolationSnafu)

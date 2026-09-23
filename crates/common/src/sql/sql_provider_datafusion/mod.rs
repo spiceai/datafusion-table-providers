@@ -45,7 +45,7 @@ use datafusion::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         SendableRecordBatchStream,
     },
-    sql::TableReference,
+    common::TableReference,
 };
 
 pub mod expr;
@@ -311,7 +311,7 @@ impl<T, P> SqlTable<T, P> {
         Arc::clone(&self.pool)
     }
 
-    pub(crate) fn function_support(&self) -> Option<FunctionSupport> {
+    pub fn function_support(&self) -> Option<FunctionSupport> {
         self.function_support.clone()
     }
 
@@ -699,6 +699,16 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
         vec![]
     }
 
+    // `SqlExec` holds an already-rendered SQL string, not a `PhysicalExpr` tree.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> DataFusionResult<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> DataFusionResult<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
@@ -917,7 +927,7 @@ mod tests {
     use std::{error::Error, sync::Arc};
 
     use datafusion::execution::context::SessionContext;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use tracing::{level_filters::LevelFilter, subscriber::DefaultGuard, Dispatch};
 
     use crate::sql::sql_provider_datafusion::SqlTable;
@@ -939,7 +949,7 @@ mod tests {
         use datafusion::sql::unparser::dialect::{Dialect, SqliteDialect};
         use datafusion::{
             logical_expr::{col, lit},
-            sql::TableReference,
+            common::TableReference,
         };
 
         use crate::sql::db_connection_pool::{
@@ -1100,7 +1110,7 @@ mod tests {
             Volatility,
         };
         use datafusion::sql::unparser::dialect::SqliteDialect;
-        use datafusion::sql::TableReference;
+        use datafusion::common::TableReference;
 
         use crate::sql::db_connection_pool::{
             dbconnection::DbConnection, DbConnectionPool, JoinPushDown,
@@ -1296,7 +1306,7 @@ mod tests {
         use datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult;
         use datafusion::physical_plan::ExecutionPlan;
         use datafusion::sql::unparser::dialect::DefaultDialect;
-        use datafusion::sql::TableReference;
+        use datafusion::common::TableReference;
         use std::sync::Arc;
 
         use crate::sql::db_connection_pool::{

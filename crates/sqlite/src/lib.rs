@@ -1,18 +1,19 @@
-use crate::sql::arrow_sql_gen::statement::{CreateTableBuilder, IndexBuilder, InsertBuilder};
-use crate::sql::db_connection_pool::dbconnection::{self, get_schema, AsyncDbConnection};
-use crate::sql::db_connection_pool::sqlitepool::SqliteConnectionPoolFactory;
-use crate::sql::db_connection_pool::DbInstanceKey;
-use crate::sql::db_connection_pool::{
+use datafusion_table_providers_common::sql::arrow_sql_gen::statement::{CreateTableBuilder, IndexBuilder, InsertBuilder};
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{self, get_schema, AsyncDbConnection};
+use crate::pool::SqliteConnectionPoolFactory;
+use datafusion_table_providers_common::sql::db_connection_pool::DbInstanceKey;
+use datafusion_table_providers_common::sql::db_connection_pool::{
     self,
-    dbconnection::{sqliteconn::SqliteConnection, DbConnection},
-    sqlitepool::SqliteConnectionPool,
+    dbconnection::DbConnection,
     DbConnectionPool, Mode,
 };
-use crate::sql::sql_provider_datafusion;
-use crate::sql::sql_provider_datafusion::expr;
-use crate::util::schema::SchemaValidator;
-use crate::util::supported_functions::FunctionSupport;
-use crate::UnsupportedTypeAction;
+use crate::conn::SqliteConnection;
+use crate::pool::SqliteConnectionPool;
+use datafusion_table_providers_common::sql::sql_provider_datafusion;
+use datafusion_table_providers_common::sql::sql_provider_datafusion::expr;
+use datafusion_table_providers_common::util::schema::SchemaValidator;
+use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
+use datafusion_table_providers_common::UnsupportedTypeAction;
 use arrow::array::{Int64Array, StringArray};
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
@@ -23,7 +24,7 @@ use datafusion::{
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::CreateExternalTable,
-    sql::TableReference,
+    common::TableReference,
 };
 use futures::TryStreamExt;
 use rusqlite::{ToSql, Transaction};
@@ -36,7 +37,7 @@ use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use tokio_rusqlite::Connection;
 
-use crate::util::{
+use datafusion_table_providers_common::util::{
     self,
     column_reference::{self, ColumnReference},
     constraints::{self, get_primary_keys_from_constraints},
@@ -47,15 +48,18 @@ use crate::util::{
 
 use self::write::SqliteTableWriter;
 
-#[cfg(feature = "sqlite-federation")]
+#[cfg(feature = "federation")]
 pub mod federation;
 
-#[cfg(feature = "sqlite-federation")]
+#[cfg(feature = "federation")]
 pub mod sqlite_interval;
 
-#[cfg(feature = "sqlite-federation")]
+#[cfg(feature = "federation")]
 pub mod between;
 
+pub mod arrow_sql_gen;
+pub mod conn;
+pub mod pool;
 pub mod sql_table;
 pub mod write;
 
@@ -436,7 +440,7 @@ impl TableProviderFactory for SqliteTableProviderFactory {
             .context(DanglingReferenceToSqliteSnafu)
             .map_err(to_datafusion_error)?;
 
-        #[cfg(feature = "sqlite-federation")]
+        #[cfg(feature = "federation")]
         let read_provider: Arc<dyn TableProvider> =
             Arc::new(read_provider.create_federated_table_provider()?);
 
@@ -861,27 +865,35 @@ impl Sqlite {
         // Add ON CONFLICT clause if specified
         if let Some(oc) = on_conflict {
             use sea_query::SeaRc;
-            use sea_query::{Alias, Query, SqliteQueryBuilder, TableRef};
+            use sea_query::{Alias, DatabaseName, Query, SchemaName, SqliteQueryBuilder, TableName, TableRef};
 
             let sea_query_on_conflict = oc.build_sea_query_on_conflict(&self.schema);
 
             // Build a temporary table reference for the dummy statement
             let table_ref = match &self.table {
                 TableReference::Bare { table } => {
-                    TableRef::Table(SeaRc::new(Alias::new(table.to_string())))
+                    TableRef::Table(TableName(None, SeaRc::new(Alias::new(table.to_string()))), None)
                 }
-                TableReference::Partial { schema, table } => TableRef::SchemaTable(
-                    SeaRc::new(Alias::new(schema.to_string())),
-                    SeaRc::new(Alias::new(table.to_string())),
+                TableReference::Partial { schema, table } => TableRef::Table(
+                    TableName(
+                        Some(SchemaName(None, SeaRc::new(Alias::new(schema.to_string())))),
+                        SeaRc::new(Alias::new(table.to_string())),
+                    ),
+                    None,
                 ),
                 TableReference::Full {
                     catalog,
                     schema,
                     table,
-                } => TableRef::DatabaseSchemaTable(
-                    SeaRc::new(Alias::new(catalog.to_string())),
-                    SeaRc::new(Alias::new(schema.to_string())),
-                    SeaRc::new(Alias::new(table.to_string())),
+                } => TableRef::Table(
+                    TableName(
+                        Some(SchemaName(
+                            Some(DatabaseName(SeaRc::new(Alias::new(catalog.to_string())))),
+                            SeaRc::new(Alias::new(schema.to_string())),
+                        )),
+                        SeaRc::new(Alias::new(table.to_string())),
+                    ),
+                    None,
                 ),
             };
 
@@ -1564,7 +1576,7 @@ pub(crate) mod tests {
         prelude::SessionContext,
     };
 
-    use crate::sql::db_connection_pool::JoinPushDown;
+    use datafusion_table_providers_common::sql::db_connection_pool::JoinPushDown;
 
     use super::*;
 
@@ -1653,7 +1665,7 @@ pub(crate) mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("test_table"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,

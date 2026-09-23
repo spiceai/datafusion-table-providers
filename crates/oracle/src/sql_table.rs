@@ -315,6 +315,15 @@ impl ExecutionPlan for OracleSQLExec {
         self.base_exec.children()
     }
 
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        self.base_exec.apply_expressions(f)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,

@@ -11,7 +11,7 @@ use datafusion::common::{Constraints, ToDFSchema};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{dml::InsertOp, CreateExternalTable};
 use datafusion::physical_plan::collect;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 
 use datafusion_federation::schema_cast::record_convert::try_cast_to;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::{
@@ -299,7 +299,7 @@ async fn test_sqlite_table_provider_roundtrip(
     let external_table = CreateExternalTable {
         schema: df_schema,
         name: TableReference::bare(table_name),
-        location: String::new(),
+        locations: vec![],
         file_type: String::new(),
         table_partition_cols: vec![],
         if_not_exists: true,
@@ -383,7 +383,7 @@ async fn test_sqlite_list_utf8_federation_roundtrip() {
     let external_table = CreateExternalTable {
         schema: df_schema,
         name: TableReference::bare(table_name),
-        location: String::new(),
+        locations: vec![],
         file_type: String::new(),
         table_partition_cols: vec![],
         if_not_exists: true,
@@ -513,7 +513,7 @@ mod sort_limit_pushdown {
         let cmd = CreateExternalTable {
             schema: Arc::new(batch.schema().to_dfschema().unwrap()),
             name: name.into(),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: false,

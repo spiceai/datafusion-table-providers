@@ -3,13 +3,13 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 
-use crate::sql::arrow_sql_gen::postgres::rows_to_arrow;
-use crate::sql::arrow_sql_gen::postgres::schema::pg_data_type_to_arrow_type;
-use crate::sql::arrow_sql_gen::postgres::schema::ParseContext;
-use crate::sql::db_connection_pool::postgrespool::ConnectionManager;
-use crate::util::handle_unsupported_type_error;
-use crate::util::schema::SchemaValidator;
-use crate::UnsupportedTypeAction;
+use datafusion_table_providers_common::sql::arrow_sql_gen::postgres::rows_to_arrow;
+use datafusion_table_providers_common::sql::arrow_sql_gen::postgres::schema::pg_data_type_to_arrow_type;
+use datafusion_table_providers_common::sql::arrow_sql_gen::postgres::schema::ParseContext;
+use datafusion_table_providers_common::sql::db_connection_pool::postgrespool::ConnectionManager;
+use datafusion_table_providers_common::util::handle_unsupported_type_error;
+use datafusion_table_providers_common::util::schema::SchemaValidator;
+use datafusion_table_providers_common::UnsupportedTypeAction;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
@@ -25,7 +25,7 @@ fn maybe_db_source_err(err: tokio_postgres::Error) -> Box<dyn Error + Send + Syn
     }
 }
 
-/// A pooled Postgres connection obtained from a [`PostgresConnectionPool`](crate::sql::db_connection_pool::postgrespool::PostgresConnectionPool).
+/// A pooled Postgres connection obtained from a [`PostgresConnectionPool`](datafusion_table_providers_common::sql::db_connection_pool::postgrespool::PostgresConnectionPool).
 ///
 /// Dereferences to [`tokio_postgres::Client`](bb8_postgres::tokio_postgres::Client) for executing queries.
 // Defined here rather than in `postgrespool` to avoid a type-resolution cycle
@@ -35,7 +35,7 @@ pub type PostgresPooledConnection = bb8::PooledConnection<'static, ConnectionMan
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::stream;
 use futures::StreamExt;
 
@@ -300,7 +300,7 @@ pub enum PostgresError {
 
     #[snafu(display("Failed to convert query result to Arrow.\n{source}\nReport a bug to request support: https://github.com/datafusion-contrib/datafusion-table-providers/issues"))]
     ConversionError {
-        source: crate::sql::arrow_sql_gen::postgres::Error,
+        source: datafusion_table_providers_common::sql::arrow_sql_gen::postgres::Error,
     },
 }
 

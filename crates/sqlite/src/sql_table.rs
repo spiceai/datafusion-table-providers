@@ -1,6 +1,6 @@
-use crate::sql::db_connection_pool::DbConnectionPool;
-use crate::sql::sql_provider_datafusion::expr::Engine;
-use crate::util::supported_functions::FunctionSupport;
+use datafusion_table_providers_common::sql::db_connection_pool::DbConnectionPool;
+use datafusion_table_providers_common::sql::sql_provider_datafusion::expr::Engine;
+use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::Constraints;
@@ -9,7 +9,7 @@ use futures::TryStreamExt;
 use std::fmt::Display;
 use std::{fmt, sync::Arc};
 
-use crate::sql::sql_provider_datafusion::{
+use datafusion_table_providers_common::sql::sql_provider_datafusion::{
     get_stream, to_execution_error, Result as SqlResult, SqlExec, SqlTable,
 };
 use datafusion::{
@@ -26,7 +26,7 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     },
-    sql::TableReference,
+    common::TableReference,
 };
 
 pub struct SQLiteTable<T: 'static, P: 'static> {
@@ -184,6 +184,15 @@ impl<T: 'static, P: 'static> ExecutionPlan for SQLiteSqlExec<T, P> {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         self.base_exec.children()
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        self.base_exec.apply_expressions(f)
     }
 
     fn with_new_children(

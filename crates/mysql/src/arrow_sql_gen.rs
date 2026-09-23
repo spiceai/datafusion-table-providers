@@ -1,4 +1,4 @@
-use crate::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder_optional;
+use datafusion_table_providers_common::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder_optional;
 use arrow::{
     array::{
         ArrayBuilder, ArrayRef, BinaryBuilder, Date32Builder, Decimal128Builder, Decimal256Builder,

@@ -95,6 +95,16 @@ impl ExecutionPlan for CountExec {
         vec![]
     }
 
+    // `CountExec` holds no `PhysicalExpr`, so there is nothing to visit.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,

@@ -14,7 +14,7 @@ use datafusion::{
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
 };
 
-use crate::sql::sql_provider_datafusion::{expr, project_schema_safe, SqlExec};
+use datafusion_table_providers_common::sql::sql_provider_datafusion::{expr, project_schema_safe, SqlExec};
 
 use super::ClickHouseTable;
 
@@ -120,11 +120,11 @@ impl Display for ClickHouseTable {
 mod tests {
     use super::*;
     use crate::clickhouse::Arg;
-    use crate::sql::db_connection_pool::{clickhousepool::ClickHouseConnectionPool, JoinPushDown};
+    use datafusion_table_providers_common::sql::db_connection_pool::{clickhousepool::ClickHouseConnectionPool, JoinPushDown};
     use clickhouse::Client;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::Constraints;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
 
     fn new_clickhouse_table(args: Option<Vec<(String, Arg)>>) -> ClickHouseTable {
         let pool = Arc::new(ClickHouseConnectionPool {

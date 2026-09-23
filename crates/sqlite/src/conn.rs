@@ -6,7 +6,7 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::memory::MemoryStream;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_table_providers_common::util::schema::SchemaValidator;
 use datafusion_table_providers_common::UnsupportedTypeAction;
 use rusqlite::ToSql;

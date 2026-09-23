@@ -1,5 +1,5 @@
-use crate::sql::db_connection_pool::dbconnection::{get_schema, Error as DbError};
-use crate::sql::sql_provider_datafusion::{get_stream, to_execution_error};
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{get_schema, Error as DbError};
+use datafusion_table_providers_common::sql::sql_provider_datafusion::{get_stream, to_execution_error};
 use arrow::datatypes::SchemaRef;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_expr::PhysicalExpr;
@@ -20,7 +20,7 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter,
-    sql::TableReference,
+    common::TableReference,
 };
 
 impl<T, P> DuckDBTable<T, P> {
@@ -78,8 +78,8 @@ impl<T, P> SQLExecutor for DuckDBTable<T, P> {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
-        self.base_table.can_execute_plan(plan)
+    fn logical_optimizer(&self) -> Option<datafusion_federation::sql::LogicalOptimizer> {
+        self.base_table.logical_optimizer()
     }
 
     async fn table_names(&self) -> DataFusionResult<Vec<String>> {

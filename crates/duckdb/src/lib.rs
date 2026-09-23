@@ -1,7 +1,7 @@
 use crate::duckdb::write_settings::DuckDBWriteSettings;
-use crate::sql::sql_provider_datafusion;
-use crate::util::supported_functions::FunctionSupport;
-use crate::util::{
+use datafusion_table_providers_common::sql::sql_provider_datafusion;
+use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
+use datafusion_table_providers_common::util::{
     self,
     column_reference::{self, ColumnReference},
     constraints,
@@ -31,7 +31,7 @@ use datafusion::{
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::CreateExternalTable,
-    sql::TableReference,
+    common::TableReference,
 };
 use duckdb::{AccessMode, DuckdbConnectionManager};
 use itertools::Itertools;
@@ -46,7 +46,7 @@ pub use self::settings::{
 };
 use self::sql_table::DuckDBTable;
 
-#[cfg(feature = "duckdb-federation")]
+#[cfg(feature = "federation")]
 mod federation;
 
 mod creator;
@@ -568,7 +568,7 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
             indexes,
         ));
 
-        #[cfg(feature = "duckdb-federation")]
+        #[cfg(feature = "federation")]
         let read_provider: Arc<dyn TableProvider> =
             Arc::new(read_provider.create_federated_table_provider()?);
 
@@ -749,7 +749,7 @@ impl DuckDBTableFactory {
             self.indexes.clone(),
         ));
 
-        #[cfg(feature = "duckdb-federation")]
+        #[cfg(feature = "federation")]
         let table_provider: Arc<dyn TableProvider> =
             Arc::new(table_provider.create_federated_table_provider()?);
 
@@ -854,7 +854,7 @@ pub(crate) mod tests {
     use datafusion::common::{Constraints, ToDFSchema};
     use datafusion::logical_expr::CreateExternalTable;
     use datafusion::prelude::SessionContext;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -911,7 +911,7 @@ pub(crate) mod tests {
         let cmd = CreateExternalTable {
             schema: Arc::new(schema.to_dfschema().expect("to df schema")),
             name: table_name,
-            location: "".to_string(),
+            locations: vec![],
             file_type: "".to_string(),
             table_partition_cols: vec![],
             if_not_exists: false,
@@ -972,7 +972,7 @@ pub(crate) mod tests {
         let cmd = CreateExternalTable {
             schema: Arc::new(schema.to_dfschema().expect("to df schema")),
             name: table_name,
-            location: "".to_string(),
+            locations: vec![],
             file_type: "".to_string(),
             table_partition_cols: vec![],
             if_not_exists: false,
@@ -1029,7 +1029,7 @@ pub(crate) mod tests {
         let cmd = CreateExternalTable {
             schema: Arc::new(schema.to_dfschema().expect("to df schema")),
             name: table_name,
-            location: "".to_string(),
+            locations: vec![],
             file_type: "".to_string(),
             table_partition_cols: vec![],
             if_not_exists: false,
@@ -1084,7 +1084,7 @@ pub(crate) mod tests {
         let cmd = CreateExternalTable {
             schema: Arc::new(schema.to_dfschema().expect("to df schema")),
             name: table_name,
-            location: "".to_string(),
+            locations: vec![],
             file_type: "".to_string(),
             table_partition_cols: vec![],
             if_not_exists: false,
@@ -1142,7 +1142,7 @@ pub(crate) mod tests {
         let cmd = CreateExternalTable {
             schema: Arc::new(schema.to_dfschema().expect("to df schema")),
             name: table_name,
-            location: "".to_string(),
+            locations: vec![],
             file_type: "".to_string(),
             table_partition_cols: vec![],
             if_not_exists: false,

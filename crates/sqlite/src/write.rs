@@ -12,14 +12,14 @@ use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{dml::InsertOp, Expr},
     physical_plan::{metrics::MetricsSet, DisplayAs, DisplayFormatType, ExecutionPlan},
-    sql::TableReference,
+    common::TableReference,
 };
 use futures::StreamExt;
 use snafu::prelude::*;
 
-use crate::sql::sql_provider_datafusion::expr;
+use datafusion_table_providers_common::sql::sql_provider_datafusion::expr;
 
-use crate::util::{
+use datafusion_table_providers_common::util::{
     constraints,
     count_exec::make_count_exec,
     dml::{
@@ -292,7 +292,7 @@ impl DataSink for SqliteDataSink {
                 constraints::validate_batch_with_constraints(
                     vec![data_batch.clone()],
                     &constraints,
-                    &crate::util::constraints::UpsertOptions::default(),
+                    &datafusion_table_providers_common::util::constraints::UpsertOptions::default(),
                 )
                 .await
                 .context(super::ConstraintViolationSnafu)
@@ -427,8 +427,8 @@ mod tests {
     use datafusion::arrow::array::UInt64Array;
     use datafusion::logical_expr::{col, lit};
 
-    use crate::sqlite::SqliteTableProviderFactory;
-    use crate::util::test::MockExec;
+    use crate::SqliteTableProviderFactory;
+    use datafusion_table_providers_common::util::test::MockExec;
 
     #[tokio::test]
     #[allow(clippy::unreadable_literal)]
@@ -441,7 +441,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("test_table"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -584,7 +584,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare(format!("test_all_types_{}", num_rows)),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -891,7 +891,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("test_filter_table"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -936,7 +936,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("concurrent_test"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -1018,7 +1018,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare(table_name),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,

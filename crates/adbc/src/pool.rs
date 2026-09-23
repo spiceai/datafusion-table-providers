@@ -20,8 +20,8 @@ use snafu::{prelude::*, ResultExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement;
-use crate::sql::db_connection_pool::dbconnection::{
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement;
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{
     adbcconn::AdbcDbConnection, DbConnection, SyncDbConnection,
 };
 

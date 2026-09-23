@@ -9,7 +9,7 @@ use crate::table::MongoDBTable;
 use arrow_schema::ArrowError;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_table_providers_common::schema_projection::SchemaProjection;
 use snafu::prelude::*;
 use std::sync::Arc;

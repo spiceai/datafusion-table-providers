@@ -10,7 +10,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement;
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement;
 use crate::{
     adbc::write::{ADBCTableWriterBuilder, AdbcDataSink},
     sql::db_connection_pool::{
@@ -21,11 +21,11 @@ use crate::{
     },
 };
 
-#[cfg(feature = "adbc-federation")]
-use crate::util::supported_functions::FunctionSupport;
+#[cfg(feature = "federation")]
+use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
 use adbc_core::{Connection, Database};
 use arrow::array::RecordBatch;
-#[cfg(feature = "adbc-federation")]
+#[cfg(feature = "federation")]
 use datafusion::optimizer::OptimizerRule;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::{
@@ -33,7 +33,7 @@ use datafusion::{
     datasource::{sink::DataSinkExec, TableProvider},
     logical_expr::dml::InsertOp,
     physical_plan::ExecutionPlan,
-    sql::TableReference,
+    common::TableReference,
 };
 use r2d2_adbc::AdbcConnectionManager;
 use snafu::prelude::*;
@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use self::sql_table::AdbcDBTable;
 
-#[cfg(feature = "adbc-federation")]
+#[cfg(feature = "federation")]
 mod federation;
 
 mod sql_table;
@@ -82,11 +82,11 @@ where
     <D::ConnectionType as Connection>::StatementType: CancellableStatement,
 {
     pool: Arc<ADBCPool<D>>,
-    #[cfg(feature = "adbc-federation")]
+    #[cfg(feature = "federation")]
     federation_enabled: bool,
-    #[cfg(feature = "adbc-federation")]
+    #[cfg(feature = "federation")]
     function_support: Option<FunctionSupport>,
-    #[cfg(feature = "adbc-federation")]
+    #[cfg(feature = "federation")]
     pre_federation_optimizer_rules: Vec<Arc<dyn OptimizerRule + Send + Sync>>,
 }
 
@@ -100,30 +100,30 @@ where
     pub fn new(pool: Arc<ADBCPool<D>>) -> Self {
         Self {
             pool,
-            #[cfg(feature = "adbc-federation")]
+            #[cfg(feature = "federation")]
             federation_enabled: true, // enabled by default when the feature is available
-            #[cfg(feature = "adbc-federation")]
+            #[cfg(feature = "federation")]
             function_support: None,
-            #[cfg(feature = "adbc-federation")]
+            #[cfg(feature = "federation")]
             pre_federation_optimizer_rules: vec![],
         }
     }
 
-    #[cfg(feature = "adbc-federation")]
+    #[cfg(feature = "federation")]
     #[must_use]
     pub fn with_federation_enabled(mut self, enabled: bool) -> Self {
         self.federation_enabled = enabled;
         self
     }
 
-    #[cfg(feature = "adbc-federation")]
+    #[cfg(feature = "federation")]
     #[must_use]
     pub fn with_function_support(mut self, function_support: FunctionSupport) -> Self {
         self.function_support = Some(function_support);
         self
     }
 
-    #[cfg(feature = "adbc-federation")]
+    #[cfg(feature = "federation")]
     #[must_use]
     pub fn with_pre_federation_optimizer_rules(
         mut self,
@@ -167,13 +167,13 @@ where
             Arc::clone(&schema),
             table_reference.clone(),
             dialect,
-            #[cfg(feature = "adbc-federation")]
+            #[cfg(feature = "federation")]
             self.function_support.clone(),
-            #[cfg(feature = "adbc-federation")]
+            #[cfg(feature = "federation")]
             self.pre_federation_optimizer_rules.clone(),
         ));
 
-        #[cfg(feature = "adbc-federation")]
+        #[cfg(feature = "federation")]
         let table_provider: Arc<dyn TableProvider> = if self.federation_enabled {
             Arc::new(table_provider.create_federated_table_provider()?)
         } else {

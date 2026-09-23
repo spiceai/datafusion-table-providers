@@ -19,30 +19,13 @@
 members = ["core", "crates/common", "python", "crates/odbc", "crates/clickhouse", "crates/flightsql", "crates/mongodb", "crates/mysql", "crates/sqlite", "crates/postgres", "crates/duckdb", "crates/adbc", "crates/oracle"]
 resolver = "2"
 
-# LOCAL-ONLY, temporary: the DataFusion 55 upgrade needs matching bumps in
-# sibling Spice forks (arrow-rs to 59.2.0, duckdb-rs to an arrow-59-compatible
-# rev) that are prepared but not yet pushed. These path overrides point at
-# local sibling checkouts purely so this branch can be compiled and tested in
-# isolation; replace with real `git`/`rev` pins once those forks are pushed.
+# LOCAL-ONLY, temporary: the DataFusion 55 upgrade needs a matching bump in
+# the sibling duckdb-rs fork (to an arrow-59-compatible rev) that is prepared
+# but not yet pushed. This path override points at a local sibling checkout
+# purely so this branch can be compiled and tested in isolation; replace with
+# a real `rev` pin once that fork is pushed.
 [patch."https://github.com/spiceai/duckdb-rs.git"]
-duckdb = { path = "../duckdb-rs" }
-[patch."https://github.com/spiceai/arrow-rs.git"]
-arrow = { path = "../arrow-rs/arrow" }
-arrow-arith = { path = "../arrow-rs/arrow-arith" }
-arrow-array = { path = "../arrow-rs/arrow-array" }
-arrow-buffer = { path = "../arrow-rs/arrow-buffer" }
-arrow-cast = { path = "../arrow-rs/arrow-cast" }
-arrow-csv = { path = "../arrow-rs/arrow-csv" }
-arrow-data = { path = "../arrow-rs/arrow-data" }
-arrow-flight = { path = "../arrow-rs/arrow-flight" }
-arrow-ipc = { path = "../arrow-rs/arrow-ipc" }
-arrow-json = { path = "../arrow-rs/arrow-json" }
-arrow-ord = { path = "../arrow-rs/arrow-ord" }
-arrow-row = { path = "../arrow-rs/arrow-row" }
-arrow-schema = { path = "../arrow-rs/arrow-schema" }
-arrow-select = { path = "../arrow-rs/arrow-select" }
-arrow-string = { path = "../arrow-rs/arrow-string" }
-parquet = { path = "../arrow-rs/parquet" }
+duckdb = { path = "../duckdb-rs/crates/duckdb" }
 
 [workspace.package]
 version = "0.13.1"
@@ -107,7 +90,7 @@ num-bigint = "0.4"
 secrecy = "0.10.3"
 serde = { version = "1.0.209", features = ["derive"] }
 serde_json = "1.0.124"
-snafu = "0.8.3"
+snafu = "0.9"
 time = "0.3.36"
 tokio = { version = "1.46", features = ["macros", "fs"] }
 tracing = "0.1.40"
@@ -128,7 +111,17 @@ fundu = "2.0.1"
 geo-types = "0.7.13"
 sha2 = "0.10"
 hickory-resolver = "0.26"
-sea-query = { git = "https://github.com/spiceai/sea-query.git", rev = "ae75baef819513fb8d19af014972dcfa324e201a", features = [
+# TODO(DF55): spiceai/sea-query (rev ae75baef, v0.32.0-rc.1) is stale against
+# upstream SeaQL/sea-query 1.0.x, which the merged-forward CreateTableBuilder/
+# IndexBuilder code (TableCreateStatement::temporary(), ExprTrait, blanket
+# IntoTableRef for String/tuples) now requires. Even spiceai/sea-query's own
+# `master` mirror is still 0.32.0-rc.1 — this fork needs its own bump before
+# it can be repinned here. Using plain crates.io sea-query 1.0.2 as a stand-in
+# so this branch can be verified; this drops Spice's two small sea-query
+# patches (spiceai/sea-query@213b6b8 "Change to use decimal",
+# spiceai/sea-query@ae75bae "fix: preserve fractional seconds in Chrono SQL
+# literals" — 3 files total) until they are re-ported onto a 1.0.x-based fork.
+sea-query = { version = "1.0.2", features = [
   "backend-sqlite",
   "backend-postgres",
   "postgres-array",
@@ -144,22 +137,21 @@ tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = 
 
 # arrow-rs with spice patches (ObjectVersionType + new_with_meta for Azure compatibility).
 # TODO(DF55): repoint at the arrow-59 spiceai-59-patches branch once it is
-# pushed (prepared locally as commit eed0d7b89). Pinned at the last-pushed
-# spiceai-58 rev for now; the path patch above supplies the actual arrow-59
-# build content in this checkout.
-arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }
-arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }
-arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }
-arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }
-arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }
-arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }
-arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }
-arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }
-arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }
-arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }
-arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }
-arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }
-arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }
-arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }
-arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }
-parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }
+# pushed (prepared locally as commit eed0d7b89). Local path for now; the
+# fork isn't pushed, so this substitutes a local sibling checkout.
+arrow = { path = "../arrow-rs/arrow" }
+arrow-arith = { path = "../arrow-rs/arrow-arith" }
+arrow-array = { path = "../arrow-rs/arrow-array" }
+arrow-buffer = { path = "../arrow-rs/arrow-buffer" }
+arrow-cast = { path = "../arrow-rs/arrow-cast" }
+arrow-csv = { path = "../arrow-rs/arrow-csv" }
+arrow-data = { path = "../arrow-rs/arrow-data" }
+arrow-flight = { path = "../arrow-rs/arrow-flight" }
+arrow-ipc = { path = "../arrow-rs/arrow-ipc" }
+arrow-json = { path = "../arrow-rs/arrow-json" }
+arrow-ord = { path = "../arrow-rs/arrow-ord" }
+arrow-row = { path = "../arrow-rs/arrow-row" }
+arrow-schema = { path = "../arrow-rs/arrow-schema" }
+arrow-select = { path = "../arrow-rs/arrow-select" }
+arrow-string = { path = "../arrow-rs/arrow-string" }
+parquet = { path = "../arrow-rs/parquet" } # TODO(DF55): repoint at spiceai-59-patches (local eed0d7b89) once pushed

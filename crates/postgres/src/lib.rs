@@ -1,17 +1,17 @@
-use crate::sql::arrow_sql_gen::statement::{
+use datafusion_table_providers_common::sql::arrow_sql_gen::statement::{
     CreateTableBuilder, Error as SqlGenError, IndexBuilder, InsertBuilder,
 };
-use crate::sql::db_connection_pool::dbconnection::postgresconn::PostgresPooledConnection;
-use crate::sql::db_connection_pool::{
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::postgresconn::PostgresPooledConnection;
+use datafusion_table_providers_common::sql::db_connection_pool::{
     self,
     dbconnection::{postgresconn::PostgresConnection, DbConnection},
     postgrespool::{self, PostgresConnectionPool},
     DbConnectionPool,
 };
-use crate::sql::sql_provider_datafusion::{expr, expr::Engine, SqlTable};
-use crate::util::schema::SchemaValidator;
-use crate::util::supported_functions::FunctionSupport;
-use crate::UnsupportedTypeAction;
+use datafusion_table_providers_common::sql::sql_provider_datafusion::{expr, expr::Engine, SqlTable};
+use datafusion_table_providers_common::util::schema::SchemaValidator;
+use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
+use datafusion_table_providers_common::UnsupportedTypeAction;
 use arrow::{
     array::RecordBatch,
     datatypes::{Schema, SchemaRef},
@@ -26,12 +26,12 @@ use datafusion::{
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::CreateExternalTable,
-    sql::TableReference,
+    common::TableReference,
 };
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::util::{
+use datafusion_table_providers_common::util::{
     self,
     column_reference::{self, ColumnReference},
     constraints::{self, get_primary_keys_from_constraints},
@@ -164,7 +164,7 @@ impl PostgresTableFactory {
     /// queries the server for the schema, so building providers for a whole
     /// namespace costs a round trip per table. A caller that resolved them
     /// together -- see
-    /// [`PostgresConnection::get_schemas_in`](crate::sql::db_connection_pool::dbconnection::postgresconn::PostgresConnection::get_schemas_in)
+    /// [`PostgresConnection::get_schemas_in`](datafusion_table_providers_common::sql::db_connection_pool::dbconnection::postgresconn::PostgresConnection::get_schemas_in)
     /// -- pays none here.
     ///
     /// The schema must be the one the server reports for that table; nothing
@@ -200,7 +200,7 @@ impl PostgresTableFactory {
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let table_provider = Arc::new(table.with_dialect(Arc::new(PostgreSqlDialect {})));
 
-        #[cfg(feature = "postgres-federation")]
+        #[cfg(feature = "federation")]
         let table_provider = Arc::new(
             table_provider
                 .create_federated_table_provider()
@@ -388,7 +388,7 @@ impl TableProviderFactory for PostgresTableProviderFactory {
             .with_function_support(self.function_support.clone()),
         );
 
-        #[cfg(feature = "postgres-federation")]
+        #[cfg(feature = "federation")]
         let read_provider = Arc::new(read_provider.create_federated_table_provider()?);
 
         Ok(PostgresTableWriter::create(

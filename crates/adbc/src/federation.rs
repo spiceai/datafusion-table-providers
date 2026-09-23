@@ -11,8 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::sql::db_connection_pool::dbconnection::{get_schema, Error as DbError};
-use crate::sql::sql_provider_datafusion::{get_stream, to_execution_error};
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{get_schema, Error as DbError};
+use datafusion_table_providers_common::sql::sql_provider_datafusion::{get_stream, to_execution_error};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::logical_expr::LogicalPlan;
@@ -44,7 +44,7 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter,
-    sql::TableReference,
+    common::TableReference,
 };
 
 impl<T, P> AdbcDBTable<T, P> {
@@ -86,8 +86,8 @@ impl<T, P> SQLExecutor for AdbcDBTable<T, P> {
         self.base_table.dialect()
     }
 
-    fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
-        self.base_table.can_execute_plan(plan)
+    fn logical_optimizer(&self) -> Option<datafusion_federation::sql::LogicalOptimizer> {
+        self.base_table.logical_optimizer()
     }
 
     fn pre_federation_optimizer_rules(&self) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {

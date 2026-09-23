@@ -22,7 +22,7 @@ use arrow::array::{AsArray, RecordBatch, RecordBatchIterator, RecordBatchReader}
 use arrow_schema::SchemaRef;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use r2d2_adbc::AdbcConnectionManager;
 use snafu::{prelude::*, ResultExt};
 use std::marker::Send;
@@ -30,7 +30,7 @@ use std::marker::Sync;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::Sender;
 
-use crate::sql::db_connection_pool::runtime::run_sync_with_tokio;
+use datafusion_table_providers_common::sql::db_connection_pool::runtime::run_sync_with_tokio;
 
 use super::DbConnection;
 use super::Result;
@@ -1051,7 +1051,7 @@ mod tests {
         activity: &Arc<DriverActivity>,
         fail_fast: &Arc<AtomicBool>,
         ignore_cancel: &Arc<AtomicBool>,
-    ) -> Arc<crate::sql::db_connection_pool::adbcpool::ADBCPool<FakeDatabase>> {
+    ) -> Arc<datafusion_table_providers_common::sql::db_connection_pool::adbcpool::ADBCPool<FakeDatabase>> {
         let database = FakeDatabase {
             activity: Arc::clone(activity),
             cancelled: Arc::new((Mutex::new(false), Condvar::new())),
@@ -1059,7 +1059,7 @@ mod tests {
             ignore_cancel: Arc::clone(ignore_cancel),
         };
         let pool =
-            crate::sql::db_connection_pool::adbcpool::AdbcConnectionPoolBuilder::new(database)
+            datafusion_table_providers_common::sql::db_connection_pool::adbcpool::AdbcConnectionPoolBuilder::new(database)
                 .with_max_size(Some(1))
                 .build()
                 .expect("the pool should build");
@@ -1070,7 +1070,7 @@ mod tests {
     /// connection back, which is what a client that goes away needs to happen.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn dropping_the_stream_cancels_the_query_and_frees_the_connection() {
-        use crate::sql::db_connection_pool::DbConnectionPool;
+        use datafusion_table_providers_common::sql::db_connection_pool::DbConnectionPool;
 
         let activity = Arc::new(DriverActivity::default());
         let pool = fake_pool(
@@ -1150,7 +1150,7 @@ mod tests {
     /// nobody is waiting for.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_result_is_not_read_for_a_caller_that_has_gone() {
-        use crate::sql::db_connection_pool::DbConnectionPool;
+        use datafusion_table_providers_common::sql::db_connection_pool::DbConnectionPool;
 
         let activity = Arc::new(DriverActivity::default());
         let pool = fake_pool(
@@ -1192,7 +1192,7 @@ mod tests {
     /// has already been released.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_failed_query_is_finalized_and_not_cancelled() {
-        use crate::sql::db_connection_pool::DbConnectionPool;
+        use datafusion_table_providers_common::sql::db_connection_pool::DbConnectionPool;
         use futures::StreamExt;
 
         let activity = Arc::new(DriverActivity::default());

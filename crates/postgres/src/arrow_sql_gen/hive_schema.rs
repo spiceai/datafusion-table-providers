@@ -19,7 +19,7 @@ use logos::{Lexer, Logos};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::DESCRIPTION_METADATA_KEY;
+use datafusion_table_providers_common::DESCRIPTION_METADATA_KEY;
 
 const MAX_RECURSION_DEPTH: usize = 100;
 

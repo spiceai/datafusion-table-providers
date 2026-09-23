@@ -2,10 +2,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fmt, sync::Arc};
 
 use crate::duckdb::DuckDB;
-use crate::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
-use crate::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-use crate::sql::sql_provider_datafusion::expr;
-use crate::util::{
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
+use datafusion_table_providers_common::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+use datafusion_table_providers_common::sql::sql_provider_datafusion::expr;
+use datafusion_table_providers_common::util::{
     constraints,
     count_exec::make_count_exec,
     dml::{
@@ -24,7 +24,7 @@ use datafusion::catalog::Session;
 use datafusion::common::{not_impl_err, Constraints, SchemaExt};
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion::{
     datasource::{TableProvider, TableType},
     error::DataFusionError,
@@ -42,7 +42,7 @@ use super::creator::{TableDefinition, TableManager, ViewCreator};
 use super::file_swap;
 use super::write_settings::DuckDBWriteSettings;
 use super::{to_datafusion_error, RelationName};
-use crate::sql::db_connection_pool::Mode;
+use datafusion_table_providers_common::sql::db_connection_pool::Mode;
 
 /// A callback handler that is invoked after data has been successfully written to a DuckDB table
 /// but before the transaction is committed.
@@ -512,7 +512,7 @@ impl DataSink for DuckDBDataSink {
                 constraints::validate_batch_with_constraints(
                     vec![batch.clone()],
                     constraints,
-                    &crate::util::constraints::UpsertOptions::default(),
+                    &datafusion_table_providers_common::util::constraints::UpsertOptions::default(),
                 )
                 .await
                 .context(super::ConstraintViolationSnafu)

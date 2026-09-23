@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder;
+use datafusion_table_providers_common::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder;
 use arrow::{
     array::{
         ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Float32Builder, Float64Builder,
