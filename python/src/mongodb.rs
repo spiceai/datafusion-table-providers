@@ -44,7 +44,7 @@ impl RawMongoDBTableFactory {
         let table = wait_for_future(
             py,
             self.factory
-                .table_provider(table_reference.into(), None, None),
+                .table_provider(table_reference.into()),
         )
         .map_err(to_pyerr)?;
 

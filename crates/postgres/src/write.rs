@@ -29,7 +29,7 @@ use datafusion_table_providers_common::util::{
     retriable_error::check_and_mark_retriable_error,
 };
 
-use crate::postgres::Postgres;
+use crate::Postgres;
 
 use super::to_datafusion_error;
 

@@ -34,6 +34,7 @@ pub mod builder;
 pub mod composite;
 pub mod hive_schema;
 pub mod schema;
+pub mod statement_ext;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

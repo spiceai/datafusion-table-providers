@@ -3,10 +3,10 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 
-use datafusion_table_providers_common::sql::arrow_sql_gen::postgres::rows_to_arrow;
-use datafusion_table_providers_common::sql::arrow_sql_gen::postgres::schema::pg_data_type_to_arrow_type;
-use datafusion_table_providers_common::sql::arrow_sql_gen::postgres::schema::ParseContext;
-use datafusion_table_providers_common::sql::db_connection_pool::postgrespool::ConnectionManager;
+use crate::arrow_sql_gen::rows_to_arrow;
+use crate::arrow_sql_gen::schema::pg_data_type_to_arrow_type;
+use crate::arrow_sql_gen::schema::ParseContext;
+use crate::pool::ConnectionManager;
 use datafusion_table_providers_common::util::handle_unsupported_type_error;
 use datafusion_table_providers_common::util::schema::SchemaValidator;
 use datafusion_table_providers_common::UnsupportedTypeAction;
@@ -25,7 +25,7 @@ fn maybe_db_source_err(err: tokio_postgres::Error) -> Box<dyn Error + Send + Syn
     }
 }
 
-/// A pooled Postgres connection obtained from a [`PostgresConnectionPool`](datafusion_table_providers_common::sql::db_connection_pool::postgrespool::PostgresConnectionPool).
+/// A pooled Postgres connection obtained from a [`PostgresConnectionPool`](crate::pool::PostgresConnectionPool).
 ///
 /// Dereferences to [`tokio_postgres::Client`](bb8_postgres::tokio_postgres::Client) for executing queries.
 // Defined here rather than in `postgrespool` to avoid a type-resolution cycle
@@ -42,9 +42,10 @@ use futures::StreamExt;
 use snafu::prelude::*;
 use tokio_postgres::Row;
 
-use super::AsyncDbConnection;
-use super::DbConnection;
-use super::Result;
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{
+    AsyncDbConnection, DbConnection, Error as DbConnectionError, Result, UnableToGetSchemaSnafu,
+    UnableToGetSchemasSnafu, UnableToGetTablesSnafu,
+};
 
 const SCHEMA_QUERY: &str = r"
 WITH custom_type_details AS (
@@ -232,21 +233,21 @@ fn row_opt_int(row: &Row, column: &str) -> Option<i64> {
     None
 }
 
-/// Maps an error from the catalog schema query into the right `super::Error`, surfacing a
-/// missing relation as [`super::Error::UndefinedTable`].
+/// Maps an error from the catalog schema query into the right `DbConnectionError`, surfacing a
+/// missing relation as [`DbConnectionError::UndefinedTable`].
 fn map_schema_query_error(
     e: tokio_postgres::Error,
     table_reference: &TableReference,
-) -> super::Error {
+) -> DbConnectionError {
     if let Some(db_error) = e.as_db_error() {
         if db_error.code() == &tokio_postgres::error::SqlState::UNDEFINED_TABLE {
-            return super::Error::UndefinedTable {
+            return DbConnectionError::UndefinedTable {
                 source: Box::new(db_error.clone()),
                 table_name: table_reference.to_string(),
             };
         }
     }
-    super::Error::UnableToGetSchema {
+    DbConnectionError::UnableToGetSchema {
         source: maybe_db_source_err(e),
     }
 }
@@ -300,7 +301,7 @@ pub enum PostgresError {
 
     #[snafu(display("Failed to convert query result to Arrow.\n{source}\nReport a bug to request support: https://github.com/datafusion-contrib/datafusion-table-providers/issues"))]
     ConversionError {
-        source: datafusion_table_providers_common::sql::arrow_sql_gen::postgres::Error,
+        source: crate::arrow_sql_gen::Error,
     },
 }
 
@@ -343,14 +344,14 @@ pub struct PostgresConnection {
 }
 
 impl SchemaValidator for PostgresConnection {
-    type Error = super::Error;
+    type Error = DbConnectionError;
 
     fn is_data_type_supported(data_type: &DataType) -> bool {
         !matches!(data_type, DataType::Map(_, _))
     }
 
     fn unsupported_type_error(data_type: &DataType, field_name: &str) -> Self::Error {
-        super::Error::UnsupportedDataType {
+        DbConnectionError::UnsupportedDataType {
             data_type: data_type.to_string(),
             field_name: field_name.to_string(),
         }
@@ -387,14 +388,14 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
         }
     }
 
-    async fn tables(&self, schema: &str) -> Result<Vec<String>, super::Error> {
+    async fn tables(&self, schema: &str) -> Result<Vec<String>, DbConnectionError> {
         let query = match self.variant() {
             PostgresVariant::Default => TABLES_QUERY,
             PostgresVariant::Redshift => REDSHIFT_TABLES_QUERY,
         };
 
         let rows = self.conn.query(query, &[&schema]).await.map_err(|e| {
-            super::Error::UnableToGetTables {
+            DbConnectionError::UnableToGetTables {
                 source: maybe_db_source_err(e),
             }
         })?;
@@ -402,7 +403,7 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
         Ok(rows.iter().map(|r| r.get::<usize, String>(0)).collect())
     }
 
-    async fn schemas(&self) -> Result<Vec<String>, super::Error> {
+    async fn schemas(&self) -> Result<Vec<String>, DbConnectionError> {
         let query = match self.variant() {
             PostgresVariant::Default => SCHEMAS_QUERY,
             PostgresVariant::Redshift => REDSHIFT_SCHEMAS_QUERY,
@@ -412,7 +413,7 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
             self.conn
                 .query(query, &[])
                 .await
-                .map_err(|e| super::Error::UnableToGetSchemas {
+                .map_err(|e| DbConnectionError::UnableToGetSchemas {
                     source: maybe_db_source_err(e),
                 })?;
 
@@ -422,7 +423,7 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
     async fn get_schema(
         &self,
         table_reference: &TableReference,
-    ) -> Result<SchemaRef, super::Error> {
+    ) -> Result<SchemaRef, DbConnectionError> {
         let (variant, columns) = self.query_variant_and_schema(table_reference).await?;
 
         // Native inference can return zero rows even though the table exists and is
@@ -520,7 +521,7 @@ impl PostgresConnection {
         &self,
         columns: Vec<ColumnDef>,
         variant: PostgresVariant,
-    ) -> Result<SchemaRef, super::Error> {
+    ) -> Result<SchemaRef, DbConnectionError> {
         let mut fields = Vec::new();
         for column in columns {
             let mut context =
@@ -535,7 +536,7 @@ impl PostgresConnection {
             else {
                 handle_unsupported_type_error(
                     self.unsupported_type_action,
-                    super::Error::UnsupportedDataType {
+                    DbConnectionError::UnsupportedDataType {
                         data_type: column.data_type.clone(),
                         field_name: column.name.clone(),
                     },
@@ -576,7 +577,7 @@ impl PostgresConnection {
         &self,
         schema_name: &str,
         relations: &[String],
-    ) -> Result<HashMap<String, SchemaRef>, super::Error> {
+    ) -> Result<HashMap<String, SchemaRef>, DbConnectionError> {
         // Nothing to describe, and `= ANY('{}')` would match nothing anyway.
         if relations.is_empty() {
             return Ok(HashMap::new());
@@ -591,7 +592,7 @@ impl PostgresConnection {
             .conn
             .query(SCHEMA_QUERY, &[&schema_name, &relations])
             .await
-            .map_err(|e| super::Error::UnableToGetSchema {
+            .map_err(|e| DbConnectionError::UnableToGetSchema {
                 source: maybe_db_source_err(e),
             })?;
 
@@ -629,14 +630,14 @@ impl PostgresConnection {
         clippy::unused_async,
         reason = "kept async so existing `get_variant().await` call sites still compile"
     )]
-    pub async fn get_variant(&self) -> Result<PostgresVariant, super::Error> {
+    pub async fn get_variant(&self) -> Result<PostgresVariant, DbConnectionError> {
         Ok(self.variant)
     }
 
     async fn query_variant_and_schema(
         &self,
         table_reference: &TableReference,
-    ) -> Result<(PostgresVariant, Vec<ColumnDef>), super::Error> {
+    ) -> Result<(PostgresVariant, Vec<ColumnDef>), DbConnectionError> {
         let table_name = table_reference.table();
         let schema_name = table_reference.schema().unwrap_or("public");
 
@@ -672,7 +673,7 @@ impl PostgresConnection {
         catalog: Option<&str>,
         schema_name: &str,
         table_name: &str,
-    ) -> Result<Vec<ColumnDef>, super::Error> {
+    ) -> Result<Vec<ColumnDef>, DbConnectionError> {
         // `SHOW COLUMNS` needs a fully-qualified 3-part name including the database. Use
         // the catalog from the table reference when the caller fully-qualified it;
         // otherwise scope to the connected database (matching the previous
@@ -683,11 +684,11 @@ impl PostgresConnection {
                 .conn
                 .query_one("SELECT current_database()", &[])
                 .await
-                .map_err(|e| super::Error::UnableToGetSchema {
+                .map_err(|e| DbConnectionError::UnableToGetSchema {
                     source: maybe_db_source_err(e),
                 })?
                 .try_get(0)
-                .map_err(|e| super::Error::UnableToGetSchema {
+                .map_err(|e| DbConnectionError::UnableToGetSchema {
                     source: maybe_db_source_err(e),
                 })?,
         };
@@ -716,7 +717,7 @@ impl PostgresConnection {
                 return Ok(Vec::new());
             }
             Err(e) => {
-                return Err(super::Error::UnableToGetSchema {
+                return Err(DbConnectionError::UnableToGetSchema {
                     source: maybe_db_source_err(e),
                 })
             }
@@ -768,7 +769,7 @@ impl PostgresConnection {
     async fn infer_schema_from_data(
         &self,
         table_reference: &TableReference,
-    ) -> Result<SchemaRef, super::Error> {
+    ) -> Result<SchemaRef, DbConnectionError> {
         let rows = self
             .conn
             .query(&format!("SELECT * FROM {table_reference} LIMIT 1"), &[])
@@ -779,14 +780,14 @@ impl PostgresConnection {
                         error_source.downcast_ref::<tokio_postgres::error::DbError>()
                     {
                         if pg_error.code() == &tokio_postgres::error::SqlState::UNDEFINED_TABLE {
-                            return super::Error::UndefinedTable {
+                            return DbConnectionError::UndefinedTable {
                                 source: Box::new(pg_error.clone()),
                                 table_name: table_reference.to_string(),
                             };
                         }
                     }
                 }
-                super::Error::UnableToGetSchema {
+                DbConnectionError::UnableToGetSchema {
                     source: maybe_db_source_err(e),
                 }
             })?;
@@ -799,7 +800,7 @@ impl PostgresConnection {
         }
 
         let rec =
-            rows_to_arrow(rows.as_slice(), &None).map_err(|e| super::Error::UnableToGetSchema {
+            rows_to_arrow(rows.as_slice(), &None).map_err(|e| DbConnectionError::UnableToGetSchema {
                 source: Box::new(PostgresError::ConversionError { source: e }),
             })?;
 

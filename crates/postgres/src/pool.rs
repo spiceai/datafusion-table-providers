@@ -1,9 +1,9 @@
 use std::{collections::HashMap, path::Path, str::FromStr, sync::Arc};
 
-use crate::{
-    util::{self, ns_lookup::verify_ns_lookup_and_tcp_connect},
-    UnsupportedTypeAction,
-};
+use crate::conn::{variant_from_version, PostgresConnection, PostgresPooledConnection, PostgresVariant};
+use crate::UnableToCreatePostgresConnectionPoolSnafu;
+use datafusion_table_providers_common::util::{self, ns_lookup::verify_ns_lookup_and_tcp_connect};
+use datafusion_table_providers_common::UnsupportedTypeAction;
 use async_trait::async_trait;
 use bb8::ErrorSink;
 use bb8_postgres::tokio_postgres::{config::Host, types::ToSql, Config};
@@ -14,15 +14,10 @@ use snafu::{prelude::*, ResultExt};
 use tokio::runtime::Handle;
 use tokio_postgres;
 
-use super::{
-    runtime::run_async_with_tokio, DbConnectionPool, PasswordProvider, StaticPasswordProvider,
-};
 use datafusion_table_providers_common::sql::db_connection_pool::{
-    dbconnection::{
-        postgresconn::{variant_from_version, PostgresConnection, PostgresVariant},
-        AsyncDbConnection, DbConnection,
-    },
-    JoinPushDown,
+    dbconnection::{AsyncDbConnection, DbConnection},
+    runtime::run_async_with_tokio,
+    DbConnectionPool, PasswordProvider, StaticPasswordProvider, JoinPushDown,
 };
 
 #[derive(Debug, Snafu)]
@@ -486,13 +481,18 @@ impl PostgresConnectionPool {
     /// Returns an error if there is a problem creating the connection pool.
     pub async fn connect_direct(&self) -> super::Result<PostgresConnection> {
         let pool = Arc::clone(&self.pool);
-        let conn = if let Some(handle) = &self.io_handle {
+        let conn: PostgresPooledConnection = if let Some(handle) = &self.io_handle {
             handle
                 .spawn(async move { pool.get_owned().await.map_err(map_pool_run_error) })
                 .await
-                .context(IoRuntimeSnafu)??
+                .context(IoRuntimeSnafu)
+                .context(UnableToCreatePostgresConnectionPoolSnafu)?
+                .context(UnableToCreatePostgresConnectionPoolSnafu)?
         } else {
-            pool.get_owned().await.map_err(map_pool_run_error)?
+            pool.get_owned()
+                .await
+                .map_err(map_pool_run_error)
+                .context(UnableToCreatePostgresConnectionPoolSnafu)?
         };
         // Deliberately does not apply `unsupported_type_action`, matching this
         // method's existing behavior; only the variant memo is shared, which
@@ -687,6 +687,30 @@ impl
 {
     async fn connect(
         &self,
+    ) -> std::result::Result<
+        Box<
+            dyn DbConnection<
+                bb8::PooledConnection<'static, ConnectionManager>,
+                &'static (dyn ToSql + Sync),
+            >,
+        >,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.connect_local().await.map_err(Into::into)
+    }
+
+    fn join_push_down(&self) -> JoinPushDown {
+        self.join_push_down.clone()
+    }
+}
+
+impl PostgresConnectionPool {
+    /// The real `connect` body; kept on the crate's own [`Error`] so its
+    /// many `?`-using internals don't have to funnel through the boxed error
+    /// the `DbConnectionPool` trait requires; the trait method above converts
+    /// at the boundary.
+    async fn connect_local(
+        &self,
     ) -> super::Result<
         Box<
             dyn DbConnection<
@@ -696,24 +720,24 @@ impl
         >,
     > {
         let pool = Arc::clone(&self.pool);
-        let conn = if let Some(handle) = &self.io_handle {
+        let conn: PostgresPooledConnection = if let Some(handle) = &self.io_handle {
             handle
                 .spawn(async move { pool.get_owned().await.map_err(map_pool_run_error) })
                 .await
-                .context(IoRuntimeSnafu)??
+                .context(IoRuntimeSnafu)
+                .context(UnableToCreatePostgresConnectionPoolSnafu)?
+                .context(UnableToCreatePostgresConnectionPoolSnafu)?
         } else {
             let get_conn = async || pool.get_owned().await.map_err(map_pool_run_error);
-            run_async_with_tokio(get_conn).await?
+            run_async_with_tokio(get_conn)
+                .await
+                .context(UnableToCreatePostgresConnectionPoolSnafu)?
         };
         Ok(Box::new(
             PostgresConnection::new(conn)
                 .with_unsupported_type_action(self.unsupported_type_action)
                 .with_variant(self.variant),
         ))
-    }
-
-    fn join_push_down(&self) -> JoinPushDown {
-        self.join_push_down.clone()
     }
 }
 

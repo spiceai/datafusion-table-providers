@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::sync::Arc;
 
 use super::hive_schema;
-use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::postgresconn::PostgresVariant;
+use crate::conn::PostgresVariant;
 use datafusion_table_providers_common::UnsupportedTypeAction;
 
 #[derive(Debug, Clone)]

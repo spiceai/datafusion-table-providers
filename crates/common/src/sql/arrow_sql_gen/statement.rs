@@ -77,37 +77,11 @@ impl CreateTableBuilder {
         &self.table_name
     }
 
-    #[must_use]
-    #[cfg(feature = "postgres")]
-    pub fn build_postgres(self) -> Vec<String> {
-        use crate::sql::arrow_sql_gen::postgres::{
-            builder::TypeBuilder, get_postgres_composite_type_name,
-            map_data_type_to_column_type_postgres,
-        };
-        let schema = Arc::clone(&self.schema);
-        let table_name = self.table_name.clone();
-        let main_table_creation =
-            self.build(PostgresQueryBuilder, &|f: &Arc<Field>| -> ColumnType {
-                map_data_type_to_column_type_postgres(f.data_type(), &table_name, f.name())
-            });
-
-        // Postgres supports composite types (i.e. Structs) but needs to have the type defined first
-        // https://www.postgresql.org/docs/current/rowtypes.html
-        let mut creation_stmts = Vec::new();
-        for field in schema.fields() {
-            let DataType::Struct(struct_inner_fields) = field.data_type() else {
-                continue;
-            };
-            let type_builder = TypeBuilder::new(
-                get_postgres_composite_type_name(&table_name, field.name()),
-                struct_inner_fields,
-            );
-            creation_stmts.push(type_builder.build());
-        }
-
-        creation_stmts.push(main_table_creation);
-        creation_stmts
-    }
+    // Postgres-specific `build_postgres()` (composite/struct types need their own
+    // `CREATE TYPE` statements ahead of the table) lives in
+    // `datafusion-table-providers-postgres` as the `CreateTableBuilderPostgresExt`
+    // extension trait: the crate split moved the postgres arrow<->SQL type mapping
+    // out of this crate, and this builder cannot depend back on it.
 
     #[must_use]
     pub fn build_sqlite(self) -> String {

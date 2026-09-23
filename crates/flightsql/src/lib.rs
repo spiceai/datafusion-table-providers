@@ -148,7 +148,12 @@ impl TableProviderFactory for FlightTableFactory {
         _state: &dyn Session,
         cmd: &CreateExternalTable,
     ) -> datafusion::common::Result<Arc<dyn TableProvider>> {
-        let table = self.open_table(&cmd.location, cmd.options.clone()).await?;
+        let location = cmd.locations.first().ok_or_else(|| {
+            DataFusionError::Execution(
+                "CREATE EXTERNAL TABLE for a Flight SQL table requires a LOCATION".to_string(),
+            )
+        })?;
+        let table = self.open_table(location, cmd.options.clone()).await?;
         Ok(Arc::new(table))
     }
 }

@@ -21,13 +21,13 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     },
+    common::TableReference,
     sql::{
         sqlparser,
         unparser::{
             dialect::{CustomDialect, CustomDialectBuilder, Dialect},
             Unparser,
         },
-        TableReference,
     },
 };
 use datafusion_table_providers_common::sql::db_connection_pool::DbConnectionPool;
@@ -62,7 +62,7 @@ impl OracleTable {
                     + Send
                     + Sync,
             >;
-        let base_table = SqlTable::new("oracle", &dyn_pool, table_reference)
+        let base_table = SqlTable::new("oracle", &dyn_pool, table_reference, None)
             .await?
             .with_dialect(Arc::new(OracleTable::dialect()));
 
