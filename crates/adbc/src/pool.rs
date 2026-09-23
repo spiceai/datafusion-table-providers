@@ -20,12 +20,15 @@ use snafu::{prelude::*, ResultExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement;
+use crate::conn::{AdbcDbConnection, CancellableStatement};
 use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{
-    adbcconn::AdbcDbConnection, DbConnection, SyncDbConnection,
+    DbConnection, SyncDbConnection,
+};
+use datafusion_table_providers_common::sql::db_connection_pool::{
+    runtime::run_async_with_tokio, DbConnectionPool, JoinPushDown,
 };
 
-use super::{runtime::run_async_with_tokio, DbConnectionPool, JoinPushDown, Result};
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -39,6 +42,9 @@ pub enum Error {
         "ADBC connection failed.\n{source}\nAdjust the connection pool parameters or sufficient capacity."
     ))]
     ConnectionPoolError { source: r2d2::Error },
+
+    #[snafu(display("The ADBC connection setup task failed to complete.\n{source}"))]
+    TaskJoinError { source: tokio::task::JoinError },
 }
 
 pub struct AdbcConnectionPoolBuilder<D>
@@ -205,6 +211,30 @@ where
 {
     async fn connect(
         &self,
+    ) -> std::result::Result<
+        Box<dyn DbConnection<r2d2::PooledConnection<AdbcConnectionManager<D>>, RecordBatch>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.connect_local().await.map_err(Into::into)
+    }
+
+    fn join_push_down(&self) -> JoinPushDown {
+        self.join_push_down.clone()
+    }
+}
+
+impl<D> ADBCPool<D>
+where
+    D: Database + Send + 'static,
+    D::ConnectionType: Connection + Send + Sync,
+    <D::ConnectionType as Connection>::StatementType: CancellableStatement,
+{
+    /// The real `connect` body; kept on the crate's own [`Error`] so its
+    /// many `?`-using internals don't have to funnel through the boxed error
+    /// the `DbConnectionPool` trait requires; the trait method above converts
+    /// at the boundary.
+    async fn connect_local(
+        &self,
     ) -> Result<Box<dyn DbConnection<r2d2::PooledConnection<AdbcConnectionManager<D>>, RecordBatch>>>
     {
         // `r2d2::Pool::get()` is synchronous and may block until a connection is
@@ -220,7 +250,7 @@ where
             let conn: r2d2::PooledConnection<AdbcConnectionManager<D>> =
                 tokio::task::spawn_blocking(move || pool.get())
                     .await
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                    .context(TaskJoinSnafu)?
                     .context(ConnectionPoolSnafu)?;
 
             Ok(Box::new(AdbcDbConnection::new(conn))
@@ -232,10 +262,6 @@ where
                 >)
         };
         run_async_with_tokio(connect).await
-    }
-
-    fn join_push_down(&self) -> JoinPushDown {
-        self.join_push_down.clone()
     }
 }
 

@@ -10,15 +10,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement;
-use crate::{
-    adbc::write::{ADBCTableWriterBuilder, AdbcDataSink},
-    sql::db_connection_pool::{
-        self,
-        adbcpool::ADBCPool,
-        dbconnection::{adbcconn::AdbcDbConnection, get_schema, DbConnection},
-        DbConnectionPool,
-    },
+use crate::conn::{AdbcDbConnection, CancellableStatement};
+use crate::pool::ADBCPool;
+use crate::write::{ADBCTableWriterBuilder, AdbcDataSink};
+use datafusion_table_providers_common::sql::db_connection_pool::{
+    self,
+    dbconnection::{get_schema, DbConnection},
+    DbConnectionPool,
 };
 
 #[cfg(feature = "federation")]
@@ -44,6 +42,8 @@ use self::sql_table::AdbcDBTable;
 #[cfg(feature = "federation")]
 mod federation;
 
+pub mod conn;
+pub mod pool;
 mod sql_table;
 mod write;
 

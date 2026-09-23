@@ -31,10 +31,10 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::Sender;
 
 use datafusion_table_providers_common::sql::db_connection_pool::runtime::run_sync_with_tokio;
-
-use super::DbConnection;
-use super::Result;
-use super::SyncDbConnection;
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{
+    DbConnection, Error as DbConnectionError, Result, SyncDbConnection, UnableToGetSchemaSnafu,
+    UnableToGetSchemasSnafu, UnableToGetTablesSnafu, UnableToQueryArrowSnafu,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -239,13 +239,13 @@ where
         }
     }
 
-    fn tables(&self, schema: &str) -> Result<Vec<String>, super::Error> {
+    fn tables(&self, schema: &str) -> Result<Vec<String>, DbConnectionError> {
         let conn_mx = self.conn.lock().unwrap();
         let conn = conn_mx.borrow();
         let result = conn
             .get_objects(ObjectDepth::Tables, None, Some(schema), None, None, None)
             .boxed()
-            .context(super::UnableToGetTablesSnafu)?;
+            .context(UnableToGetTablesSnafu)?;
 
         let mut tables = vec![];
         for batch in result {
@@ -266,7 +266,7 @@ where
             // 3: list<CONSTRAINT_SCHEMA>
             //
             // so we need to drill down to the table names
-            let b = batch.boxed().context(super::UnableToGetTablesSnafu)?;
+            let b = batch.boxed().context(UnableToGetTablesSnafu)?;
             b.column(1).as_list::<i32>().iter().for_each(|value| {
                 if let Some(db_schema_schema) = value {
                     db_schema_schema
@@ -294,14 +294,14 @@ where
         Ok(tables)
     }
 
-    fn schemas(&self) -> Result<Vec<String>, super::Error> {
+    fn schemas(&self) -> Result<Vec<String>, DbConnectionError> {
         let conn_mx = self.conn.lock().unwrap();
         let conn = conn_mx.borrow();
 
         let result = conn
             .get_objects(ObjectDepth::Schemas, None, None, None, None, None)
             .boxed()
-            .context(super::UnableToGetSchemaSnafu)?;
+            .context(UnableToGetSchemaSnafu)?;
 
         let mut schemas = vec![];
         for batch in result {
@@ -316,7 +316,7 @@ where
             // 1: list<TABLE_INFO>
             //
             // so we need to drill down to the schema names
-            let b = batch.boxed().context(super::UnableToGetSchemaSnafu)?;
+            let b = batch.boxed().context(UnableToGetSchemaSnafu)?;
             b.column(1).as_list::<i32>().iter().for_each(|value| {
                 if let Some(db_schema_schema) = value {
                     db_schema_schema
@@ -332,7 +332,7 @@ where
         Ok(schemas)
     }
 
-    fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef, super::Error> {
+    fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef, DbConnectionError> {
         let conn_mx = self.conn.lock().unwrap();
         let conn = conn_mx.borrow();
 
@@ -343,7 +343,7 @@ where
                 table_reference.table(),
             )
             .boxed()
-            .context(super::UnableToGetSchemaSnafu)?;
+            .context(UnableToGetSchemaSnafu)?;
 
         Ok(Arc::new(schema))
     }
@@ -370,7 +370,7 @@ where
                 let mut stmt = conn
                     .new_statement()
                     .boxed()
-                    .context(super::UnableToQueryArrowSnafu)?;
+                    .context(UnableToQueryArrowSnafu)?;
                 stmt.set_sql_query(sql)?;
 
                 match stmt.execute_schema() {
@@ -382,7 +382,7 @@ where
                         let result = stmt
                             .execute()
                             .boxed()
-                            .context(super::UnableToQueryArrowSnafu)?;
+                            .context(UnableToQueryArrowSnafu)?;
                         schema = result.schema();
                     }
                 }
@@ -402,7 +402,7 @@ where
                 let mut stmt = conn
                     .new_statement()
                     .boxed()
-                    .context(super::UnableToQueryArrowSnafu)?;
+                    .context(UnableToQueryArrowSnafu)?;
                 stmt.set_sql_query(&sql_owned)?;
 
                 match params_owned.len() {
@@ -446,7 +446,7 @@ where
                         let results = stmt
                             .execute()
                             .boxed()
-                            .context(super::UnableToQueryArrowSnafu)?;
+                            .context(UnableToQueryArrowSnafu)?;
                         if matches!(
                             *lock_cancellation(&task_cancellation),
                             QueryCancellation::Abandoned
@@ -454,7 +454,7 @@ where
                             return Ok(());
                         }
                         for batch in results {
-                            let b = batch.boxed().context(super::UnableToQueryArrowSnafu)?;
+                            let b = batch.boxed().context(UnableToQueryArrowSnafu)?;
                             blocking_channel_send(&batch_tx, b)?;
                         }
                         Ok(())
@@ -1051,7 +1051,7 @@ mod tests {
         activity: &Arc<DriverActivity>,
         fail_fast: &Arc<AtomicBool>,
         ignore_cancel: &Arc<AtomicBool>,
-    ) -> Arc<datafusion_table_providers_common::sql::db_connection_pool::adbcpool::ADBCPool<FakeDatabase>> {
+    ) -> Arc<crate::pool::ADBCPool<FakeDatabase>> {
         let database = FakeDatabase {
             activity: Arc::clone(activity),
             cancelled: Arc::new((Mutex::new(false), Condvar::new())),
@@ -1059,7 +1059,7 @@ mod tests {
             ignore_cancel: Arc::clone(ignore_cancel),
         };
         let pool =
-            datafusion_table_providers_common::sql::db_connection_pool::adbcpool::AdbcConnectionPoolBuilder::new(database)
+            crate::pool::AdbcConnectionPoolBuilder::new(database)
                 .with_max_size(Some(1))
                 .build()
                 .expect("the pool should build");
@@ -1083,7 +1083,7 @@ mod tests {
             .connect()
             .await
             .expect("a connection should be available");
-        let stream = super::super::query_arrow(conn, "SELECT 1".to_string(), None)
+        let stream = datafusion_table_providers_common::sql::db_connection_pool::dbconnection::query_arrow(conn, "SELECT 1".to_string(), None)
             .await
             .expect("the query should start");
 
@@ -1163,7 +1163,7 @@ mod tests {
             .connect()
             .await
             .expect("a connection should be available");
-        let stream = super::super::query_arrow(conn, "SELECT 1".to_string(), None)
+        let stream = datafusion_table_providers_common::sql::db_connection_pool::dbconnection::query_arrow(conn, "SELECT 1".to_string(), None)
             .await
             .expect("the query should start");
 
@@ -1206,7 +1206,7 @@ mod tests {
             .connect()
             .await
             .expect("a connection should be available");
-        let mut stream = super::super::query_arrow(conn, "SELECT 1".to_string(), None)
+        let mut stream = datafusion_table_providers_common::sql::db_connection_pool::dbconnection::query_arrow(conn, "SELECT 1".to_string(), None)
             .await
             .expect("the stream should be created");
 

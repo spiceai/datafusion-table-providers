@@ -10,9 +10,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::adbc::ADBC;
-use datafusion_table_providers_common::sql::db_connection_pool::adbcpool::ADBCPool;
-use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement;
+use crate::ADBC;
+use crate::pool::ADBCPool;
+use crate::conn::CancellableStatement;
 use datafusion_table_providers_common::util::retriable_error::{check_and_mark_retriable_error, to_retriable_data_write_error};
 use adbc_core::options::{IngestMode, OptionStatement, OptionValue};
 use adbc_core::{Connection, Database, Optionable, Statement};
@@ -323,6 +323,7 @@ where
 {
     let mut db_conn = pool
         .connect_sync()
+        .boxed()
         .context(super::DbConnectionPoolSnafu)
         .map_err(to_retriable_data_write_error)?;
 
