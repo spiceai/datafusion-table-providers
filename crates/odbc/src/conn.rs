@@ -131,11 +131,11 @@ where
         }
     }
 
-    async fn tables(&self, _schema: &str) -> Result<Vec<String>, super::Error> {
+    async fn tables(&self, _schema: &str) -> Result<Vec<String>, dbconnection::Error> {
         unimplemented!()
     }
 
-    async fn schemas(&self) -> Result<Vec<String>, super::Error> {
+    async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
         unimplemented!()
     }
 

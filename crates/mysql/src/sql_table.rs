@@ -1,4 +1,4 @@
-use datafusion_table_providers_common::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
+use crate::pool::MySQLConnectionPool;
 use datafusion_table_providers_common::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
 use async_trait::async_trait;

@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
+pub mod conn;
+pub mod pool;
+
+use crate::conn::ODBCDbConnectionPool;
 use datafusion_table_providers_common::sql::{
     db_connection_pool as db_connection_pool_datafusion,
     sql_provider_datafusion::{expr, SqlTable},

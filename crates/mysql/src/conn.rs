@@ -1,8 +1,8 @@
 use std::{any::Any, sync::Arc};
 
-use datafusion_table_providers_common::sql::arrow_sql_gen::mysql::map_column_to_data_type;
-use datafusion_table_providers_common::sql::arrow_sql_gen::mysql::MysqlZeroDateBehavior;
-use datafusion_table_providers_common::sql::arrow_sql_gen::{self, mysql::rows_to_arrow};
+use crate::arrow_sql_gen::map_column_to_data_type;
+use crate::arrow_sql_gen::MysqlZeroDateBehavior;
+use crate::arrow_sql_gen::rows_to_arrow;
 use async_stream::stream;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::error::DataFusionError;
@@ -17,8 +17,10 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{prelude::ToValue, Conn, Params, Row};
 use snafu::prelude::*;
 
-use super::Result;
-use super::{AsyncDbConnection, DbConnection};
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{
+    AsyncDbConnection, DbConnection, Error as DbConnectionError, Result, UnableToGetSchemaSnafu,
+    UnableToGetSchemasSnafu, UnableToGetTablesSnafu,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -26,7 +28,7 @@ pub enum Error {
     QueryError { source: mysql_async::Error },
 
     #[snafu(display("Failed to convert query result to Arrow.\n{source}.\nReport a bug to request support: https://github.com/datafusion-contrib/datafusion-table-providers/issues"))]
-    ConversionError { source: arrow_sql_gen::mysql::Error },
+    ConversionError { source: crate::arrow_sql_gen::Error },
 
     #[snafu(display("An unexpected error occurred. Verify the configuration and try again."))]
     QueryResultStreamError {},
@@ -90,7 +92,7 @@ impl<'a> DbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
         self
     }
 
-    fn as_async(&self) -> Option<&dyn super::AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)>> {
+    fn as_async(&self) -> Option<&dyn AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)>> {
         Some(self)
     }
 }
@@ -104,7 +106,7 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
         }
     }
 
-    async fn tables(&self, schema: &str) -> Result<Vec<String>, super::Error> {
+    async fn tables(&self, schema: &str) -> Result<Vec<String>, DbConnectionError> {
         let mut conn = self.conn.lock().await;
         let conn = &mut *conn;
 
@@ -113,7 +115,7 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
             .exec(query, (schema,))
             .await
             .boxed()
-            .context(super::UnableToGetTablesSnafu)?;
+            .context(UnableToGetTablesSnafu)?;
 
         let table_names = tables
             .iter()
@@ -123,7 +125,7 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
         Ok(table_names)
     }
 
-    async fn schemas(&self) -> Result<Vec<String>, super::Error> {
+    async fn schemas(&self) -> Result<Vec<String>, DbConnectionError> {
         let mut conn = self.conn.lock().await;
         let conn = &mut *conn;
 
@@ -135,7 +137,7 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
             .exec(query, ())
             .await
             .boxed()
-            .context(super::UnableToGetSchemasSnafu)?;
+            .context(UnableToGetSchemasSnafu)?;
 
         let schema_names = schemas
             .iter()
@@ -148,7 +150,7 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
     async fn get_schema(
         &self,
         table_reference: &TableReference,
-    ) -> Result<SchemaRef, super::Error> {
+    ) -> Result<SchemaRef, DbConnectionError> {
         let mut conn = self.conn.lock().await;
         let conn = &mut *conn;
 
@@ -169,17 +171,17 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
             Err(e) => match e {
                 mysql_async::Error::Server(server_error) => {
                     if server_error.code == 1146 {
-                        return Err(super::Error::UndefinedTable {
+                        return Err(DbConnectionError::UndefinedTable {
                             source: Box::new(server_error.clone()),
                             table_name: table_reference.to_string(),
                         });
                     }
-                    return Err(super::Error::UnableToGetSchema {
+                    return Err(DbConnectionError::UnableToGetSchema {
                         source: Box::new(mysql_async::Error::Server(server_error)),
                     });
                 }
                 _ => {
-                    return Err(super::Error::UnableToGetSchema {
+                    return Err(DbConnectionError::UnableToGetSchema {
                         source: Box::new(e),
                     })
                 }
@@ -188,7 +190,7 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
 
         Ok(
             columns_meta_to_schema(columns_meta, self.zero_date_behavior)
-                .context(super::UnableToGetSchemaSnafu)?,
+                .context(UnableToGetSchemaSnafu)?,
         )
     }
 
@@ -309,7 +311,7 @@ fn columns_meta_to_schema(
         let (precision, scale) = match column_type {
             ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => {
                 let (precision, scale) = extract_decimal_precision_and_scale(&data_type)
-                    .context(super::UnableToGetSchemaSnafu)?;
+                    .context(UnableToGetSchemaSnafu)?;
                 (Some(precision), Some(scale))
             }
             _ => (None, None),

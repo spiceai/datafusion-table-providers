@@ -13,13 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::mysql::write::MySQLTableWriter;
-use datafusion_table_providers_common::sql::arrow_sql_gen::mysql::MysqlZeroDateBehavior;
+use crate::write::MySQLTableWriter;
+use crate::arrow_sql_gen::MysqlZeroDateBehavior;
 use datafusion_table_providers_common::sql::arrow_sql_gen::statement::{CreateTableBuilder, IndexBuilder, InsertBuilder};
-use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::mysqlconn::MySQLConnection;
+use crate::conn::MySQLConnection;
 use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::DbConnection;
-use datafusion_table_providers_common::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
-use datafusion_table_providers_common::sql::db_connection_pool::{self, mysqlpool, DbConnectionPool};
+use crate::pool::MySQLConnectionPool;
+use datafusion_table_providers_common::sql::db_connection_pool::{self, DbConnectionPool};
 use datafusion_table_providers_common::sql::sql_provider_datafusion::{self, expr, expr::Engine, SqlTable};
 use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
 use datafusion_table_providers_common::util::{
@@ -52,6 +52,9 @@ pub type DynMySQLConnection = dyn DbConnection<mysql_async::Conn, &'static (dyn 
 #[cfg(feature = "federation")]
 pub mod federation;
 pub(crate) mod mysql_window;
+pub mod arrow_sql_gen;
+pub mod conn;
+pub mod pool;
 pub mod sql_table;
 pub mod write;
 
@@ -80,7 +83,7 @@ pub enum Error {
     UnableToBeginTransaction { source: mysql_async::Error },
 
     #[snafu(display("Unable to create MySQL connection pool: {source}"))]
-    UnableToCreateMySQLConnectionPool { source: mysqlpool::Error },
+    UnableToCreateMySQLConnectionPool { source: crate::pool::Error },
 
     #[snafu(display("Unable to create the MySQL table: {source}"))]
     UnableToCreateMySQLTable { source: mysql_async::Error },
