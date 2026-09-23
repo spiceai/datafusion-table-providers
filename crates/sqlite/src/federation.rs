@@ -90,8 +90,9 @@ impl<T, P> SQLExecutor for SQLiteTable<T, P> {
     }
 
     fn ast_analyzer(&self) -> Option<AstAnalyzer> {
-        let rule: AstAnalyzer = Box::new(sqlite_ast_analyzer(self.decimal_between));
-        Some(rule)
+        Some(AstAnalyzer::new(vec![Box::new(sqlite_ast_analyzer(
+            self.decimal_between,
+        ))]))
     }
 
     fn logical_optimizer(&self) -> Option<datafusion_federation::sql::LogicalOptimizer> {

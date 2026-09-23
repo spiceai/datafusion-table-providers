@@ -49,7 +49,7 @@ impl TableArgReplace {
             let _ = datafusion::sql::sqlparser::ast::VisitMut::visit(&mut statement, &mut visitor);
             Ok(statement)
         };
-        Box::new(x)
+        datafusion_federation::sql::AstAnalyzer::new(vec![Box::new(x)])
     }
 }
 

@@ -79,8 +79,7 @@ impl SQLExecutor for MySQLTable {
     }
 
     fn ast_analyzer(&self) -> Option<AstAnalyzer> {
-        let rule: AstAnalyzer = Box::new(mysql_ast_analyzer);
-        Some(rule)
+        Some(AstAnalyzer::new(vec![Box::new(mysql_ast_analyzer)]))
     }
 
     fn logical_optimizer(&self) -> Option<datafusion_federation::sql::LogicalOptimizer> {
