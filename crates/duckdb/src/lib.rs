@@ -1,4 +1,4 @@
-use crate::duckdb::write_settings::DuckDBWriteSettings;
+use crate::write_settings::DuckDBWriteSettings;
 use datafusion_table_providers_common::sql::sql_provider_datafusion;
 use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
 use datafusion_table_providers_common::util::{
@@ -8,20 +8,16 @@ use datafusion_table_providers_common::util::{
     indexes::IndexType,
     on_conflict::{self, OnConflict},
 };
-use crate::{
-    sql::db_connection_pool::{
-        self,
-        dbconnection::{
-            duckdbconn::{
-                flatten_table_function_name, is_table_function, DuckDBParameter, DuckDbConnection,
-            },
-            get_schema, DbConnection,
-        },
-        duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
-        DbConnectionPool, DbInstanceKey, Mode,
-    },
-    UnsupportedTypeAction,
+use crate::conn::{
+    flatten_table_function_name, is_table_function, DuckDBParameter, DuckDbConnection,
 };
+use crate::pool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder};
+use datafusion_table_providers_common::sql::db_connection_pool::{
+    self,
+    dbconnection::{get_schema, DbConnection},
+    DbConnectionPool, DbInstanceKey, Mode,
+};
+use datafusion_table_providers_common::UnsupportedTypeAction;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect};
@@ -52,6 +48,8 @@ mod federation;
 mod creator;
 mod file_swap;
 mod settings;
+pub mod conn;
+pub mod pool;
 pub mod sql_table;
 pub mod write;
 pub mod write_settings;
@@ -389,6 +387,7 @@ impl DuckDBTableProviderFactory {
 
         let pool = pool_builder
             .build()
+            .boxed()
             .context(DbConnectionPoolSnafu)?
             .with_unsupported_type_action(self.unsupported_type_action);
 
@@ -504,6 +503,7 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
 
                 read_pool
                     .set_attached_databases(&self.attach_databases(&options))
+                    .boxed()
                     .context(DbConnectionPoolSnafu)
                     .map_err(to_datafusion_error)?
             }
@@ -635,6 +635,7 @@ impl DuckDB {
     > {
         Arc::clone(&self.pool)
             .connect_sync()
+            .boxed()
             .context(DbConnectionSnafu)
     }
 
@@ -810,6 +811,7 @@ pub(crate) fn make_initial_table(
     let cloned_pool = Arc::clone(pool);
     let mut db_conn = Arc::clone(&cloned_pool)
         .connect_sync()
+        .boxed()
         .context(DbConnectionPoolSnafu)
         .map_err(to_datafusion_error)?;
 
@@ -847,7 +849,7 @@ pub(crate) fn make_initial_table(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::duckdb::write::DuckDBTableWriter;
+    use crate::write::DuckDBTableWriter;
 
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};

@@ -4,18 +4,15 @@ use once_cell::sync::OnceCell;
 use snafu::{prelude::*, ResultExt};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
-use super::{
-    dbconnection::duckdbconn::{file_identity, DuckDBAttachments, DuckDBParameter, FileIdentity},
+use crate::conn::{file_identity, DuckDBAttachments, DuckDBParameter, FileIdentity, DuckDbConnection};
+use datafusion_table_providers_common::sql::db_connection_pool::{
     runtime::run_async_with_tokio,
-    DbConnectionPool, Mode, Result,
+    dbconnection::{DbConnection, SyncDbConnection},
+    DbConnectionPool, JoinPushDown, Mode,
 };
-use crate::{
-    sql::db_connection_pool::{
-        dbconnection::{duckdbconn::DuckDbConnection, DbConnection, SyncDbConnection},
-        JoinPushDown,
-    },
-    UnsupportedTypeAction,
-};
+use datafusion_table_providers_common::UnsupportedTypeAction;
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -36,6 +33,9 @@ pub enum Error {
         "Cannot swap the database file of an in-memory DuckDB instance. Only file-backed DuckDB instances support file swapping."
     ))]
     FileSwapUnsupportedForMemory,
+
+    #[snafu(display("The DuckDB connection setup task failed to complete.\n{source}"))]
+    TaskJoinError { source: tokio::task::JoinError },
 }
 
 pub struct DuckDbConnectionPoolBuilder {
@@ -358,7 +358,7 @@ impl DuckDbConnectionPool {
     /// cannot be opened and initialized. On error the pool is left unchanged.
     pub fn swap_database_file(&self, new_path: &str) -> Result<Arc<str>> {
         if self.mode != Mode::File {
-            return Err(Box::new(Error::FileSwapUnsupportedForMemory));
+            return Err(Error::FileSwapUnsupportedForMemory);
         }
 
         let config = get_config(&clone_access_mode(&self.rebuild.access_mode))?;
@@ -547,6 +547,25 @@ impl DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
 {
     async fn connect(
         &self,
+    ) -> std::result::Result<
+        Box<dyn DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBParameter>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.connect_local().await.map_err(Into::into)
+    }
+
+    fn join_push_down(&self) -> JoinPushDown {
+        self.join_push_down.clone()
+    }
+}
+
+impl DuckDbConnectionPool {
+    /// The real `connect` body; kept on the crate's own [`Error`] so its
+    /// many `?`-using internals don't have to funnel through the boxed error
+    /// the `DbConnectionPool` trait requires; the trait method above converts
+    /// at the boundary.
+    async fn connect_local(
+        &self,
     ) -> Result<
         Box<dyn DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBParameter>>,
     > {
@@ -575,7 +594,7 @@ impl DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
                     Ok(conn)
                 })
                 .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)??;
+                .context(TaskJoinSnafu)??;
 
             Ok(Box::new(
                 DuckDbConnection::new(conn)
@@ -591,10 +610,6 @@ impl DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
                 >)
         };
         run_async_with_tokio(connect).await
-    }
-
-    fn join_push_down(&self) -> JoinPushDown {
-        self.join_push_down.clone()
     }
 }
 
@@ -671,9 +686,9 @@ fn extract_db_name(file_path: Arc<str>) -> Result<String> {
     let db_name = match path.file_stem().and_then(|name| name.to_str()) {
         Some(name) => name,
         None => {
-            return Err(Box::new(Error::UnableToExtractDatabaseNameFromPath {
+            return Err(Error::UnableToExtractDatabaseNameFromPath {
                 path: file_path,
-            }))
+            })
         }
     };
 

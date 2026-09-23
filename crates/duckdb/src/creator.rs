@@ -1,6 +1,6 @@
 use datafusion_table_providers_common::sql::arrow_sql_gen::statement::IndexBuilder;
-use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
-use datafusion_table_providers_common::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+use crate::conn::DuckDbConnection;
+use crate::pool::DuckDbConnectionPool;
 use datafusion_table_providers_common::util::on_conflict::OnConflict;
 use arrow::{
     array::{RecordBatch, RecordBatchIterator, RecordBatchReader},
@@ -369,7 +369,7 @@ impl TableManager {
         pool: Arc<DuckDbConnectionPool>,
         tx: &Transaction<'_>,
     ) -> super::Result<()> {
-        let mut db_conn = pool.connect_sync().context(super::DbConnectionPoolSnafu)?;
+        let mut db_conn = pool.connect_sync().boxed().context(super::DbConnectionPoolSnafu)?;
         let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)?;
 
         // create the table with the supplied table name, or a generated internal name
@@ -908,12 +908,9 @@ impl ViewCreator {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::{
-        duckdb::make_initial_table,
-        sql::db_connection_pool::{
-            dbconnection::duckdbconn::DuckDbConnection, duckdbpool::DuckDbConnectionPool,
-        },
-    };
+    use crate::make_initial_table;
+    use crate::conn::DuckDbConnection;
+    use crate::pool::DuckDbConnectionPool;
     use datafusion::{
         arrow::array::RecordBatch,
         common::SchemaExt,
@@ -926,12 +923,27 @@ pub(crate) mod tests {
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
 
-    use crate::{
-        duckdb::write::DuckDBDataSink,
-        util::constraints::tests::{get_pk_constraints, get_unique_constraints},
-    };
+    use crate::write::DuckDBDataSink;
 
     use super::*;
+
+    fn get_unique_constraints(cols: &[&str], schema: SchemaRef) -> Constraints {
+        let indices: Vec<usize> = cols
+            .iter()
+            .filter_map(|&col_name| schema.column_with_name(col_name).map(|(index, _)| index))
+            .collect();
+
+        Constraints::new_unverified(vec![datafusion::common::Constraint::Unique(indices)])
+    }
+
+    fn get_pk_constraints(cols: &[&str], schema: SchemaRef) -> Constraints {
+        let indices: Vec<usize> = cols
+            .iter()
+            .filter_map(|&col_name| schema.column_with_name(col_name).map(|(index, _)| index))
+            .collect();
+
+        Constraints::new_unverified(vec![datafusion::common::Constraint::PrimaryKey(indices)])
+    }
 
     pub(crate) fn get_mem_duckdb() -> Arc<DuckDbConnectionPool> {
         Arc::new(

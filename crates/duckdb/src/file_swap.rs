@@ -61,7 +61,7 @@ use super::creator::{TableDefinition, TableManager};
 use super::write::{execute_analyze_sql, write_to_table, WriteCompletionHandler};
 use super::write_settings::DuckDBWriteSettings;
 use super::{to_datafusion_error, DuckDB};
-use datafusion_table_providers_common::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+use crate::pool::DuckDbConnectionPool;
 use datafusion_table_providers_common::util::on_conflict::OnConflict;
 use datafusion_table_providers_common::util::retriable_error::to_retriable_data_write_error;
 
@@ -451,6 +451,7 @@ fn copy_live_contents_into_staging(
     // state, so it must never run on a connection that returns to the pool.
     let mut pooled = Arc::clone(pool)
         .connect_sync()
+        .boxed()
         .context(super::DbConnectionPoolSnafu)
         .map_err(to_retriable_data_write_error)?;
     let live_conn = DuckDB::duckdb_conn(&mut pooled)
@@ -914,6 +915,7 @@ fn complete_swap(
     };
 
     pool.swap_database_file(&target)
+        .boxed()
         .context(super::DbConnectionPoolSnafu)
         .map_err(to_datafusion_error)?;
 
@@ -934,9 +936,9 @@ fn complete_swap(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::duckdb::write::DuckDBDataSink;
-    use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
-    use datafusion_table_providers_common::sql::db_connection_pool::duckdbpool::DuckDbConnectionPoolBuilder;
+    use crate::write::DuckDBDataSink;
+    use crate::conn::DuckDbConnection;
+    use crate::pool::DuckDbConnectionPoolBuilder;
     use datafusion_table_providers_common::util::column_reference::ColumnReference;
     use datafusion_table_providers_common::util::indexes::IndexType;
     use arrow::array::{Int64Array, StringArray};
@@ -1265,7 +1267,7 @@ mod tests {
     /// restarted. `attach_once` must notice the replacement and re-attach.
     #[tokio::test]
     async fn test_attach_once_reattaches_replaced_database_file() {
-        use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::duckdbconn::DuckDBAttachments;
+        use crate::conn::DuckDBAttachments;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let main_path = dir.path().join("main.db").to_string_lossy().to_string();
@@ -1320,7 +1322,7 @@ mod tests {
     /// "attachment_..."` failures under concurrent load with `replace_file`.
     #[tokio::test]
     async fn test_attach_once_reattaches_after_own_instance_swap() {
-        use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::duckdbconn::DuckDBAttachments;
+        use crate::conn::DuckDBAttachments;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let peer_path = dir.path().join("peer.db").to_string_lossy().to_string();
@@ -1492,7 +1494,7 @@ mod tests {
     /// statement, must fail with its original error rather than be retried.
     #[test]
     fn test_recovery_does_not_mask_unrelated_catalog_errors() {
-        use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::duckdbconn::DuckDBAttachments;
+        use crate::conn::DuckDBAttachments;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let peer_path = dir.path().join("peer.db").to_string_lossy().to_string();

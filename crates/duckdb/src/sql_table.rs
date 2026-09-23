@@ -439,9 +439,9 @@ pub(crate) fn get_cte(table_functions: &Option<HashMap<String, String>>) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::duckdb::DynDuckDbConnectionPool;
-    use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::duckdbconn::DuckDBParameter;
-    use datafusion_table_providers_common::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+    use crate::DynDuckDbConnectionPool;
+    use crate::conn::DuckDBParameter;
+    use crate::pool::DuckDbConnectionPool;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::prelude::SessionContext;
     use duckdb::DuckdbConnectionManager;

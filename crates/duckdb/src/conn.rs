@@ -25,9 +25,10 @@ use datafusion_table_providers_common::sql::db_connection_pool::runtime::run_syn
 use datafusion_table_providers_common::util::schema::SchemaValidator;
 use datafusion_table_providers_common::UnsupportedTypeAction;
 
-use super::DbConnection;
-use super::Result;
-use super::SyncDbConnection;
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{
+    DbConnection, Error as DbConnectionError, Result, SyncDbConnection, UnableToGetSchemaSnafu,
+    UnableToGetSchemasSnafu, UnableToGetTablesSnafu,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -218,9 +219,9 @@ impl DuckDBAttachments {
         let mut rows = stmt.query([]).context(DuckDBConnectionSnafu)?;
 
         let mut existing_attachments = std::collections::HashMap::new();
-        while let Some(row) = rows.next()? {
-            let db_name: String = row.get(1)?;
-            let db_path: Option<String> = row.get(2)?;
+        while let Some(row) = rows.next().context(DuckDBConnectionSnafu)? {
+            let db_name: String = row.get(1).context(DuckDBConnectionSnafu)?;
+            let db_path: Option<String> = row.get(2).context(DuckDBConnectionSnafu)?;
             if db_name.starts_with(ATTACHMENT_ALIAS_PREFIX) {
                 // attachment always has a path so it is safe to use unwrap_or_default
                 existing_attachments.insert(db_path.unwrap_or_default(), db_name);
@@ -490,7 +491,7 @@ pub struct DuckDbConnection {
 }
 
 impl SchemaValidator for DuckDbConnection {
-    type Error = super::Error;
+    type Error = DbConnectionError;
 
     fn is_data_type_supported(data_type: &DataType) -> bool {
         match data_type {
@@ -520,7 +521,7 @@ impl SchemaValidator for DuckDbConnection {
     }
 
     fn unsupported_type_error(data_type: &DataType, field_name: &str) -> Self::Error {
-        super::Error::UnsupportedDataType {
+        DbConnectionError::UnsupportedDataType {
             data_type: data_type.to_string(),
             field_name: field_name.to_string(),
         }
@@ -619,7 +620,7 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
         }
     }
 
-    fn tables(&self, schema: &str) -> Result<Vec<String>, super::Error> {
+    fn tables(&self, schema: &str) -> Result<Vec<String>, DbConnectionError> {
         let sql = "SELECT table_name FROM information_schema.tables \
                   WHERE table_schema = ? AND table_type = 'BASE TABLE'";
 
@@ -627,21 +628,21 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
             .conn
             .prepare(sql)
             .boxed()
-            .context(super::UnableToGetTablesSnafu)?;
+            .context(UnableToGetTablesSnafu)?;
         let mut rows = stmt
             .query([schema])
             .boxed()
-            .context(super::UnableToGetTablesSnafu)?;
+            .context(UnableToGetTablesSnafu)?;
         let mut tables = vec![];
 
-        while let Some(row) = rows.next().boxed().context(super::UnableToGetTablesSnafu)? {
-            tables.push(row.get(0).boxed().context(super::UnableToGetTablesSnafu)?);
+        while let Some(row) = rows.next().boxed().context(UnableToGetTablesSnafu)? {
+            tables.push(row.get(0).boxed().context(UnableToGetTablesSnafu)?);
         }
 
         Ok(tables)
     }
 
-    fn schemas(&self) -> Result<Vec<String>, super::Error> {
+    fn schemas(&self) -> Result<Vec<String>, DbConnectionError> {
         let sql = "SELECT DISTINCT schema_name FROM information_schema.schemata \
                   WHERE schema_name NOT IN ('information_schema', 'pg_catalog')";
 
@@ -649,25 +650,25 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
             .conn
             .prepare(sql)
             .boxed()
-            .context(super::UnableToGetSchemasSnafu)?;
+            .context(UnableToGetSchemasSnafu)?;
         let mut rows = stmt
             .query([])
             .boxed()
-            .context(super::UnableToGetSchemasSnafu)?;
+            .context(UnableToGetSchemasSnafu)?;
         let mut schemas = vec![];
 
         while let Some(row) = rows
             .next()
             .boxed()
-            .context(super::UnableToGetSchemasSnafu)?
+            .context(UnableToGetSchemasSnafu)?
         {
-            schemas.push(row.get(0).boxed().context(super::UnableToGetSchemasSnafu)?);
+            schemas.push(row.get(0).boxed().context(UnableToGetSchemasSnafu)?);
         }
 
         Ok(schemas)
     }
 
-    fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef, super::Error> {
+    fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef, DbConnectionError> {
         let table_str = if is_table_function(table_reference) {
             table_reference.to_string()
         } else {
@@ -680,7 +681,7 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
             probe_schema(conn, &probe_sql)
         })
         .boxed()
-        .context(super::UnableToGetSchemaSnafu)?;
+        .context(UnableToGetSchemaSnafu)?;
 
         Self::handle_unsupported_schema(&schema, self.unsupported_type_action)
     }
@@ -693,7 +694,7 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
     ) -> Result<SendableRecordBatchStream> {
         let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<RecordBatch>(4);
 
-        let conn = self.conn.try_clone()?;
+        let conn = self.conn.try_clone().context(DuckDBConnectionSnafu)?;
 
         if let Some(attachments) = &self.attachments {
             attachments.attach_once(&conn)?;
@@ -707,7 +708,7 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
             probe_schema(conn, &fetch_schema_sql)
         })
         .boxed()
-        .context(super::UnableToGetSchemaSnafu)?;
+        .context(UnableToGetSchemaSnafu)?;
 
         let params = params.iter().map(dyn_clone::clone).collect::<Vec<_>>();
 
@@ -1202,7 +1203,7 @@ mod tests {
         use arrow::datatypes::{Schema, TimeUnit};
         use futures::StreamExt;
 
-        use datafusion_table_providers_common::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+        use crate::pool::DuckDbConnectionPool;
         use datafusion_table_providers_common::sql::db_connection_pool::DbConnectionPool;
 
         let rt = tokio::runtime::Runtime::new().expect("runtime");

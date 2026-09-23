@@ -9,7 +9,7 @@ pub struct DuckDBWriteSettings {
     /// Whether an `InsertOp::Overwrite` on a file-backed instance writes into a
     /// fresh database file and atomically swaps it in (reclaiming disk space
     /// and leaving a checkpointed, WAL-free file) instead of rewriting the
-    /// table inside the live file. See [`crate::duckdb::file_swap`].
+    /// table inside the live file. See [`crate::file_swap`].
     ///
     /// This and [`Self::checkpoint_on_write`] are two answers to the same
     /// problem — a repeated overwrite never reclaiming the space of the

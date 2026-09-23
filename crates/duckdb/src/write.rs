@@ -1,9 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fmt, sync::Arc};
 
-use crate::duckdb::DuckDB;
-use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
-use datafusion_table_providers_common::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+use crate::DuckDB;
+use crate::conn::DuckDbConnection;
+use crate::pool::DuckDbConnectionPool;
 use datafusion_table_providers_common::sql::sql_provider_datafusion::expr;
 use datafusion_table_providers_common::util::{
     constraints,
@@ -621,6 +621,7 @@ fn insert_append(
 
     let mut db_conn = pool
         .connect_sync()
+        .boxed()
         .context(super::DbConnectionPoolSnafu)
         .map_err(to_retriable_data_write_error)?;
 
@@ -780,6 +781,7 @@ fn insert_overwrite(
     let cloned_pool = Arc::clone(&pool);
     let mut db_conn = pool
         .connect_sync()
+        .boxed()
         .context(super::DbConnectionPoolSnafu)
         .map_err(to_retriable_data_write_error)?;
 
@@ -1067,10 +1069,8 @@ mod test {
     use datafusion::physical_plan::memory::MemoryStream;
 
     use super::*;
-    use crate::{
-        duckdb::creator::tests::{get_basic_table_definition, get_mem_duckdb, init_tracing},
-        util::{column_reference::ColumnReference, indexes::IndexType},
-    };
+    use crate::creator::tests::{get_basic_table_definition, get_mem_duckdb, init_tracing};
+    use datafusion_table_providers_common::util::{column_reference::ColumnReference, indexes::IndexType};
 
     #[tokio::test]
     async fn test_write_to_table_overwrite_without_previous_table() {
