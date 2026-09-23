@@ -4,7 +4,11 @@ use clickhouse::{Client, Compression};
 use secrecy::{ExposeSecret, SecretString};
 use snafu::{ResultExt, Snafu};
 
-use super::{dbconnection::DbConnection, DbConnectionPool, JoinPushDown};
+use crate::conn::ClickHouseConnection;
+use datafusion_table_providers_common::sql::db_connection_pool::{
+    dbconnection::DbConnection, DbConnectionPool, JoinPushDown,
+};
+type PoolResult<T, E = Box<dyn std::error::Error + Send + Sync>> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -71,7 +75,7 @@ impl ClickHouseConnectionPool {
                 }
                 key if key.starts_with("option_") => {
                     let opt = &key["option_".len()..];
-                    client = client.with_option(opt, value);
+                    client = client.with_setting(opt, value);
                 }
                 key if key.starts_with("header_") => {
                     let header = &key["header_".len()..];
@@ -114,8 +118,8 @@ impl ClickHouseConnectionPool {
 
 #[async_trait::async_trait]
 impl DbConnectionPool<Client, ()> for ClickHouseConnectionPool {
-    async fn connect(&self) -> super::Result<Box<dyn DbConnection<Client, ()>>> {
-        Ok(Box::new(self.client()))
+    async fn connect(&self) -> PoolResult<Box<dyn DbConnection<Client, ()>>> {
+        Ok(Box::new(ClickHouseConnection::new(self.client())))
     }
 
     fn join_push_down(&self) -> JoinPushDown {

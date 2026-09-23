@@ -16,11 +16,36 @@
 # under the License.
 
 [workspace]
-members = ["core", "python"]
+members = ["core", "crates/common", "python", "crates/odbc", "crates/clickhouse", "crates/flightsql", "crates/mongodb", "crates/mysql", "crates/sqlite", "crates/postgres", "crates/duckdb", "crates/adbc", "crates/oracle"]
 resolver = "2"
 
+# LOCAL-ONLY, temporary: the DataFusion 55 upgrade needs matching bumps in
+# sibling Spice forks (arrow-rs to 59.2.0, duckdb-rs to an arrow-59-compatible
+# rev) that are prepared but not yet pushed. These path overrides point at
+# local sibling checkouts purely so this branch can be compiled and tested in
+# isolation; replace with real `git`/`rev` pins once those forks are pushed.
+[patch."https://github.com/spiceai/duckdb-rs.git"]
+duckdb = { path = "../duckdb-rs" }
+[patch."https://github.com/spiceai/arrow-rs.git"]
+arrow = { path = "../arrow-rs/arrow" }
+arrow-arith = { path = "../arrow-rs/arrow-arith" }
+arrow-array = { path = "../arrow-rs/arrow-array" }
+arrow-buffer = { path = "../arrow-rs/arrow-buffer" }
+arrow-cast = { path = "../arrow-rs/arrow-cast" }
+arrow-csv = { path = "../arrow-rs/arrow-csv" }
+arrow-data = { path = "../arrow-rs/arrow-data" }
+arrow-flight = { path = "../arrow-rs/arrow-flight" }
+arrow-ipc = { path = "../arrow-rs/arrow-ipc" }
+arrow-json = { path = "../arrow-rs/arrow-json" }
+arrow-ord = { path = "../arrow-rs/arrow-ord" }
+arrow-row = { path = "../arrow-rs/arrow-row" }
+arrow-schema = { path = "../arrow-rs/arrow-schema" }
+arrow-select = { path = "../arrow-rs/arrow-select" }
+arrow-string = { path = "../arrow-rs/arrow-string" }
+parquet = { path = "../arrow-rs/parquet" }
+
 [workspace.package]
-version = "0.10.1"
+version = "0.13.1"
 readme = "README.md"
 edition = "2021"
 repository = "https://github.com/datafusion-contrib/datafusion-table-providers"
@@ -28,30 +53,47 @@ license = "Apache-2.0"
 description = "Extend the capabilities of DataFusion to support additional data sources via implementations of the `TableProvider` trait."
 
 [workspace.dependencies]
-arrow = "58.0"
-arrow-array = { version = "58.0" }
-arrow-flight = { version = "58.0", features = [
+arrow = "59.2"
+arrow-array = { version = "59.2" }
+arrow-flight = { version = "59.2", features = [
   "flight-sql-experimental",
   "tls-ring",
   "tls-native-roots",
 ] }
-arrow-ipc = { version = "58.0" }
-arrow-schema = { version = "58.0", features = ["serde"] }
-arrow-json = "58.0"
-arrow-odbc = { version = "23.1" }
-datafusion = { version = "54.0", default-features = false }
-datafusion-expr = { version = "54.0" }
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "3af703dba0accdff5fdb0ae92ef12588e1dfe88a" } # branch: spiceai-54
-datafusion-ffi = { version = "54.0" }
-datafusion-proto = { version = "54.0" }
-datafusion-physical-expr = { version = "54.0" }
-datafusion-physical-plan = { version = "54.0" }
-datafusion-python = { version = "54.0" }
-datafusion-table-providers = { path = "core" }
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "76655d2ffc1b1e4dfc886de561759b70ead48b96" } # branch: spiceai-1.4.4 (DuckDB v1.4.4, arrow 58)
-adbc_core = { version = "0.23" }
-adbc_driver_manager = { version = "0.23" }
-parquet = "58"
+arrow-ipc = { version = "59.2" }
+arrow-schema = { version = "59.2", features = ["serde"] }
+arrow-json = "59.2"
+arrow-odbc = { version = "25.3" }
+datafusion = { version = "55.1", default-features = false }
+datafusion-expr = { version = "55.1" }
+# crates.io datafusion-federation 0.5.7 already requires datafusion ^55
+# (verified via crates.io dependency metadata); no Spice fork bump needed here.
+datafusion-federation = { version = "0.5.7" }
+datafusion-ffi = { version = "55.1" }
+datafusion-proto = { version = "55.1" }
+datafusion-physical-expr = { version = "55.1" }
+datafusion-physical-plan = { version = "55.1" }
+datafusion-python = { version = "55.1" }
+datafusion-table-providers = { version = "0.13.1", path = "core" }
+datafusion-table-providers-common = { version = "0.13.1", path = "crates/common" }
+datafusion-table-providers-odbc = { version = "0.13.1", path = "crates/odbc" }
+datafusion-table-providers-clickhouse = { version = "0.13.1", path = "crates/clickhouse" }
+datafusion-table-providers-flightsql = { version = "0.13.1", path = "crates/flightsql" }
+datafusion-table-providers-mongodb = { version = "0.13.1", path = "crates/mongodb" }
+datafusion-table-providers-mysql = { version = "0.13.1", path = "crates/mysql" }
+datafusion-table-providers-sqlite = { version = "0.13.1", path = "crates/sqlite" }
+datafusion-table-providers-postgres = { version = "0.13.1", path = "crates/postgres" }
+datafusion-table-providers-duckdb = { version = "0.13.1", path = "crates/duckdb" }
+datafusion-table-providers-adbc = { version = "0.13.1", path = "crates/adbc" }
+datafusion-table-providers-oracle = { version = "0.13.1", path = "crates/oracle" }
+# TODO(DF55): repoint at the arrow-59-compatible spiceai-1.4.4-arrow59 branch
+# once it is pushed (prepared locally as commit 8759747e3070275c00c3b02bb2b13da03cb4d6b0).
+# Pinned at the last-pushed rev for now; the local path patch above supplies
+# the actual arrow-59 build content in this checkout.
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "76655d2ffc1b1e4dfc886de561759b70ead48b96" } # branch: spiceai-1.4.4
+adbc_core = { version = "0.24" }
+adbc_driver_manager = { version = "0.24" }
+parquet = "59.2"
 rusqlite = "0.40"
 tokio-rusqlite = "0.7.0"
 async-stream = "0.3.5"
@@ -100,7 +142,11 @@ sea-query = { git = "https://github.com/spiceai/sea-query.git", rev = "ae75baef8
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3f98225d35735a61a5875d356774d246a8b0c037" } # spiceai-v0.40.0
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" } # rusqlite 0.40-compatible (matches spiceai/spiceai)
 
-# arrow-rs 58 with spice patches (ObjectVersionType + new_with_meta for Azure compatibility) — branch: spiceai-58
+# arrow-rs with spice patches (ObjectVersionType + new_with_meta for Azure compatibility).
+# TODO(DF55): repoint at the arrow-59 spiceai-59-patches branch once it is
+# pushed (prepared locally as commit eed0d7b89). Pinned at the last-pushed
+# spiceai-58 rev for now; the path patch above supplies the actual arrow-59
+# build content in this checkout.
 arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }
 arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }
 arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }

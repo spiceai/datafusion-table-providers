@@ -819,7 +819,7 @@ async fn test_mongodb_json_nesting(port: usize) {
     let pool = common::get_mongodb_connection_pool(port, None)
         .await
         .expect("MongoDB connection pool should be created");
-    let table = MongoDBTable::new(
+    let table = MongoDBTable::new_with_projection(
         &Arc::new(pool),
         "json_nesting_collection",
         None,
@@ -969,7 +969,7 @@ async fn test_mongodb_sort_limit(port: usize) {
     let pool = common::get_mongodb_connection_pool(port, None)
         .await
         .expect("MongoDB connection pool should be created");
-    let table = MongoDBTable::new(&Arc::new(pool), "sort_limit_test", None, None)
+    let table = MongoDBTable::new(&Arc::new(pool), "sort_limit_test")
         .await
         .expect("Table should be created");
     ctx.register_table("sort_limit_test", Arc::new(table))

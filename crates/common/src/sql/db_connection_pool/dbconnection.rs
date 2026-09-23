@@ -7,25 +7,11 @@ use snafu::prelude::*;
 
 use crate::sql::db_connection_pool::runtime::run_async_with_tokio;
 
-#[cfg(feature = "adbc")]
-pub mod adbcconn;
-#[cfg(feature = "clickhouse")]
-pub mod clickhouseconn;
-#[cfg(feature = "duckdb")]
-pub mod duckdbconn;
-#[cfg(feature = "mysql")]
-pub mod mysqlconn;
-#[cfg(feature = "odbc")]
-pub mod odbcconn;
-#[cfg(feature = "postgres")]
-pub mod postgresconn;
-#[cfg(feature = "sqlite")]
-pub mod sqliteconn;
-
 pub type GenericError = Box<dyn std::error::Error + Send + Sync>;
-type Result<T, E = GenericError> = std::result::Result<T, E>;
+pub type Result<T, E = GenericError> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 pub enum Error {
     #[snafu(display("Unable to downcast connection.\nReport a bug to request support: https://github.com/datafusion-contrib/datafusion-table-providers/issues"))]
     UnableToDowncastConnection {},

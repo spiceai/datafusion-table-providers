@@ -1,30 +1,42 @@
 //! `RowShape` adapter for MongoDB BSON, letting the connector-agnostic
-//! [`crate::schema_projection`] core apply JSON nesting to MongoDB documents on
-//! both the scan and change-stream paths.
+//! [`datafusion_table_providers_common::schema_projection`] core apply JSON
+//! nesting to MongoDB documents on the scan path.
 
-use crate::schema_projection::{RowShape, SchemaProjection};
+use datafusion_table_providers_common::schema_projection::{RowShape, SchemaProjection};
 use mongodb::bson::{Bson, Document};
 
-impl RowShape for Bson {
+/// Local wrapper that permits implementing the common projection trait for BSON
+/// without violating Rust's orphan rules.
+struct BsonRow(Bson);
+
+impl RowShape for BsonRow {
     fn into_object(self) -> Result<Vec<(String, Self)>, Self> {
-        match self {
-            Bson::Document(doc) => Ok(doc.into_iter().collect()),
-            other => Err(other),
+        match self.0 {
+            Bson::Document(doc) => Ok(doc
+                .into_iter()
+                .map(|(key, value)| (key, Self(value)))
+                .collect()),
+            other => Err(Self(other)),
         }
     }
 
     fn from_object(entries: Vec<(String, Self)>) -> Self {
-        Bson::Document(entries.into_iter().collect())
+        Self(Bson::Document(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key, value.0))
+                .collect(),
+        ))
     }
 
     fn to_json(&self) -> serde_json::Value {
         // Relaxed Extended JSON keeps ordinary values (numbers, strings, bools)
         // as plain JSON while round-tripping MongoDB-specific types.
-        self.clone().into_relaxed_extjson()
+        self.0.clone().into_relaxed_extjson()
     }
 
     fn from_json_string(json: String) -> Self {
-        Bson::String(json)
+        Self(Bson::String(json))
     }
 }
 
@@ -32,7 +44,7 @@ impl RowShape for Bson {
 /// `Document` type. Non-declared fields are folded into the catch-all column.
 #[must_use]
 pub fn project_bson_document(doc: Document, projection: &SchemaProjection) -> Document {
-    match projection.project_row(Bson::Document(doc)) {
+    match projection.project_row(BsonRow(Bson::Document(doc))).0 {
         Bson::Document(doc) => doc,
         _ => Document::new(),
     }
@@ -41,7 +53,7 @@ pub fn project_bson_document(doc: Document, projection: &SchemaProjection) -> Do
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema_projection::{ColumnSource, ProjectedColumn};
+    use datafusion_table_providers_common::schema_projection::{ColumnSource, ProjectedColumn};
     use mongodb::bson::doc;
 
     fn nesting_projection() -> SchemaProjection {

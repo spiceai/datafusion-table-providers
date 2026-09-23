@@ -13,9 +13,30 @@ use regex::Regex;
 use serde::Deserialize;
 use snafu::ResultExt;
 
-use super::{AsyncDbConnection, DbConnection, Error, SyncDbConnection};
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{
+    AsyncDbConnection, DbConnection, Error, SyncDbConnection,
+};
 
-impl DbConnection<Client, ()> for Client {
+#[derive(Clone)]
+pub struct ClickHouseConnection {
+    pub client: Client,
+}
+
+impl std::fmt::Debug for ClickHouseConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClickHouseConnection")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClickHouseConnection {
+    #[must_use]
+    pub fn new(client: Client) -> Self {
+        Self { client }
+    }
+}
+
+impl DbConnection<Client, ()> for ClickHouseConnection {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -34,12 +55,12 @@ impl DbConnection<Client, ()> for Client {
 }
 
 #[async_trait]
-impl AsyncDbConnection<Client, ()> for Client {
+impl AsyncDbConnection<Client, ()> for ClickHouseConnection {
     fn new(conn: Client) -> Self
     where
         Self: Sized,
     {
-        conn
+        Self { client: conn }
     }
 
     async fn tables(&self, schema: &str) -> Result<Vec<String>, Error> {
@@ -49,12 +70,13 @@ impl AsyncDbConnection<Client, ()> for Client {
         }
 
         let tables: Vec<Row> = self
+            .client
             .query("SELECT name FROM system.tables WHERE database = ?")
             .bind(schema)
             .fetch_all()
             .await
             .boxed()
-            .context(super::UnableToGetTablesSnafu)?;
+            .context(datafusion_table_providers_common::sql::db_connection_pool::dbconnection::UnableToGetTablesSnafu)?;
 
         Ok(tables.into_iter().map(|x| x.name).collect())
     }
@@ -65,11 +87,12 @@ impl AsyncDbConnection<Client, ()> for Client {
             name: String,
         }
         let tables: Vec<Row> = self
+            .client
             .query("SELECT name FROM system.databases WHERE name NOT IN ('system', 'information_schema', 'INFORMATION_SCHEMA')")
             .fetch_all()
             .await
             .boxed()
-            .context(super::UnableToGetSchemasSnafu)?;
+            .context(datafusion_table_providers_common::sql::db_connection_pool::dbconnection::UnableToGetSchemasSnafu)?;
 
         Ok(tables.into_iter().map(|x| x.name).collect())
     }
@@ -89,11 +112,12 @@ impl AsyncDbConnection<Client, ()> for Client {
             Some(db) => db.to_string(),
             None => {
                 let row: CatalogRow = self
+                    .client
                     .query("SELECT currentDatabase() AS db")
                     .fetch_one()
                     .await
                     .boxed()
-                    .context(super::UnableToGetSchemaSnafu)?;
+                    .context(datafusion_table_providers_common::sql::db_connection_pool::dbconnection::UnableToGetSchemaSnafu)?;
                 row.db
             }
         };
@@ -105,13 +129,14 @@ impl AsyncDbConnection<Client, ()> for Client {
         }
 
         let table_info: TableInfoRow = self
+            .client
             .query("SELECT engine, as_select FROM system.tables WHERE database = ? AND name = ?")
             .bind(&database)
             .bind(table_reference.table())
             .fetch_one()
             .await
             .boxed()
-            .context(super::UnableToGetSchemaSnafu)?;
+            .context(datafusion_table_providers_common::sql::db_connection_pool::dbconnection::UnableToGetSchemaSnafu)?;
 
         let is_view = matches!(
             table_info.engine.to_uppercase().as_str(),
@@ -130,17 +155,18 @@ impl AsyncDbConnection<Client, ()> for Client {
         };
 
         let mut bytes = self
+            .client
             .query(&statement)
             .fetch_bytes("ArrowStream")
             .boxed()
-            .context(super::UnableToGetSchemaSnafu)?;
+            .context(datafusion_table_providers_common::sql::db_connection_pool::dbconnection::UnableToGetSchemaSnafu)?;
 
         let reader = bytes
             .collect()
             .await
             .boxed()
             .and_then(|bytes| StreamReader::try_new(Cursor::new(bytes), None).boxed())
-            .context(super::UnableToGetSchemaSnafu)?;
+            .context(datafusion_table_providers_common::sql::db_connection_pool::dbconnection::UnableToGetSchemaSnafu)?;
 
         return Ok(reader.schema());
     }
@@ -161,13 +187,15 @@ impl AsyncDbConnection<Client, ()> for Client {
         sql: &str,
         _params: &[()],
         projected_schema: Option<SchemaRef>,
-    ) -> super::Result<SendableRecordBatchStream> {
-        let query = self.query(sql);
+    ) -> datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Result<
+        SendableRecordBatchStream,
+    > {
+        let query = self.client.query(sql);
 
         let mut bytes_stream = query
             .fetch_bytes("ArrowStream")
             .boxed()
-            .context(super::UnableToQueryArrowSnafu)?;
+            .context(datafusion_table_providers_common::sql::db_connection_pool::dbconnection::UnableToQueryArrowSnafu)?;
 
         let mut first_batch: Option<RecordBatch> = None;
         let mut decoder = StreamDecoder::new();
@@ -215,8 +243,12 @@ impl AsyncDbConnection<Client, ()> for Client {
     ///
     /// * `sql` - The SQL statement.
     /// * `params` - The parameters for the SQL statement.
-    async fn execute(&self, sql: &str, params: &[()]) -> super::Result<u64> {
-        let mut query = self.query(sql);
+    async fn execute(
+        &self,
+        sql: &str,
+        params: &[()],
+    ) -> datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Result<u64> {
+        let mut query = self.client.query(sql);
 
         for param in params {
             query = query.bind(param);
@@ -226,7 +258,7 @@ impl AsyncDbConnection<Client, ()> for Client {
             .execute()
             .await
             .boxed()
-            .context(super::UnableToQueryArrowSnafu)?;
+            .context(datafusion_table_providers_common::sql::db_connection_pool::dbconnection::UnableToQueryArrowSnafu)?;
 
         Ok(0)
     }

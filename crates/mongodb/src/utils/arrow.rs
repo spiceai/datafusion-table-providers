@@ -1,4 +1,4 @@
-use crate::mongodb::{Error, InvalidDecimalSnafu, Result};
+use crate::{Error, InvalidDecimalSnafu, Result};
 use arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Date64Builder, Decimal128Builder,
     Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder,

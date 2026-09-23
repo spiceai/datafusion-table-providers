@@ -1,7 +1,7 @@
 use datafusion::arrow::datatypes::Fields;
 use sea_query::{Alias, ColumnDef, PostgresQueryBuilder, TableBuilder};
 
-use crate::sql::arrow_sql_gen::statement::map_data_type_to_column_type;
+use datafusion_table_providers_common::sql::arrow_sql_gen::statement::map_data_type_to_column_type;
 
 pub struct TypeBuilder {
     name: String,

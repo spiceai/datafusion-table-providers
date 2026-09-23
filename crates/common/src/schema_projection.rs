@@ -13,9 +13,9 @@
 //! The two generic entry points are [`SchemaProjection::project_schema`] (build
 //! the exposed Arrow schema) and [`SchemaProjection::project_row`] (reshape one
 //! source row just before Arrow conversion). Each connector contributes a
-//! [`RowShape`] impl for its native value type (`serde_json::Value`,
-//! `bson::Bson`, DynamoDB `AttributeValue`, …); a nested object is simply a
-//! value that is itself an object.
+//! [`RowShape`] adapter for its native value type (`serde_json::Value`, BSON,
+//! DynamoDB `AttributeValue`, …); a nested object is simply a value that is
+//! itself an object.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -101,16 +101,6 @@ pub struct SchemaProjection {
 }
 
 impl SchemaProjection {
-    /// Build a projection from the declared columns. Validates: at most one
-    /// catch-all, no duplicate output names, and that none of
-    /// `required_columns` is folded into the catch-all.
-    ///
-    /// `required_columns` are columns that must be declared explicitly (e.g.
-    /// primary-key / CDC-key columns) — they must appear as declared `Field`
-    /// columns and may not be the catch-all.
-    ///
-    /// # Errors
-    /// See [`SchemaProjectionError`].
     /// Build a JSON-nesting projection directly from a set of kept (declared)
     /// field names plus one catch-all column. Infallible: the field names are
     /// deduplicated into a set and there is exactly one catch-all, so none of
@@ -123,11 +113,16 @@ impl SchemaProjection {
         catch_all: impl Into<String>,
     ) -> Self {
         let catch_all = catch_all.into();
-        let static_fields: HashSet<String> = static_fields.into_iter().collect();
-        let mut columns: Vec<ProjectedColumn> = static_fields
-            .iter()
+        let mut seen = HashSet::new();
+        let ordered_fields: Vec<String> = static_fields
+            .into_iter()
+            .filter(|name| seen.insert(name.clone()))
+            .collect();
+        let static_fields: HashSet<String> = ordered_fields.iter().cloned().collect();
+        let mut columns: Vec<ProjectedColumn> = ordered_fields
+            .into_iter()
             .map(|name| ProjectedColumn {
-                output_name: name.clone(),
+                output_name: name,
                 source: ColumnSource::Field,
                 declared_type: None,
                 nullable: true,
@@ -146,6 +141,13 @@ impl SchemaProjection {
         }
     }
 
+    /// Build a projection from the declared columns. Validates: at most one
+    /// catch-all, no duplicate output names, and that none of
+    /// `required_columns` is folded into the catch-all.
+    ///
+    /// `required_columns` are columns that must be declared explicitly (e.g.
+    /// primary-key / CDC-key columns) — they must appear as declared `Field`
+    /// columns and may not be the catch-all.
     pub fn new(
         columns: Vec<ProjectedColumn>,
         required_columns: &[String],

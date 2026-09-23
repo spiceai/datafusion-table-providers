@@ -10,7 +10,7 @@
 //! ```rust
 //! use std::sync::Arc;
 //! use datafusion::arrow::datatypes::{DataType, Field, Schema};
-//! use datafusion_table_providers::sql::arrow_sql_gen::statement::CreateTableBuilder;
+//! use datafusion_table_providers_common::sql::arrow_sql_gen::statement::CreateTableBuilder;
 //!
 //! let schema = Arc::new(Schema::new(vec![
 //!     Field::new("id", DataType::Int32, false),
@@ -27,7 +27,7 @@
 //! ```rust
 //! use std::sync::Arc;
 //! use datafusion::arrow::datatypes::{DataType, Field, Schema};
-//! use datafusion_table_providers::sql::arrow_sql_gen::statement::CreateTableBuilder;
+//! use datafusion_table_providers_common::sql::arrow_sql_gen::statement::CreateTableBuilder;
 //!
 //! let schema = Arc::new(Schema::new(vec![
 //!     Field::new("id", DataType::Int32, false),
@@ -43,10 +43,4 @@
 //! ```
 
 pub mod arrow;
-#[cfg(feature = "mysql")]
-pub mod mysql;
-#[cfg(feature = "postgres")]
-pub mod postgres;
-#[cfg(feature = "sqlite")]
-pub mod sqlite;
 pub mod statement;

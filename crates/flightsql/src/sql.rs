@@ -24,7 +24,7 @@ use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
 use tonic::transport::Channel;
 
-use crate::flight::{FlightDriver, FlightMetadata, FlightProperties};
+use crate::{FlightDriver, FlightMetadata, FlightProperties};
 
 pub const QUERY: &str = "flight.sql.query";
 pub const USERNAME: &str = "flight.sql.username";

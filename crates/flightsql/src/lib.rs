@@ -23,7 +23,7 @@ use std::error::Error;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use crate::flight::exec::FlightExec;
+use crate::exec::FlightExec;
 use arrow_flight::error::FlightError;
 use arrow_flight::FlightInfo;
 use async_trait::async_trait;

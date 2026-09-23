@@ -1,4 +1,4 @@
-use crate::mongodb::Error;
+use crate::Error;
 use mongodb::bson::{Bson, Document};
 
 #[derive(Debug, Clone)]
@@ -9,7 +9,7 @@ pub enum DuplicateBehavior {
 #[derive(Debug, Clone)]
 pub enum UnnestBehavior {
     Depth(usize),
-    Custom(fn(&Document) -> crate::mongodb::Result<Document, Error>),
+    Custom(fn(&Document) -> crate::Result<Document, Error>),
 }
 
 #[derive(Debug, Clone)]
@@ -21,7 +21,7 @@ pub struct UnnestParameters {
 pub fn unnest_bson_documents(
     documents: Vec<Document>,
     unnest_parameters: &UnnestParameters,
-) -> crate::mongodb::Result<Vec<Document>, Error> {
+) -> crate::Result<Vec<Document>, Error> {
     let mut all_documents = Vec::new();
 
     for doc in documents {
@@ -35,7 +35,7 @@ pub fn unnest_bson_documents(
 fn unnest_bson_document(
     document: &Document,
     unnest_parameters: &UnnestParameters,
-) -> crate::mongodb::Result<Document, Error> {
+) -> crate::Result<Document, Error> {
     match unnest_parameters.behavior {
         UnnestBehavior::Depth(depth) => {
             let mut new_document = Document::new();
@@ -60,7 +60,7 @@ fn flatten_document_recursive(
     max_depth: usize,
     current_depth: usize,
     duplicate_behavior: &DuplicateBehavior,
-) -> crate::mongodb::Result<(), Error> {
+) -> crate::Result<(), Error> {
     for (key, value) in document {
         let new_path = if current_path.is_empty() {
             key.clone()
@@ -93,7 +93,7 @@ fn handle_duplicate_key(
     document: &Document,
     key: &str,
     duplicate_behavior: &DuplicateBehavior,
-) -> crate::mongodb::Result<String, Error> {
+) -> crate::Result<String, Error> {
     match duplicate_behavior {
         DuplicateBehavior::Error => {
             if document.contains_key(key) {
@@ -109,7 +109,7 @@ fn handle_duplicate_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mongodb::Error;
+    use crate::Error;
     use mongodb::bson::doc;
 
     #[test]
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn test_custom_unnest_behavior() {
-        fn custom_unnest(doc: &Document) -> crate::mongodb::Result<Document, Error> {
+        fn custom_unnest(doc: &Document) -> crate::Result<Document, Error> {
             let mut result = Document::new();
             result.insert("custom_processed", true);
 
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn test_custom_unnest_behavior_with_error() {
-        fn failing_custom_unnest(_doc: &Document) -> crate::mongodb::Result<Document, Error> {
+        fn failing_custom_unnest(_doc: &Document) -> crate::Result<Document, Error> {
             Err(Error::InvalidDocumentAccess {
                 message: "Custom processing failed".to_string(),
             })

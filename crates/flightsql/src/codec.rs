@@ -19,8 +19,8 @@
 
 use std::sync::Arc;
 
-use crate::flight::exec::{FlightConfig, FlightExec};
-use crate::flight::to_df_err;
+use crate::exec::{FlightConfig, FlightExec};
+use crate::to_df_err;
 use datafusion::common::DataFusionError;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;

@@ -1,12 +1,14 @@
+use crate::conn::SqliteConnection;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use snafu::prelude::*;
 use tokio_rusqlite::{Connection, ToSql};
 
-use super::{DbConnectionPool, Result};
-use crate::sql::db_connection_pool::{
-    dbconnection::{sqliteconn::SqliteConnection, AsyncDbConnection, DbConnection},
+use datafusion_table_providers_common::sql::db_connection_pool::DbConnectionPool;
+type PoolResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+use datafusion_table_providers_common::sql::db_connection_pool::{
+    dbconnection::{AsyncDbConnection, DbConnection},
     JoinPushDown, Mode,
 };
 
@@ -45,7 +47,7 @@ impl SqliteConnectionPoolFactory {
         self
     }
 
-    pub async fn build(&self) -> Result<SqliteConnectionPool> {
+    pub async fn build(&self) -> PoolResult<SqliteConnectionPool> {
         let join_push_down = match (self.mode, &self.attach_databases) {
             (Mode::File, Some(attach_databases)) => {
                 if attach_databases.is_empty() {
@@ -123,7 +125,7 @@ impl SqliteConnectionPool {
         join_push_down: JoinPushDown,
         attach_databases: Vec<Arc<str>>,
         busy_timeout: Duration,
-    ) -> Result<Self> {
+    ) -> PoolResult<Self> {
         let conn = match mode {
             Mode::Memory => Connection::open_in_memory()
                 .await
@@ -146,7 +148,7 @@ impl SqliteConnectionPool {
 
     /// Initializes an SQLite database on-disk without creating a connection pool.
     /// No-op if the database is in-memory.
-    pub async fn init(path: &str, mode: Mode) -> Result<()> {
+    pub async fn init(path: &str, mode: Mode) -> PoolResult<()> {
         if mode == Mode::File {
             Connection::open(path.to_string())
                 .await
@@ -156,7 +158,7 @@ impl SqliteConnectionPool {
         Ok(())
     }
 
-    pub async fn setup(&self) -> Result<()> {
+    pub async fn setup(&self) -> PoolResult<()> {
         let conn = self.conn.clone();
         let busy_timeout = self.busy_timeout;
 
@@ -190,7 +192,7 @@ impl SqliteConnectionPool {
             })?;
 
             // database attachments are only supported for file-mode databases
-            #[cfg(feature = "sqlite-federation")]
+            #[cfg(feature = "federation")]
             {
                 let attach_databases = self
                     .attach_databases
@@ -222,7 +224,7 @@ impl SqliteConnectionPool {
                     })?;
                 }
 
-                Ok::<(), super::Error>(())
+                Ok::<(), Error>(())
             }?;
         }
 
@@ -239,7 +241,7 @@ impl SqliteConnectionPool {
     ///
     /// Due to the way the connection pool is implemented, it doesn't allow multiple concurrent reads/writes
     /// using the same connection pool instance.
-    pub async fn try_clone(&self) -> Result<Self> {
+    pub async fn try_clone(&self) -> PoolResult<Self> {
         match self.mode {
             Mode::Memory => Ok(SqliteConnectionPool {
                 conn: self.conn.clone(),
@@ -269,7 +271,7 @@ impl SqliteConnectionPool {
 impl DbConnectionPool<Connection, &'static (dyn ToSql + Sync)> for SqliteConnectionPool {
     async fn connect(
         &self,
-    ) -> Result<Box<dyn DbConnection<Connection, &'static (dyn ToSql + Sync)>>> {
+    ) -> PoolResult<Box<dyn DbConnection<Connection, &'static (dyn ToSql + Sync)>>> {
         let conn = self.conn.clone();
 
         Ok(Box::new(SqliteConnection::new(conn)))
@@ -283,8 +285,8 @@ impl DbConnectionPool<Connection, &'static (dyn ToSql + Sync)> for SqliteConnect
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::db_connection_pool::Mode;
-    use rand::Rng;
+    use datafusion_table_providers_common::sql::db_connection_pool::Mode;
+    use rand::RngExt;
     use rstest::rstest;
     use std::time::Duration;
 

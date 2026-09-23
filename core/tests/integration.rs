@@ -1,4 +1,4 @@
-use rand::Rng;
+use rand::RngExt;
 
 #[cfg(feature = "adbc")]
 mod adbc;
@@ -12,7 +12,7 @@ mod clickhouse;
     feature = "postgres"
 ))]
 mod docker;
-#[cfg(all(feature = "duckdb", feature = "federation"))]
+#[cfg(feature = "duckdb")]
 mod duckdb;
 #[cfg(feature = "flight")]
 mod flight;
@@ -20,6 +20,8 @@ mod flight;
 mod mongodb;
 #[cfg(feature = "mysql")]
 mod mysql;
+#[cfg(feature = "oracle")]
+mod oracle;
 #[cfg(feature = "postgres")]
 mod postgres;
 #[cfg(feature = "sqlite")]

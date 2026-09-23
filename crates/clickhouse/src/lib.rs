@@ -14,6 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod conn;
+pub mod pool;
+
 use clickhouse::Client;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::TableProvider;
@@ -22,10 +25,11 @@ use datafusion::sql::unparser;
 use datafusion::{common::Constraints, sql::TableReference};
 use std::sync::Arc;
 
-use crate::sql::db_connection_pool::clickhousepool::ClickHouseConnectionPool;
-use crate::sql::db_connection_pool::dbconnection::AsyncDbConnection;
+use crate::conn::ClickHouseConnection;
+use crate::pool::ClickHouseConnectionPool;
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::AsyncDbConnection;
 
-#[cfg(feature = "clickhouse-federation")]
+#[cfg(feature = "federation")]
 mod federation;
 mod sql_table;
 
@@ -44,7 +48,8 @@ impl ClickHouseTableFactory {
         args: Option<Vec<(String, Arg)>>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync + 'static>>
     {
-        let client: &dyn AsyncDbConnection<Client, ()> = &self.pool.client();
+        let connection = ClickHouseConnection::new(self.pool.client());
+        let client: &dyn AsyncDbConnection<Client, ()> = &connection;
         let schema = client.get_schema(&table_reference).await?;
         let table_provider = Arc::new(ClickHouseTable::new(
             table_reference,
@@ -54,7 +59,7 @@ impl ClickHouseTableFactory {
             Constraints::default(),
         ));
 
-        #[cfg(feature = "clickhouse-federation")]
+        #[cfg(feature = "federation")]
         let table_provider = Arc::new(
             table_provider
                 .create_federated_table_provider()

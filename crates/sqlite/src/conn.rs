@@ -1,21 +1,21 @@
 use std::any::Any;
 
-use crate::sql::arrow_sql_gen::sqlite::rows_to_arrow;
-use crate::util::schema::SchemaValidator;
-use crate::UnsupportedTypeAction;
+use crate::arrow_sql_gen::rows_to_arrow;
 use arrow::datatypes::SchemaRef;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::sql::TableReference;
+use datafusion_table_providers_common::util::schema::SchemaValidator;
+use datafusion_table_providers_common::UnsupportedTypeAction;
 use rusqlite::ToSql;
 use snafu::prelude::*;
 use tokio_rusqlite::Connection;
 
-use super::AsyncDbConnection;
-use super::DbConnection;
-use super::Result;
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::AsyncDbConnection;
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::DbConnection;
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Result;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -28,9 +28,7 @@ pub enum Error {
     QueryError { source: rusqlite::Error },
 
     #[snafu(display("Failed to convert query result to Arrow: {source}"))]
-    ConversionError {
-        source: crate::sql::arrow_sql_gen::sqlite::Error,
-    },
+    ConversionError { source: crate::arrow_sql_gen::Error },
 }
 
 pub struct SqliteConnection {
@@ -38,7 +36,7 @@ pub struct SqliteConnection {
 }
 
 impl SchemaValidator for SqliteConnection {
-    type Error = super::Error;
+    type Error = datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Error;
 
     fn is_data_type_supported(data_type: &DataType) -> bool {
         match data_type {
@@ -64,7 +62,7 @@ impl SchemaValidator for SqliteConnection {
     }
 
     fn unsupported_type_error(data_type: &DataType, field_name: &str) -> Self::Error {
-        super::Error::UnsupportedDataType {
+        datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Error::UnsupportedDataType {
             data_type: data_type.to_string(),
             field_name: field_name.to_string(),
         }
@@ -91,7 +89,13 @@ impl AsyncDbConnection<Connection, &'static (dyn ToSql + Sync)> for SqliteConnec
         SqliteConnection { conn }
     }
 
-    async fn tables(&self, _schema: &str) -> Result<Vec<String>, super::Error> {
+    async fn tables(
+        &self,
+        _schema: &str,
+    ) -> Result<
+        Vec<String>,
+        datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Error,
+    > {
         let tables = self
             .conn
             .call(move |conn| {
@@ -104,19 +108,27 @@ impl AsyncDbConnection<Connection, &'static (dyn ToSql + Sync)> for SqliteConnec
             })
             .await
             .boxed()
-            .context(super::UnableToGetTablesSnafu)?;
+            .context(datafusion_table_providers_common::sql::db_connection_pool::dbconnection::UnableToGetTablesSnafu)?;
 
         Ok(tables)
     }
 
-    async fn schemas(&self) -> Result<Vec<String>, super::Error> {
+    async fn schemas(
+        &self,
+    ) -> Result<
+        Vec<String>,
+        datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Error,
+    > {
         Ok(vec!["main".to_string()])
     }
 
     async fn get_schema(
         &self,
         table_reference: &TableReference,
-    ) -> Result<SchemaRef, super::Error> {
+    ) -> Result<
+        SchemaRef,
+        datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Error,
+    > {
         let table_reference = table_reference.to_quoted_string();
         let schema: SchemaRef = self
             .conn
@@ -132,7 +144,7 @@ impl AsyncDbConnection<Connection, &'static (dyn ToSql + Sync)> for SqliteConnec
             })
             .await
             .boxed()
-            .context(super::UnableToGetSchemaSnafu)?;
+            .context(datafusion_table_providers_common::sql::db_connection_pool::dbconnection::UnableToGetSchemaSnafu)?;
 
         Self::handle_unsupported_schema(&schema, UnsupportedTypeAction::Error)
     }

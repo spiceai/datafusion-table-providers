@@ -1,7 +1,4 @@
-use crate::mysql::MySQL;
-use crate::util::on_conflict::OnConflict;
-use crate::util::retriable_error::check_and_mark_retriable_error;
-use crate::util::{constraints, to_datafusion_error};
+use crate::MySQL;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::not_impl_err;
@@ -13,6 +10,9 @@ use datafusion::{
     logical_expr::{dml::InsertOp, Expr},
     physical_plan::{metrics::MetricsSet, DisplayAs, DisplayFormatType, ExecutionPlan},
 };
+use datafusion_table_providers_common::util::on_conflict::OnConflict;
+use datafusion_table_providers_common::util::retriable_error::check_and_mark_retriable_error;
+use datafusion_table_providers_common::util::{constraints, to_datafusion_error};
 use futures::StreamExt;
 use mysql_async::TxOpts;
 use snafu::ResultExt;

@@ -12,7 +12,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{dml::InsertOp, CreateExternalTable};
 use datafusion::physical_plan::collect;
 use datafusion::sql::TableReference;
-#[cfg(feature = "sqlite-federation")]
+
 use datafusion_federation::schema_cast::record_convert::try_cast_to;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::{
     CreateTableBuilder, InsertBuilder,
@@ -101,7 +101,6 @@ async fn arrow_sqlite_round_trip(
 
         let record_batch = df.collect().await.expect("RecordBatch should be collected");
 
-        #[cfg(feature = "sqlite-federation")]
         let casted_record =
             try_cast_to(record_batch[0].clone(), Arc::clone(&source_schema)).unwrap();
 
@@ -115,7 +114,7 @@ async fn arrow_sqlite_round_trip(
         assert_eq!(record_batch.len(), 1);
         assert_eq!(record_batch[0].num_rows(), arrow_record.num_rows());
         assert_eq!(record_batch[0].num_columns(), arrow_record.num_columns());
-        #[cfg(feature = "sqlite-federation")]
+
         assert_eq!(casted_record, arrow_record);
     }
 }
@@ -358,12 +357,12 @@ async fn test_sqlite_table_provider_roundtrip(
     );
 
     // Cast the result back to the original schema for comparison
-    #[cfg(feature = "sqlite-federation")]
+
     let casted_result = try_cast_to(result_batch.clone(), Arc::clone(&schema))
         .expect("should cast result to original schema");
 
     // Verify the data matches
-    #[cfg(feature = "sqlite-federation")]
+
     assert_eq!(
         casted_result, record_batch,
         "Round-tripped data should match original"
@@ -372,7 +371,6 @@ async fn test_sqlite_table_provider_roundtrip(
 
 /// Test List(Utf8) round-trip through SqliteTableProviderFactory with federation enabled
 /// This test uses the factory which wraps the table with federation support when the feature is enabled
-#[cfg(feature = "sqlite-federation")]
 #[tokio::test]
 async fn test_sqlite_list_utf8_federation_roundtrip() {
     let ctx = SessionContext::new();
@@ -491,7 +489,6 @@ async fn download_parquet_as_record_batch(url: &str) -> anyhow::Result<RecordBat
     Ok(record_batch)
 }
 
-#[cfg(feature = "sqlite-federation")]
 mod sort_limit_pushdown {
     use super::*;
 

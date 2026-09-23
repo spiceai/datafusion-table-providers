@@ -11,13 +11,13 @@ use mongodb::{
 use snafu::prelude::*;
 use std::sync::Arc;
 
-use crate::mongodb::projection::project_bson_document;
-use crate::mongodb::utils::arrow::mongo_docs_to_arrow;
-use crate::mongodb::utils::schema::infer_arrow_schema_from_documents;
-use crate::mongodb::utils::unnest::{unnest_bson_documents, UnnestBehavior, UnnestParameters};
-use crate::mongodb::{Error, QuerySnafu, Result, UnableToGetSchemaSnafu, UnableToGetTablesSnafu};
-use crate::schema_projection::SchemaProjection;
-use crate::util::schema::merge_inferred_and_declared_schemas;
+use crate::projection::project_bson_document;
+use crate::utils::arrow::mongo_docs_to_arrow;
+use crate::utils::schema::infer_arrow_schema_from_documents;
+use crate::utils::unnest::{unnest_bson_documents, UnnestBehavior, UnnestParameters};
+use crate::{Error, QuerySnafu, Result, UnableToGetSchemaSnafu, UnableToGetTablesSnafu};
+use datafusion_table_providers_common::schema_projection::SchemaProjection;
+use datafusion_table_providers_common::util::schema::merge_inferred_and_declared_schemas;
 
 pub struct MongoDBConnection {
     pub client: Arc<Client>,
@@ -58,16 +58,12 @@ impl MongoDBConnection {
         Ok(collections)
     }
 
-    /// Get the schema for a collection, optionally merging with a declared schema.
-    ///
-    /// * If the collection has documents, the inferred schema is merged with
-    ///   the declared schema (declared fields take precedence over inferred ones
-    ///   with the same name; extra declared fields are appended).
-    /// * If the collection is empty and a declared schema is provided, the
-    ///   declared schema is returned directly — no error, no retry needed.
-    /// * If the collection is empty and no declared schema is provided, the
-    ///   `EmptyCollection` error is returned.
-    pub async fn get_schema(
+    pub async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef, Error> {
+        self.get_schema_with_declared_schema(table_reference, None)
+            .await
+    }
+
+    pub async fn get_schema_with_declared_schema(
         &self,
         table_reference: &TableReference,
         declared_schema: Option<SchemaRef>,
@@ -102,13 +98,10 @@ impl MongoDBConnection {
             };
         }
 
-        let inferred = infer_arrow_schema_from_documents(
-            collection_name,
-            &unnested_docs,
-            self.tz.clone().as_deref(),
-        )
-        .boxed()
-        .context(UnableToGetSchemaSnafu)?;
+        let inferred =
+            infer_arrow_schema_from_documents(&unnested_docs, self.tz.clone().as_deref())
+                .boxed()
+                .context(UnableToGetSchemaSnafu)?;
 
         Ok(merge_inferred_and_declared_schemas(
             inferred,
@@ -123,14 +116,30 @@ impl MongoDBConnection {
         filters_doc: &Document,
         limit: Option<i32>,
         sort_doc: &Document,
+    ) -> Result<SendableRecordBatchStream> {
+        self.query_arrow_with_projection(
+            table_reference,
+            projected_schema,
+            filters_doc,
+            limit,
+            sort_doc,
+            None,
+        )
+        .await
+    }
+
+    pub async fn query_arrow_with_projection(
+        &self,
+        table_reference: &Arc<TableReference>,
+        projected_schema: &SchemaRef,
+        filters_doc: &Document,
+        limit: Option<i32>,
+        sort_doc: &Document,
         schema_projection: Option<&SchemaProjection>,
     ) -> Result<SendableRecordBatchStream> {
         let collection_name = table_reference.table();
         let coll = self.get_collection(collection_name);
 
-        // With a JSON-nesting catch-all the projected schema's `data` column is
-        // not a real MongoDB field; we must fetch the full documents so every
-        // non-declared field can be folded into the catch-all.
         let nesting = schema_projection.filter(|p| p.has_catch_all());
         let mongo_projection = if nesting.is_some() {
             Document::new()
@@ -166,12 +175,10 @@ impl MongoDBConnection {
                             }
                         };
 
-                        // Fold non-declared fields into the catch-all before
-                        // Arrow conversion when JSON nesting is configured.
                         let projected_docs = match &projection {
-                            Some(p) => unnested_docs
+                            Some(projection) => unnested_docs
                                 .into_iter()
-                                .map(|d| project_bson_document(d, p))
+                                .map(|doc| project_bson_document(doc, projection))
                                 .collect(),
                             None => unnested_docs,
                         };

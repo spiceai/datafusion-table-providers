@@ -75,7 +75,7 @@ impl Hash for ColumnReference {
 /// # Examples
 ///
 /// ```rust,ignore
-/// use datafusion_table_providers::util::column_reference::ColumnReference;
+/// use datafusion_table_providers_common::util::column_reference::ColumnReference;
 ///
 /// let column_ref = ColumnReference::try_from("foo").expect("valid columns");
 /// assert_eq!(column_ref.iter().collect::<Vec<_>>(), vec!["foo"]);

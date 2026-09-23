@@ -14,8 +14,9 @@ use num_bigint::BigInt;
 use sea_query::{
     Alias, ColumnDef, ColumnType, Expr, GenericBuilder, Index, InsertStatement, IntoIden,
     IntoIndexColumn, Keyword, MysqlQueryBuilder, OnConflict, PostgresQueryBuilder, Query,
-    QueryBuilder, SeaRc, SimpleExpr, SqliteQueryBuilder, Table, TableRef,
+    QueryBuilder, SimpleExpr, SqliteQueryBuilder, Table, TableRef,
 };
+use sea_query::{ExprTrait, IntoTableRef};
 use snafu::Snafu;
 use std::{str::FromStr, sync::Arc};
 use time::{OffsetDateTime, PrimitiveDateTime};
@@ -37,6 +38,7 @@ pub struct CreateTableBuilder {
     schema: SchemaRef,
     table_name: String,
     primary_keys: Vec<String>,
+    temporary: bool,
 }
 
 impl CreateTableBuilder {
@@ -46,6 +48,7 @@ impl CreateTableBuilder {
             schema,
             table_name: table_name.to_string(),
             primary_keys: Vec::new(),
+            temporary: false,
         }
     }
 
@@ -56,6 +59,22 @@ impl CreateTableBuilder {
     {
         self.primary_keys = keys.into_iter().map(Into::into).collect();
         self
+    }
+
+    /// Set whether the table is temporary or not.
+    pub fn temporary(mut self, temporary: bool) -> Self {
+        self.temporary = temporary;
+        self
+    }
+
+    #[must_use]
+    pub fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    #[must_use]
+    pub fn table_name(&self) -> &str {
+        &self.table_name
     }
 
     #[must_use]
@@ -71,24 +90,6 @@ impl CreateTableBuilder {
             self.build(PostgresQueryBuilder, &|f: &Arc<Field>| -> ColumnType {
                 map_data_type_to_column_type_postgres(f.data_type(), &table_name, f.name())
             });
-
-        // Postgres supports composite types (i.e. Structs) but needs to have the type defined first
-        // https://www.postgresql.org/docs/current/rowtypes.html
-        let mut creation_stmts = Vec::new();
-        for field in schema.fields() {
-            let DataType::Struct(struct_inner_fields) = field.data_type() else {
-                continue;
-            };
-            let type_builder = TypeBuilder::new(
-                get_postgres_composite_type_name(&table_name, field.name()),
-                struct_inner_fields,
-            );
-            creation_stmts.push(type_builder.build());
-        }
-
-        creation_stmts.push(main_table_creation);
-        creation_stmts
-    }
 
     #[must_use]
     pub fn build_sqlite(self) -> String {
@@ -116,7 +117,7 @@ impl CreateTableBuilder {
     }
 
     #[must_use]
-    fn build<T: GenericBuilder>(
+    pub fn build<T: GenericBuilder>(
         self,
         query_builder: T,
         map_data_type_to_column_type_fn: &dyn Fn(&Arc<Field>) -> ColumnType,
@@ -143,6 +144,10 @@ impl CreateTableBuilder {
                 index.col(Alias::new(key).into_iden().into_index_column());
             }
             create_stmt.primary_key(&mut index);
+        }
+
+        if self.temporary {
+            create_stmt.temporary();
         }
 
         create_stmt.to_string(query_builder)
@@ -201,21 +206,13 @@ pub fn use_json_insert_for_type<T: QueryBuilder + 'static>(
     data_type: &DataType,
     query_builder: &T,
 ) -> bool {
-    #[cfg(feature = "sqlite")]
-    {
-        use std::any::Any;
-        let any_builder = query_builder as &dyn Any;
-        if any_builder.is::<SqliteQueryBuilder>() {
-            return data_type.is_nested();
-        }
+    use std::any::Any;
+    let any_builder = query_builder as &dyn Any;
+    if any_builder.is::<SqliteQueryBuilder>() {
+        return data_type.is_nested();
     }
-    #[cfg(feature = "mysql")]
-    {
-        use std::any::Any;
-        let any_builder = query_builder as &dyn Any;
-        if any_builder.is::<MysqlQueryBuilder>() {
-            return data_type.is_nested();
-        }
+    if any_builder.is::<MysqlQueryBuilder>() {
+        return data_type.is_nested();
     }
     false
 }
@@ -1008,7 +1005,7 @@ impl<'a> InsertBuilder<'a> {
                             let mut params_vec = Vec::new();
                             for param_value in &param_values {
                                 let mut params_str = String::new();
-                                query_builder.prepare_simple_expr(param_value, &mut params_str);
+                                query_builder.prepare_expr(param_value, &mut params_str);
                                 params_vec.push(params_str);
                             }
 
@@ -1104,24 +1101,17 @@ impl<'a> InsertBuilder<'a> {
     }
 }
 
-fn table_reference_to_sea_table_ref(table: &TableReference) -> TableRef {
+pub fn table_reference_to_sea_table_ref(table: &TableReference) -> TableRef {
     match table {
-        TableReference::Bare { table } => {
-            TableRef::Table(SeaRc::new(Alias::new(table.to_string())))
+        TableReference::Bare { table } => table.to_string().into_table_ref(),
+        TableReference::Partial { schema, table } => {
+            (schema.to_string(), table.to_string()).into_table_ref()
         }
-        TableReference::Partial { schema, table } => TableRef::SchemaTable(
-            SeaRc::new(Alias::new(schema.to_string())),
-            SeaRc::new(Alias::new(table.to_string())),
-        ),
         TableReference::Full {
             catalog,
             schema,
             table,
-        } => TableRef::DatabaseSchemaTable(
-            SeaRc::new(Alias::new(catalog.to_string())),
-            SeaRc::new(Alias::new(schema.to_string())),
-            SeaRc::new(Alias::new(table.to_string())),
-        ),
+        } => (catalog.to_string(), schema.to_string(), table.to_string()).into_table_ref(),
     }
 }
 
@@ -1333,7 +1323,7 @@ fn insert_list_into_row_values(
 }
 
 #[allow(clippy::cast_sign_loss)]
-pub(crate) fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
+pub fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
     match data_type {
         DataType::Int8 => ColumnType::TinyInteger,
         DataType::Int16 => ColumnType::SmallInteger,
@@ -1683,6 +1673,20 @@ mod tests {
             .build_sqlite();
 
         assert_eq!(sql, "CREATE TABLE IF NOT EXISTS \"users\" ( \"id\" integer NOT NULL, \"id2\" integer NOT NULL, \"name\" text NOT NULL, \"age\" integer, PRIMARY KEY (\"id\", \"id2\") )");
+    }
+
+    #[test]
+    fn test_temporary_table_creation() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]);
+        let sql = CreateTableBuilder::new(SchemaRef::new(schema), "users")
+            .primary_keys(vec!["id"])
+            .temporary(true)
+            .build_sqlite();
+
+        assert_eq!(sql, "CREATE TEMPORARY TABLE IF NOT EXISTS \"users\" ( \"id\" integer NOT NULL, \"name\" text NOT NULL, PRIMARY KEY (\"id\") )");
     }
 
     #[test]

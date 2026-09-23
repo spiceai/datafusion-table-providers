@@ -1,0 +1,41 @@
+[package]
+name = "datafusion-table-providers-sqlite"
+version = { workspace = true }
+readme = { workspace = true }
+edition = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+description = "DataFusion sqlite table provider"
+
+[dependencies]
+arrow = { workspace = true }
+arrow-schema = { workspace = true }
+async-trait = "0.1"
+chrono = "0.4.44"
+datafusion = { workspace = true, default-features = false, features = ["sql"] }
+datafusion-federation = { workspace = true, features = ["sql"], optional = true }
+datafusion-table-providers-common = { workspace = true }
+fundu = "2.0"
+futures = "0.3"
+rusqlite = { workspace = true }
+sea-query = { workspace = true }
+secrecy = { workspace = true }
+snafu = { workspace = true }
+tokio = { workspace = true }
+tokio-rusqlite = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+rstest = "0.26.1"
+
+[features]
+default = ["federation", "bundled"]
+federation = ["dep:datafusion-federation", "datafusion-table-providers-common/federation"]
+bundled = ["rusqlite/bundled"]
+bundled-decimal = ["rusqlite/bundled-decimal"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

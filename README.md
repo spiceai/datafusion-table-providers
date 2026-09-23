@@ -18,17 +18,28 @@ let ctx = SessionContext::with_state(state);
 // queries will now automatically be federated
 ```
 
+## Crate layout
+
+Prefer a single-provider leaf crate when you only need one backend — for example `datafusion-table-providers-postgres` or `datafusion-table-providers-duckdb`. Leaf crates do not use the facade feature flags.
+
+- Leaf crates enable `federation` by default (opt out with `default-features = false`). SQLite also defaults to the `bundled` rusqlite feature.
+- The existing `datafusion-table-providers` facade keeps the same module paths and provider feature names (`duckdb`, `postgres`, `sqlite`, etc.). Enabling a provider feature pulls in that leaf crate with its defaults (including federation). There is no separate `federation` / `*-federation` feature on the facade.
+- ClickHouse pool connections are exposed as `ClickHouseConnection` (wrapping the ClickHouse `Client`) under `sql::db_connection_pool::dbconnection::clickhouseconn`.
+
+Existing examples continue to use the facade crate and its feature flags.
+
 ## Table Providers
 
-- PostgreSQL
-- MySQL
-- SQLite
-- ClickHouse
-- DuckDB
-- Flight SQL
-- MongoDB
-- ADBC
-- ODBC
+- PostgreSQL (`datafusion-table-providers-postgres`)
+- MySQL (`datafusion-table-providers-mysql`)
+- SQLite (`datafusion-table-providers-sqlite`)
+- ClickHouse (`datafusion-table-providers-clickhouse`)
+- DuckDB (`datafusion-table-providers-duckdb`)
+- Flight SQL (`datafusion-table-providers-flightsql`)
+- MongoDB (`datafusion-table-providers-mongodb`)
+- ADBC (`datafusion-table-providers-adbc`)
+- ODBC (`datafusion-table-providers-odbc`)
+- Oracle (`datafusion-table-providers-oracle`)
 
 ## Development
 
@@ -177,6 +188,41 @@ EOF
 ```bash
 # Run from repo folder
 cargo run -p datafusion-table-providers --example mysql --features mysql
+```
+
+### Oracle
+
+The Oracle provider is driven by [`rust-oracle`](https://crates.io/crates/oracle) (ODPI-C), so it requires the Oracle Instant Client libraries at runtime. They are `dlopen`'d on first connection — compiling does not need them, running does.
+
+- **Linux (Debian/Ubuntu):**
+  ```bash
+  apt-get install libaio1 wget unzip
+  wget https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linuxx64.zip
+  unzip instantclient-basiclite-linuxx64.zip -d /opt/oracle
+  export LD_LIBRARY_PATH=/opt/oracle/instantclient_XX_X:$LD_LIBRARY_PATH
+  ```
+
+- **macOS:**
+  ```bash
+  brew install instantclient-basic
+  ```
+
+To run the Oracle integration tests, start an Oracle Free server:
+
+```bash
+docker run --name oracle-free \
+    -e ORACLE_PASSWORD=OraclePassword123 \
+    -p 1521:1521 \
+    -d gvenzl/oracle-free:latest
+
+# Wait for the Oracle server to start and healthcheck to pass
+echo "Waiting for Oracle to start (this may take 1-2 minutes)..."
+until docker exec oracle-free /usr/local/bin/checkHealth.sh >/dev/null 2>&1; do
+    sleep 5
+done
+echo "Oracle is ready!"
+
+cargo test -p datafusion-table-providers --test integration --no-default-features --features oracle -- oracle
 ```
 
 ### MongoDB
