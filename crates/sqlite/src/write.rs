@@ -6,13 +6,13 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::{
     catalog::Session,
+    common::TableReference,
     common::{not_impl_err, Constraints},
     datasource::{TableProvider, TableType},
     error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{dml::InsertOp, Expr},
     physical_plan::{metrics::MetricsSet, DisplayAs, DisplayFormatType, ExecutionPlan},
-    common::TableReference,
 };
 use futures::StreamExt;
 use snafu::prelude::*;

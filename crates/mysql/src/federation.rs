@@ -1,5 +1,3 @@
-use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{get_schema, Error as DbError};
-use datafusion_table_providers_common::sql::sql_provider_datafusion::{get_stream, to_execution_error};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::physical_expr::PhysicalExpr;
@@ -9,6 +7,12 @@ use datafusion_federation::sql::{
     AstAnalyzer, RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
 };
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{
+    get_schema, Error as DbError,
+};
+use datafusion_table_providers_common::sql::sql_provider_datafusion::{
+    get_stream, to_execution_error,
+};
 use futures::TryStreamExt;
 use snafu::ResultExt;
 use std::sync::Arc;
@@ -16,11 +20,11 @@ use std::sync::Arc;
 use super::mysql_window::MySQLWindowVisitor;
 use super::sql_table::MySQLTable;
 use datafusion::{
+    common::TableReference,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
     execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter,
-    common::TableReference,
 };
 
 impl MySQLTable {

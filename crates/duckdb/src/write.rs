@@ -1,9 +1,26 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fmt, sync::Arc};
 
-use crate::DuckDB;
 use crate::conn::DuckDbConnection;
 use crate::pool::DuckDbConnectionPool;
+use crate::DuckDB;
+use arrow::array::RecordBatchReader;
+use arrow::ffi_stream::FFI_ArrowArrayStream;
+use arrow::{array::RecordBatch, datatypes::SchemaRef};
+use arrow_schema::ArrowError;
+use async_trait::async_trait;
+use datafusion::catalog::Session;
+use datafusion::common::TableReference;
+use datafusion::common::{not_impl_err, Constraints, SchemaExt};
+use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::logical_expr::dml::InsertOp;
+use datafusion::{
+    datasource::{TableProvider, TableType},
+    error::DataFusionError,
+    execution::{SendableRecordBatchStream, TaskContext},
+    logical_expr::Expr,
+    physical_plan::{metrics::MetricsSet, DisplayAs, DisplayFormatType, ExecutionPlan},
+};
 use datafusion_table_providers_common::sql::sql_provider_datafusion::expr;
 use datafusion_table_providers_common::util::{
     constraints,
@@ -14,23 +31,6 @@ use datafusion_table_providers_common::util::{
     },
     on_conflict::OnConflict,
     retriable_error::{check_and_mark_retriable_error, to_retriable_data_write_error},
-};
-use arrow::array::RecordBatchReader;
-use arrow::ffi_stream::FFI_ArrowArrayStream;
-use arrow::{array::RecordBatch, datatypes::SchemaRef};
-use arrow_schema::ArrowError;
-use async_trait::async_trait;
-use datafusion::catalog::Session;
-use datafusion::common::{not_impl_err, Constraints, SchemaExt};
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
-use datafusion::logical_expr::dml::InsertOp;
-use datafusion::common::TableReference;
-use datafusion::{
-    datasource::{TableProvider, TableType},
-    error::DataFusionError,
-    execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::Expr,
-    physical_plan::{metrics::MetricsSet, DisplayAs, DisplayFormatType, ExecutionPlan},
 };
 use duckdb::Transaction;
 use futures::StreamExt;
@@ -1070,7 +1070,9 @@ mod test {
 
     use super::*;
     use crate::creator::tests::{get_basic_table_definition, get_mem_duckdb, init_tracing};
-    use datafusion_table_providers_common::util::{column_reference::ColumnReference, indexes::IndexType};
+    use datafusion_table_providers_common::util::{
+        column_reference::ColumnReference, indexes::IndexType,
+    };
 
     #[tokio::test]
     async fn test_write_to_table_overwrite_without_previous_table() {

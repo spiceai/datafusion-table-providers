@@ -19,11 +19,11 @@ use std::sync::Arc;
 
 use super::sql_table::OracleTable;
 use datafusion::{
+    common::TableReference,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
     execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter,
-    common::TableReference,
 };
 
 impl OracleTable {

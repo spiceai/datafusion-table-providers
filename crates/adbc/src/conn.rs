@@ -20,9 +20,9 @@ use std::cell::RefCell;
 use adbc_core::options::ObjectDepth;
 use arrow::array::{AsArray, RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::SchemaRef;
+use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::common::TableReference;
 use r2d2_adbc::AdbcConnectionManager;
 use snafu::{prelude::*, ResultExt};
 use std::marker::Send;
@@ -30,11 +30,11 @@ use std::marker::Sync;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::Sender;
 
-use datafusion_table_providers_common::sql::db_connection_pool::runtime::run_sync_with_tokio;
 use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{
     DbConnection, Error as DbConnectionError, Result, SyncDbConnection, UnableToGetSchemaSnafu,
     UnableToGetTablesSnafu, UnableToQueryArrowSnafu,
 };
+use datafusion_table_providers_common::sql::db_connection_pool::runtime::run_sync_with_tokio;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -379,10 +379,7 @@ where
                     // a row-free form of the query to get the schema.
                     Err(_) => {
                         stmt.set_sql_query(schema_probe_query(sql))?;
-                        let result = stmt
-                            .execute()
-                            .boxed()
-                            .context(UnableToQueryArrowSnafu)?;
+                        let result = stmt.execute().boxed().context(UnableToQueryArrowSnafu)?;
                         schema = result.schema();
                     }
                 }
@@ -443,10 +440,7 @@ where
                 // operation that has already ended.
                 let outcome =
                     (|| -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-                        let results = stmt
-                            .execute()
-                            .boxed()
-                            .context(UnableToQueryArrowSnafu)?;
+                        let results = stmt.execute().boxed().context(UnableToQueryArrowSnafu)?;
                         if matches!(
                             *lock_cancellation(&task_cancellation),
                             QueryCancellation::Abandoned
@@ -1058,11 +1052,10 @@ mod tests {
             fail_fast: Arc::clone(fail_fast),
             ignore_cancel: Arc::clone(ignore_cancel),
         };
-        let pool =
-            crate::pool::AdbcConnectionPoolBuilder::new(database)
-                .with_max_size(Some(1))
-                .build()
-                .expect("the pool should build");
+        let pool = crate::pool::AdbcConnectionPoolBuilder::new(database)
+            .with_max_size(Some(1))
+            .build()
+            .expect("the pool should build");
         Arc::new(pool)
     }
 
@@ -1083,7 +1076,12 @@ mod tests {
             .connect()
             .await
             .expect("a connection should be available");
-        let stream = datafusion_table_providers_common::sql::db_connection_pool::dbconnection::query_arrow(conn, "SELECT 1".to_string(), None)
+        let stream =
+            datafusion_table_providers_common::sql::db_connection_pool::dbconnection::query_arrow(
+                conn,
+                "SELECT 1".to_string(),
+                None,
+            )
             .await
             .expect("the query should start");
 
@@ -1163,7 +1161,12 @@ mod tests {
             .connect()
             .await
             .expect("a connection should be available");
-        let stream = datafusion_table_providers_common::sql::db_connection_pool::dbconnection::query_arrow(conn, "SELECT 1".to_string(), None)
+        let stream =
+            datafusion_table_providers_common::sql::db_connection_pool::dbconnection::query_arrow(
+                conn,
+                "SELECT 1".to_string(),
+                None,
+            )
             .await
             .expect("the query should start");
 
@@ -1206,7 +1209,12 @@ mod tests {
             .connect()
             .await
             .expect("a connection should be available");
-        let mut stream = datafusion_table_providers_common::sql::db_connection_pool::dbconnection::query_arrow(conn, "SELECT 1".to_string(), None)
+        let mut stream =
+            datafusion_table_providers_common::sql::db_connection_pool::dbconnection::query_arrow(
+                conn,
+                "SELECT 1".to_string(),
+                None,
+            )
             .await
             .expect("the stream should be created");
 

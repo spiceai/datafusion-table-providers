@@ -18,11 +18,11 @@ use std::sync::Arc;
 
 use super::sql_table::AdbcDBTable;
 use datafusion::{
+    common::TableReference,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
     execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter,
-    common::TableReference,
 };
 
 impl<T, P> AdbcDBTable<T, P> {

@@ -3,12 +3,12 @@ use std::{borrow::Cow, sync::Arc};
 use arrow::datatypes::{DataType, Schema, TimeUnit};
 use bigdecimal::{num_bigint::BigInt, BigDecimal};
 use datafusion::{
+    common::TableReference,
     logical_expr::{Cast, Expr, Operator},
     scalar::ScalarValue,
     sql::unparser::dialect::{
         DefaultDialect, Dialect, DuckDBDialect, MySqlDialect, PostgreSqlDialect, SqliteDialect,
     },
-    common::TableReference,
 };
 
 pub const SECONDS_IN_DAY: i32 = 86_400;

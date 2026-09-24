@@ -19,8 +19,6 @@ use datafusion_table_providers_common::sql::db_connection_pool::{
     DbConnectionPool,
 };
 
-#[cfg(feature = "federation")]
-use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
 use adbc_core::{Connection, Database};
 use arrow::array::RecordBatch;
 #[cfg(feature = "federation")]
@@ -28,11 +26,13 @@ use datafusion::optimizer::OptimizerRule;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::{
     catalog::Session,
+    common::TableReference,
     datasource::{sink::DataSinkExec, TableProvider},
     logical_expr::dml::InsertOp,
     physical_plan::ExecutionPlan,
-    common::TableReference,
 };
+#[cfg(feature = "federation")]
+use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
 use r2d2_adbc::AdbcConnectionManager;
 use snafu::prelude::*;
 use std::sync::Arc;

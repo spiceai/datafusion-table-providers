@@ -13,29 +13,33 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::write::MySQLTableWriter;
 use crate::arrow_sql_gen::MysqlZeroDateBehavior;
-use datafusion_table_providers_common::sql::arrow_sql_gen::statement::{CreateTableBuilder, IndexBuilder, InsertBuilder};
 use crate::conn::MySQLConnection;
-use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::DbConnection;
 use crate::pool::MySQLConnectionPool;
-use datafusion_table_providers_common::sql::db_connection_pool::{self, DbConnectionPool};
-use datafusion_table_providers_common::sql::sql_provider_datafusion::{self, expr, expr::Engine, SqlTable};
-use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
-use datafusion_table_providers_common::util::{
-    self, column_reference::ColumnReference, constraints::get_primary_keys_from_constraints,
-    indexes::IndexType, on_conflict::OnConflict, secrets::to_secret_map, to_datafusion_error,
-};
-use datafusion_table_providers_common::util::{column_reference, constraints, on_conflict};
+use crate::write::MySQLTableWriter;
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::sql::unparser::dialect::MySqlDialect;
 use datafusion::{
-    catalog::TableProviderFactory, common::Constraints, datasource::TableProvider,
-    error::DataFusionError, logical_expr::CreateExternalTable, common::TableReference,
+    catalog::TableProviderFactory, common::Constraints, common::TableReference,
+    datasource::TableProvider, error::DataFusionError, logical_expr::CreateExternalTable,
 };
+use datafusion_table_providers_common::sql::arrow_sql_gen::statement::{
+    CreateTableBuilder, IndexBuilder, InsertBuilder,
+};
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::DbConnection;
+use datafusion_table_providers_common::sql::db_connection_pool::{self, DbConnectionPool};
+use datafusion_table_providers_common::sql::sql_provider_datafusion::{
+    self, expr, expr::Engine, SqlTable,
+};
+use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
+use datafusion_table_providers_common::util::{
+    self, column_reference::ColumnReference, constraints::get_primary_keys_from_constraints,
+    indexes::IndexType, on_conflict::OnConflict, secrets::to_secret_map, to_datafusion_error,
+};
+use datafusion_table_providers_common::util::{column_reference, constraints, on_conflict};
 use mysql_async::prelude::{Queryable, ToValue};
 use mysql_async::{Metrics, TxOpts};
 use sea_query::{Alias, DeleteStatement, MysqlQueryBuilder};
@@ -49,11 +53,11 @@ pub type DynMySQLConnectionPool =
 
 pub type DynMySQLConnection = dyn DbConnection<mysql_async::Conn, &'static (dyn ToValue + Sync)>;
 
+pub mod arrow_sql_gen;
+pub mod conn;
 #[cfg(feature = "federation")]
 pub mod federation;
 pub(crate) mod mysql_window;
-pub mod arrow_sql_gen;
-pub mod conn;
 pub mod pool;
 pub mod sql_table;
 pub mod write;

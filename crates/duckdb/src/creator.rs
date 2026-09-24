@@ -1,7 +1,5 @@
-use datafusion_table_providers_common::sql::arrow_sql_gen::statement::IndexBuilder;
 use crate::conn::DuckDbConnection;
 use crate::pool::DuckDbConnectionPool;
-use datafusion_table_providers_common::util::on_conflict::OnConflict;
 use arrow::{
     array::{RecordBatch, RecordBatchIterator, RecordBatchReader},
     datatypes::SchemaRef,
@@ -9,6 +7,8 @@ use arrow::{
 };
 use datafusion::common::Constraints;
 use datafusion::common::TableReference;
+use datafusion_table_providers_common::sql::arrow_sql_gen::statement::IndexBuilder;
+use datafusion_table_providers_common::util::on_conflict::OnConflict;
 use duckdb::Transaction;
 use itertools::Itertools;
 use snafu::prelude::*;
@@ -369,7 +369,10 @@ impl TableManager {
         pool: Arc<DuckDbConnectionPool>,
         tx: &Transaction<'_>,
     ) -> super::Result<()> {
-        let mut db_conn = pool.connect_sync().boxed().context(super::DbConnectionPoolSnafu)?;
+        let mut db_conn = pool
+            .connect_sync()
+            .boxed()
+            .context(super::DbConnectionPoolSnafu)?;
         let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)?;
 
         // create the table with the supplied table name, or a generated internal name
@@ -908,8 +911,8 @@ impl ViewCreator {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::make_initial_table;
     use crate::conn::DuckDbConnection;
+    use crate::make_initial_table;
     use crate::pool::DuckDbConnectionPool;
     use datafusion::{
         arrow::array::RecordBatch,

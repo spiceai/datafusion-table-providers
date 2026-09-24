@@ -1,12 +1,14 @@
 use std::{collections::HashMap, path::Path, str::FromStr, sync::Arc};
 
-use crate::conn::{variant_from_version, PostgresConnection, PostgresPooledConnection, PostgresVariant};
+use crate::conn::{
+    variant_from_version, PostgresConnection, PostgresPooledConnection, PostgresVariant,
+};
 use crate::UnableToCreatePostgresConnectionPoolSnafu;
-use datafusion_table_providers_common::util::{self, ns_lookup::verify_ns_lookup_and_tcp_connect};
-use datafusion_table_providers_common::UnsupportedTypeAction;
 use async_trait::async_trait;
 use bb8::ErrorSink;
 use bb8_postgres::tokio_postgres::{config::Host, types::ToSql, Config};
+use datafusion_table_providers_common::util::{self, ns_lookup::verify_ns_lookup_and_tcp_connect};
+use datafusion_table_providers_common::UnsupportedTypeAction;
 use native_tls::{Certificate, TlsConnector};
 use postgres_native_tls::MakeTlsConnector;
 use secrecy::{ExposeSecret, SecretBox, SecretString};
@@ -17,7 +19,7 @@ use tokio_postgres;
 use datafusion_table_providers_common::sql::db_connection_pool::{
     dbconnection::{AsyncDbConnection, DbConnection},
     runtime::run_async_with_tokio,
-    DbConnectionPool, PasswordProvider, StaticPasswordProvider, JoinPushDown,
+    DbConnectionPool, JoinPushDown, PasswordProvider, StaticPasswordProvider,
 };
 
 #[derive(Debug, Snafu)]

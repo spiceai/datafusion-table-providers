@@ -229,7 +229,9 @@ mod tests {
     /// `SQLExecutor::can_execute_plan` (see the `FIXME(DF55)` above); it accepts a
     /// federatable plan with `Ok`, and signals a non-federatable one with `Err`.
     fn can_execute_plan(table: &SqlTable<(), &'static dyn ToString>, plan: &LogicalPlan) -> bool {
-        let mut optimizer = table.logical_optimizer().expect("logical_optimizer is always Some");
+        let mut optimizer = table
+            .logical_optimizer()
+            .expect("logical_optimizer is always Some");
         optimizer(plan.clone()).is_ok()
     }
 

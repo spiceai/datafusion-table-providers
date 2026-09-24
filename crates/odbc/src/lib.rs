@@ -18,13 +18,13 @@ pub mod conn;
 pub mod pool;
 
 use crate::conn::ODBCDbConnectionPool;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::error::DataFusionError;
+use datafusion::{common::TableReference, datasource::TableProvider};
 use datafusion_table_providers_common::sql::{
     db_connection_pool as db_connection_pool_datafusion,
     sql_provider_datafusion::{expr, SqlTable},
 };
-use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::error::DataFusionError;
-use datafusion::{datasource::TableProvider, common::TableReference};
 use snafu::prelude::*;
 use std::sync::Arc;
 

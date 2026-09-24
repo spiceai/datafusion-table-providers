@@ -6,13 +6,13 @@ use arrow::array::RecordBatch;
 use arrow_schema::{DataType, Field};
 use async_stream::stream;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::sqlparser::ast::TableFactor;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::{dialect::DuckDbDialect, tokenizer::Tokenizer};
-use datafusion::common::TableReference;
 use duckdb::vtab::to_duckdb_type_id;
 use duckdb::ToSql;
 use duckdb::{Connection, DuckdbConnectionManager};
@@ -651,17 +651,10 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
             .prepare(sql)
             .boxed()
             .context(UnableToGetSchemasSnafu)?;
-        let mut rows = stmt
-            .query([])
-            .boxed()
-            .context(UnableToGetSchemasSnafu)?;
+        let mut rows = stmt.query([]).boxed().context(UnableToGetSchemasSnafu)?;
         let mut schemas = vec![];
 
-        while let Some(row) = rows
-            .next()
-            .boxed()
-            .context(UnableToGetSchemasSnafu)?
-        {
+        while let Some(row) = rows.next().boxed().context(UnableToGetSchemasSnafu)? {
             schemas.push(row.get(0).boxed().context(UnableToGetSchemasSnafu)?);
         }
 

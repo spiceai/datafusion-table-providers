@@ -4,6 +4,7 @@ use arrow::datatypes::Schema;
 
 use async_trait::async_trait;
 use datafusion::{
+    common::TableReference,
     error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::Expr,
@@ -11,7 +12,6 @@ use datafusion::{
         stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan,
         PlanProperties,
     },
-    common::TableReference,
 };
 
 use super::count_exec::{count_schema, count_to_record_batch};
@@ -180,7 +180,9 @@ impl ExecutionPlan for DeletionExec {
         &self,
         _f: &mut dyn FnMut(
             &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
-        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
     ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
         Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
@@ -267,7 +269,9 @@ impl ExecutionPlan for UpdateExec {
         &self,
         _f: &mut dyn FnMut(
             &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
-        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
     ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
         Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }

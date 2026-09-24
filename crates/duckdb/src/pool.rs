@@ -4,10 +4,12 @@ use once_cell::sync::OnceCell;
 use snafu::{prelude::*, ResultExt};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
-use crate::conn::{file_identity, DuckDBAttachments, DuckDBParameter, FileIdentity, DuckDbConnection};
+use crate::conn::{
+    file_identity, DuckDBAttachments, DuckDBParameter, DuckDbConnection, FileIdentity,
+};
 use datafusion_table_providers_common::sql::db_connection_pool::{
-    runtime::run_async_with_tokio,
     dbconnection::{DbConnection, SyncDbConnection},
+    runtime::run_async_with_tokio,
     DbConnectionPool, JoinPushDown, Mode,
 };
 use datafusion_table_providers_common::UnsupportedTypeAction;
@@ -685,11 +687,7 @@ fn extract_db_name(file_path: Arc<str>) -> Result<String> {
 
     let db_name = match path.file_stem().and_then(|name| name.to_str()) {
         Some(name) => name,
-        None => {
-            return Err(Error::UnableToExtractDatabaseNameFromPath {
-                path: file_path,
-            })
-        }
+        None => return Err(Error::UnableToExtractDatabaseNameFromPath { path: file_path }),
     };
 
     Ok(db_name.to_string())

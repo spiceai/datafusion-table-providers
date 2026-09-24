@@ -1,18 +1,6 @@
 use crate::arrow_sql_gen::statement_ext::CreateTableBuilderPostgresExt;
-use datafusion_table_providers_common::sql::arrow_sql_gen::statement::{
-    CreateTableBuilder, Error as SqlGenError, IndexBuilder, InsertBuilder,
-};
 use crate::conn::{PostgresConnection, PostgresPooledConnection};
 use crate::pool::{self as postgrespool, PostgresConnectionPool};
-use datafusion_table_providers_common::sql::db_connection_pool::{
-    self,
-    dbconnection::DbConnection,
-    DbConnectionPool,
-};
-use datafusion_table_providers_common::sql::sql_provider_datafusion::{expr, expr::Engine, SqlTable};
-use datafusion_table_providers_common::util::schema::SchemaValidator;
-use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
-use datafusion_table_providers_common::UnsupportedTypeAction;
 use arrow::{
     array::RecordBatch,
     datatypes::{Schema, SchemaRef},
@@ -24,11 +12,23 @@ use datafusion::sql::unparser::dialect::PostgreSqlDialect;
 use datafusion::{
     catalog::TableProviderFactory,
     common::Constraints,
+    common::TableReference,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::CreateExternalTable,
-    common::TableReference,
 };
+use datafusion_table_providers_common::sql::arrow_sql_gen::statement::{
+    CreateTableBuilder, Error as SqlGenError, IndexBuilder, InsertBuilder,
+};
+use datafusion_table_providers_common::sql::db_connection_pool::{
+    self, dbconnection::DbConnection, DbConnectionPool,
+};
+use datafusion_table_providers_common::sql::sql_provider_datafusion::{
+    expr, expr::Engine, SqlTable,
+};
+use datafusion_table_providers_common::util::schema::SchemaValidator;
+use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
+use datafusion_table_providers_common::UnsupportedTypeAction;
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 

@@ -29,6 +29,7 @@ use std::{fmt, sync::Arc};
 
 use datafusion::{
     arrow::datatypes::SchemaRef,
+    common::TableReference,
     config::ConfigOptions,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
@@ -45,7 +46,6 @@ use datafusion::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         SendableRecordBatchStream,
     },
-    common::TableReference,
 };
 
 pub mod expr;
@@ -704,7 +704,8 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
         &self,
         _f: &mut dyn FnMut(
             &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
-        ) -> DataFusionResult<datafusion::common::tree_node::TreeNodeRecursion>,
+        )
+            -> DataFusionResult<datafusion::common::tree_node::TreeNodeRecursion>,
     ) -> DataFusionResult<datafusion::common::tree_node::TreeNodeRecursion> {
         Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
@@ -926,8 +927,8 @@ pub fn to_execution_error(
 mod tests {
     use std::{error::Error, sync::Arc};
 
-    use datafusion::execution::context::SessionContext;
     use datafusion::common::TableReference;
+    use datafusion::execution::context::SessionContext;
     use tracing::{level_filters::LevelFilter, subscriber::DefaultGuard, Dispatch};
 
     use crate::sql::sql_provider_datafusion::SqlTable;
@@ -948,8 +949,8 @@ mod tests {
         use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
         use datafusion::sql::unparser::dialect::{Dialect, SqliteDialect};
         use datafusion::{
-            logical_expr::{col, lit},
             common::TableReference,
+            logical_expr::{col, lit},
         };
 
         use crate::sql::db_connection_pool::{
@@ -1103,6 +1104,7 @@ mod tests {
         use async_trait::async_trait;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
         use datafusion::common::DFSchema;
+        use datafusion::common::TableReference;
         use datafusion::datasource::TableProvider;
         use datafusion::logical_expr::expr::ScalarFunction;
         use datafusion::logical_expr::{
@@ -1110,7 +1112,6 @@ mod tests {
             Volatility,
         };
         use datafusion::sql::unparser::dialect::SqliteDialect;
-        use datafusion::common::TableReference;
 
         use crate::sql::db_connection_pool::{
             dbconnection::DbConnection, DbConnectionPool, JoinPushDown,
@@ -1297,6 +1298,7 @@ mod tests {
         use arrow::compute::SortOptions;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
         use datafusion::common::config::ConfigOptions;
+        use datafusion::common::TableReference;
         use datafusion::logical_expr::Operator;
         use datafusion::physical_expr::expressions::{binary, col, lit, Column};
         use datafusion::physical_expr::PhysicalSortExpr;
@@ -1306,7 +1308,6 @@ mod tests {
         use datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult;
         use datafusion::physical_plan::ExecutionPlan;
         use datafusion::sql::unparser::dialect::DefaultDialect;
-        use datafusion::common::TableReference;
         use std::sync::Arc;
 
         use crate::sql::db_connection_pool::{

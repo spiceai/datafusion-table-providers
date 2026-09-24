@@ -1,15 +1,15 @@
 use std::{any::Any, sync::Arc};
 
 use crate::arrow_sql_gen::map_column_to_data_type;
-use crate::arrow_sql_gen::MysqlZeroDateBehavior;
 use crate::arrow_sql_gen::rows_to_arrow;
+use crate::arrow_sql_gen::MysqlZeroDateBehavior;
 use async_stream::stream;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
+use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::unparser::dialect::{Dialect, MySqlDialect};
-use datafusion::common::TableReference;
 use futures::lock::Mutex;
 use futures::{stream, StreamExt};
 use mysql_async::consts::ColumnType;

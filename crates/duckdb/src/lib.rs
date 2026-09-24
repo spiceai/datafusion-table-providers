@@ -1,4 +1,24 @@
+use crate::conn::{
+    flatten_table_function_name, is_table_function, DuckDBParameter, DuckDbConnection,
+};
+use crate::pool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder};
 use crate::write_settings::DuckDBWriteSettings;
+use arrow::datatypes::SchemaRef;
+use async_trait::async_trait;
+use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect};
+use datafusion::{
+    catalog::{Session, TableProviderFactory},
+    common::Constraints,
+    common::TableReference,
+    datasource::TableProvider,
+    error::{DataFusionError, Result as DataFusionResult},
+    logical_expr::CreateExternalTable,
+};
+use datafusion_table_providers_common::sql::db_connection_pool::{
+    self,
+    dbconnection::{get_schema, DbConnection},
+    DbConnectionPool, DbInstanceKey, Mode,
+};
 use datafusion_table_providers_common::sql::sql_provider_datafusion;
 use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
 use datafusion_table_providers_common::util::{
@@ -8,27 +28,7 @@ use datafusion_table_providers_common::util::{
     indexes::IndexType,
     on_conflict::{self, OnConflict},
 };
-use crate::conn::{
-    flatten_table_function_name, is_table_function, DuckDBParameter, DuckDbConnection,
-};
-use crate::pool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder};
-use datafusion_table_providers_common::sql::db_connection_pool::{
-    self,
-    dbconnection::{get_schema, DbConnection},
-    DbConnectionPool, DbInstanceKey, Mode,
-};
 use datafusion_table_providers_common::UnsupportedTypeAction;
-use arrow::datatypes::SchemaRef;
-use async_trait::async_trait;
-use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect};
-use datafusion::{
-    catalog::{Session, TableProviderFactory},
-    common::Constraints,
-    datasource::TableProvider,
-    error::{DataFusionError, Result as DataFusionResult},
-    logical_expr::CreateExternalTable,
-    common::TableReference,
-};
 use duckdb::{AccessMode, DuckdbConnectionManager};
 use itertools::Itertools;
 use snafu::prelude::*;
@@ -45,11 +45,11 @@ use self::sql_table::DuckDBTable;
 #[cfg(feature = "federation")]
 mod federation;
 
+pub mod conn;
 mod creator;
 mod file_swap;
-mod settings;
-pub mod conn;
 pub mod pool;
+mod settings;
 pub mod sql_table;
 pub mod write;
 pub mod write_settings;
@@ -853,10 +853,10 @@ pub(crate) mod tests {
 
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::TableReference;
     use datafusion::common::{Constraints, ToDFSchema};
     use datafusion::logical_expr::CreateExternalTable;
     use datafusion::prelude::SessionContext;
-    use datafusion::common::TableReference;
     use std::collections::HashMap;
     use std::sync::Arc;
 

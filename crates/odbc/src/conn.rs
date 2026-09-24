@@ -18,11 +18,6 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion_table_providers_common::sql::db_connection_pool::{
-    dbconnection::{self, AsyncDbConnection, DbConnection, GenericError},
-    runtime::run_async_with_tokio,
-    DbConnectionPool,
-};
 use arrow_odbc::arrow_schema_from;
 use arrow_odbc::odbc_api::{
     self, handles::SqlResult, handles::Statement, handles::StatementImpl,
@@ -35,10 +30,15 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::common::TableReference;
+use datafusion_table_providers_common::sql::db_connection_pool::{
+    dbconnection::{self, AsyncDbConnection, DbConnection, GenericError},
+    runtime::run_async_with_tokio,
+    DbConnectionPool,
+};
 use dyn_clone::DynClone;
 use futures::lock::Mutex;
 use secrecy::{ExposeSecret, SecretBox, SecretString};

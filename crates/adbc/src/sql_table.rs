@@ -10,10 +10,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use datafusion_table_providers_common::sql::db_connection_pool::DbConnectionPool;
-use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
 #[cfg(feature = "federation")]
 use datafusion::optimizer::OptimizerRule;
+use datafusion_table_providers_common::sql::db_connection_pool::DbConnectionPool;
+use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
 
 use async_trait::async_trait;
 use futures::TryStreamExt;
@@ -189,7 +189,9 @@ impl<T: 'static, P: 'static> ExecutionPlan for AdbcSqlExec<T, P> {
         &self,
         f: &mut dyn FnMut(
             &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
-        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
     ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
         self.base_exec.apply_expressions(f)
     }

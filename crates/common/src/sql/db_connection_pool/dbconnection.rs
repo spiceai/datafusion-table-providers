@@ -1,7 +1,7 @@
 use std::{any::Any, sync::Arc};
 
 use datafusion::{
-    arrow::datatypes::SchemaRef, execution::SendableRecordBatchStream, common::TableReference,
+    arrow::datatypes::SchemaRef, common::TableReference, execution::SendableRecordBatchStream,
 };
 use snafu::prelude::*;
 

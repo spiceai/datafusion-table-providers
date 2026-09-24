@@ -1,19 +1,6 @@
-use datafusion_table_providers_common::sql::arrow_sql_gen::statement::{CreateTableBuilder, IndexBuilder, InsertBuilder};
-use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{self, get_schema, AsyncDbConnection};
-use crate::pool::SqliteConnectionPoolFactory;
-use datafusion_table_providers_common::sql::db_connection_pool::DbInstanceKey;
-use datafusion_table_providers_common::sql::db_connection_pool::{
-    self,
-    dbconnection::DbConnection,
-    DbConnectionPool, Mode,
-};
 use crate::conn::SqliteConnection;
 use crate::pool::SqliteConnectionPool;
-use datafusion_table_providers_common::sql::sql_provider_datafusion;
-use datafusion_table_providers_common::sql::sql_provider_datafusion::expr;
-use datafusion_table_providers_common::util::schema::SchemaValidator;
-use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
-use datafusion_table_providers_common::UnsupportedTypeAction;
+use crate::pool::SqliteConnectionPoolFactory;
 use arrow::array::{Int64Array, StringArray};
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
@@ -21,11 +8,26 @@ use datafusion::catalog::Session;
 use datafusion::{
     catalog::TableProviderFactory,
     common::Constraints,
+    common::TableReference,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::CreateExternalTable,
-    common::TableReference,
 };
+use datafusion_table_providers_common::sql::arrow_sql_gen::statement::{
+    CreateTableBuilder, IndexBuilder, InsertBuilder,
+};
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{
+    self, get_schema, AsyncDbConnection,
+};
+use datafusion_table_providers_common::sql::db_connection_pool::DbInstanceKey;
+use datafusion_table_providers_common::sql::db_connection_pool::{
+    self, dbconnection::DbConnection, DbConnectionPool, Mode,
+};
+use datafusion_table_providers_common::sql::sql_provider_datafusion;
+use datafusion_table_providers_common::sql::sql_provider_datafusion::expr;
+use datafusion_table_providers_common::util::schema::SchemaValidator;
+use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
+use datafusion_table_providers_common::UnsupportedTypeAction;
 use futures::TryStreamExt;
 use rusqlite::{ToSql, Transaction};
 use snafu::prelude::*;
@@ -865,15 +867,18 @@ impl Sqlite {
         // Add ON CONFLICT clause if specified
         if let Some(oc) = on_conflict {
             use sea_query::SeaRc;
-            use sea_query::{Alias, DatabaseName, Query, SchemaName, SqliteQueryBuilder, TableName, TableRef};
+            use sea_query::{
+                Alias, DatabaseName, Query, SchemaName, SqliteQueryBuilder, TableName, TableRef,
+            };
 
             let sea_query_on_conflict = oc.build_sea_query_on_conflict(&self.schema);
 
             // Build a temporary table reference for the dummy statement
             let table_ref = match &self.table {
-                TableReference::Bare { table } => {
-                    TableRef::Table(TableName(None, SeaRc::new(Alias::new(table.to_string()))), None)
-                }
+                TableReference::Bare { table } => TableRef::Table(
+                    TableName(None, SeaRc::new(Alias::new(table.to_string()))),
+                    None,
+                ),
                 TableReference::Partial { schema, table } => TableRef::Table(
                     TableName(
                         Some(SchemaName(None, SeaRc::new(Alias::new(schema.to_string())))),

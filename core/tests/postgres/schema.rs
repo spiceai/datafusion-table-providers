@@ -1,10 +1,10 @@
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::catalog::TableProviderFactory;
 use datafusion::common::Constraints;
+use datafusion::common::TableReference;
 use datafusion::common::ToDFSchema;
 use datafusion::logical_expr::CreateExternalTable;
 use datafusion::prelude::SessionContext;
-use datafusion::common::TableReference;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;

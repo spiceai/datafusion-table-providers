@@ -936,17 +936,17 @@ fn complete_swap(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::write::DuckDBDataSink;
     use crate::conn::DuckDbConnection;
     use crate::pool::DuckDbConnectionPoolBuilder;
-    use datafusion_table_providers_common::util::column_reference::ColumnReference;
-    use datafusion_table_providers_common::util::indexes::IndexType;
+    use crate::write::DuckDBDataSink;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::sink::DataSink;
     use datafusion::execution::TaskContext;
     use datafusion::logical_expr::dml::InsertOp;
     use datafusion::physical_plan::memory::MemoryStream;
+    use datafusion_table_providers_common::util::column_reference::ColumnReference;
+    use datafusion_table_providers_common::util::indexes::IndexType;
     use duckdb::AccessMode;
 
     fn swap_dataset_definition() -> Arc<TableDefinition> {

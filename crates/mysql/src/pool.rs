@@ -246,7 +246,11 @@ impl MySQLConnectionPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    pub async fn connect_direct(&self) -> datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Result<MySQLConnection> {
+    pub async fn connect_direct(
+        &self,
+    ) -> datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Result<
+        MySQLConnection,
+    > {
         let pool = Arc::clone(&self.pool);
         let conn = pool.get_conn().await.context(MySQLConnectionSnafu)?;
 
@@ -309,8 +313,9 @@ fn get_ssl_opts(ssl_mode: &str, rootcert_path: Option<PathBuf>) -> Option<SslOpt
 impl DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)> for MySQLConnectionPool {
     async fn connect(
         &self,
-    ) -> datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Result<Box<dyn DbConnection<mysql_async::Conn, &'static (dyn ToValue + Sync)>>>
-    {
+    ) -> datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Result<
+        Box<dyn DbConnection<mysql_async::Conn, &'static (dyn ToValue + Sync)>>,
+    > {
         let pool = Arc::clone(&self.pool);
         let conn = pool.get_conn().await.context(MySQLConnectionSnafu)?;
 

@@ -9,6 +9,7 @@ use crate::conn::OraclePooledConnection;
 use datafusion::{
     arrow::datatypes::{DataType, SchemaRef},
     common::utils::quote_identifier,
+    common::TableReference,
     config::ConfigOptions,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
@@ -21,7 +22,6 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     },
-    common::TableReference,
     sql::{
         sqlparser,
         unparser::{
@@ -319,7 +319,9 @@ impl ExecutionPlan for OracleSQLExec {
         &self,
         f: &mut dyn FnMut(
             &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
-        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
     ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
         self.base_exec.apply_expressions(f)
     }

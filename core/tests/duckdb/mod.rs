@@ -311,8 +311,8 @@ mod sort_limit_pushdown {
 
 mod multipart_table_reference {
     use datafusion::arrow::array::{Int32Array, StringArray};
-    use datafusion::execution::context::SessionContext;
     use datafusion::common::TableReference;
+    use datafusion::execution::context::SessionContext;
     use datafusion_table_providers::duckdb::DuckDBTableFactory;
     use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
     use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;

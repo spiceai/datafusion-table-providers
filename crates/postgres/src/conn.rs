@@ -7,15 +7,15 @@ use crate::arrow_sql_gen::rows_to_arrow;
 use crate::arrow_sql_gen::schema::pg_data_type_to_arrow_type;
 use crate::arrow_sql_gen::schema::ParseContext;
 use crate::pool::ConnectionManager;
-use datafusion_table_providers_common::util::handle_unsupported_type_error;
-use datafusion_table_providers_common::util::schema::SchemaValidator;
-use datafusion_table_providers_common::UnsupportedTypeAction;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
 use arrow_schema::DataType;
 use async_stream::stream;
 use bb8_postgres::tokio_postgres::types::ToSql;
+use datafusion_table_providers_common::util::handle_unsupported_type_error;
+use datafusion_table_providers_common::util::schema::SchemaValidator;
+use datafusion_table_providers_common::UnsupportedTypeAction;
 
 fn maybe_db_source_err(err: tokio_postgres::Error) -> Box<dyn Error + Send + Sync> {
     if let Some(err) = err.as_db_error() {
@@ -32,10 +32,10 @@ fn maybe_db_source_err(err: tokio_postgres::Error) -> Box<dyn Error + Send + Syn
 // between the two modules (postgrespool imports PostgresConnection, which uses
 // this alias).
 pub type PostgresPooledConnection = bb8::PooledConnection<'static, ConnectionManager>;
+use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::common::TableReference;
 use futures::stream;
 use futures::StreamExt;
 
@@ -299,9 +299,7 @@ pub enum PostgresError {
     },
 
     #[snafu(display("Failed to convert query result to Arrow.\n{source}\nReport a bug to request support: https://github.com/datafusion-contrib/datafusion-table-providers/issues"))]
-    ConversionError {
-        source: crate::arrow_sql_gen::Error,
-    },
+    ConversionError { source: crate::arrow_sql_gen::Error },
 }
 
 fn format_postgres_query_error(source: &bb8_postgres::tokio_postgres::Error) -> String {
@@ -408,13 +406,11 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
             PostgresVariant::Redshift => REDSHIFT_SCHEMAS_QUERY,
         };
 
-        let rows =
-            self.conn
-                .query(query, &[])
-                .await
-                .map_err(|e| DbConnectionError::UnableToGetSchemas {
-                    source: maybe_db_source_err(e),
-                })?;
+        let rows = self.conn.query(query, &[]).await.map_err(|e| {
+            DbConnectionError::UnableToGetSchemas {
+                source: maybe_db_source_err(e),
+            }
+        })?;
 
         Ok(rows.iter().map(|r| r.get::<usize, String>(0)).collect())
     }
@@ -798,10 +794,11 @@ impl PostgresConnection {
             return Ok(Arc::new(Schema::empty()));
         }
 
-        let rec =
-            rows_to_arrow(rows.as_slice(), &None).map_err(|e| DbConnectionError::UnableToGetSchema {
+        let rec = rows_to_arrow(rows.as_slice(), &None).map_err(|e| {
+            DbConnectionError::UnableToGetSchema {
                 source: Box::new(PostgresError::ConversionError { source: e }),
-            })?;
+            }
+        })?;
 
         Ok(rec.schema())
     }

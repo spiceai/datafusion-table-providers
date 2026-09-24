@@ -1,3 +1,7 @@
+use async_trait::async_trait;
+use datafusion::catalog::Session;
+use datafusion::common::Constraints;
+use datafusion::sql::unparser::dialect::Dialect;
 use datafusion_table_providers_common::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers_common::sql::sql_provider_datafusion::expr::Engine;
 use datafusion_table_providers_common::sql::sql_provider_datafusion::{
@@ -6,10 +10,6 @@ use datafusion_table_providers_common::sql::sql_provider_datafusion::{
 use datafusion_table_providers_common::util::column_reference::ColumnReference;
 use datafusion_table_providers_common::util::indexes::IndexType;
 use datafusion_table_providers_common::util::supported_functions::FunctionSupport;
-use async_trait::async_trait;
-use datafusion::catalog::Session;
-use datafusion::common::Constraints;
-use datafusion::sql::unparser::dialect::Dialect;
 use futures::TryStreamExt;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -284,7 +284,9 @@ impl<T: 'static, P: 'static> ExecutionPlan for DuckSqlExec<T, P> {
         &self,
         f: &mut dyn FnMut(
             &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
-        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
     ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
         self.base_exec.apply_expressions(f)
     }
@@ -439,9 +441,9 @@ pub(crate) fn get_cte(table_functions: &Option<HashMap<String, String>>) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DynDuckDbConnectionPool;
     use crate::conn::DuckDBParameter;
     use crate::pool::DuckDbConnectionPool;
+    use crate::DynDuckDbConnectionPool;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::prelude::SessionContext;
     use duckdb::DuckdbConnectionManager;
