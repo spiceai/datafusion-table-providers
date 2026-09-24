@@ -135,6 +135,12 @@ sea-query = { version = "1.0.2", features = [
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3f98225d35735a61a5875d356774d246a8b0c037" } # spiceai-v0.40.0
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" } # rusqlite 0.40-compatible (matches spiceai/spiceai)
 
+# LOCAL-ONLY, temporary: Spice's datafusion-federation fork carries
+# `SQLExecutor::pre_federation_optimizer_rules`, which the adbc provider
+# overrides and crates.io 0.5.7 lacks. Points at the unpushed spiceai-55
+# checkout; replace with the fork's `git`/`rev` pin once it is pushed.
+datafusion-federation = { path = "../datafusion-federation-spiceai-55/datafusion-federation" }
+
 # arrow-rs with spice patches (ObjectVersionType + new_with_meta for Azure compatibility).
 # TODO(DF55): repoint at the arrow-59 spiceai-59-patches branch once it is
 # pushed (prepared locally as commit eed0d7b89). Local path for now; the

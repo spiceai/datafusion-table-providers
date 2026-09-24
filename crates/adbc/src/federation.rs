@@ -68,6 +68,10 @@ impl<T, P> SQLExecutor for AdbcDBTable<T, P> {
         self.base_table.logical_optimizer()
     }
 
+    fn pre_federation_optimizer_rules(&self) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
+        self.pre_federation_optimizer_rules.clone()
+    }
+
     fn execute(
         &self,
         query: &str,
