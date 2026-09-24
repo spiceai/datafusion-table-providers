@@ -2,7 +2,6 @@ use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{g
 use datafusion_table_providers_common::sql::sql_provider_datafusion::{get_stream, to_execution_error};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::sql::sqlparser::ast::{self, VisitMut};
 use datafusion::sql::unparser::dialect::Dialect;

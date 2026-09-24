@@ -43,8 +43,7 @@ use snafu::prelude::*;
 use tokio_postgres::Row;
 
 use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{
-    AsyncDbConnection, DbConnection, Error as DbConnectionError, Result, UnableToGetSchemaSnafu,
-    UnableToGetSchemasSnafu, UnableToGetTablesSnafu,
+    AsyncDbConnection, DbConnection, Error as DbConnectionError, Result,
 };
 
 const SCHEMA_QUERY: &str = r"

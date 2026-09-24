@@ -33,7 +33,7 @@ use tokio::sync::mpsc::Sender;
 use datafusion_table_providers_common::sql::db_connection_pool::runtime::run_sync_with_tokio;
 use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{
     DbConnection, Error as DbConnectionError, Result, SyncDbConnection, UnableToGetSchemaSnafu,
-    UnableToGetSchemasSnafu, UnableToGetTablesSnafu, UnableToQueryArrowSnafu,
+    UnableToGetTablesSnafu, UnableToQueryArrowSnafu,
 };
 
 #[derive(Debug, Snafu)]
