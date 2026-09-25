@@ -19,14 +19,6 @@
 members = ["core", "crates/common", "python", "crates/odbc", "crates/clickhouse", "crates/flightsql", "crates/mongodb", "crates/mysql", "crates/sqlite", "crates/postgres", "crates/duckdb", "crates/adbc", "crates/oracle"]
 resolver = "2"
 
-# LOCAL-ONLY, temporary: the DataFusion 55 upgrade needs a matching bump in
-# the sibling duckdb-rs fork (to an arrow-59-compatible rev) that is prepared
-# but not yet pushed. This path override points at a local sibling checkout
-# purely so this branch can be compiled and tested in isolation; replace with
-# a real `rev` pin once that fork is pushed.
-[patch."https://github.com/spiceai/duckdb-rs.git"]
-duckdb = { path = "../duckdb-rs/crates/duckdb" }
-
 [workspace.package]
 version = "0.13.1"
 readme = "README.md"
@@ -73,7 +65,7 @@ datafusion-table-providers-oracle = { version = "0.13.1", path = "crates/oracle"
 # once it is pushed (prepared locally as commit 8759747e3070275c00c3b02bb2b13da03cb4d6b0).
 # Pinned at the last-pushed rev for now; the local path patch above supplies
 # the actual arrow-59 build content in this checkout.
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "76655d2ffc1b1e4dfc886de561759b70ead48b96" } # branch: spiceai-1.4.4
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "875974763e847eb4dc4e071f875f5bbecdd63b47" } # branch: viktor/df-55-upgrade (duckdb 1.4.4 on arrow 59)
 adbc_core = { version = "0.24" }
 adbc_driver_manager = { version = "0.24" }
 parquet = "59.2"
@@ -135,29 +127,25 @@ sea-query = { version = "1.0.2", features = [
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3f98225d35735a61a5875d356774d246a8b0c037" } # spiceai-v0.40.0
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" } # rusqlite 0.40-compatible (matches spiceai/spiceai)
 
-# LOCAL-ONLY, temporary: Spice's datafusion-federation fork carries
+# Spice's datafusion-federation fork carries
 # `SQLExecutor::pre_federation_optimizer_rules`, which the adbc provider
-# overrides and crates.io 0.5.7 lacks. Points at the unpushed spiceai-55
-# checkout; replace with the fork's `git`/`rev` pin once it is pushed.
-datafusion-federation = { path = "../datafusion-federation-spiceai-55/datafusion-federation" }
+# overrides and crates.io 0.5.7 lacks.
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "40fefe6426addce7864b80261bdf771ddb19d8ab" } # branch: viktor/df-55-upgrade
 
 # arrow-rs with spice patches (ObjectVersionType + new_with_meta for Azure compatibility).
-# TODO(DF55): repoint at the arrow-59 spiceai-59-patches branch once it is
-# pushed (prepared locally as commit eed0d7b89). Local path for now; the
-# fork isn't pushed, so this substitutes a local sibling checkout.
-arrow = { path = "../arrow-rs/arrow" }
-arrow-arith = { path = "../arrow-rs/arrow-arith" }
-arrow-array = { path = "../arrow-rs/arrow-array" }
-arrow-buffer = { path = "../arrow-rs/arrow-buffer" }
-arrow-cast = { path = "../arrow-rs/arrow-cast" }
-arrow-csv = { path = "../arrow-rs/arrow-csv" }
-arrow-data = { path = "../arrow-rs/arrow-data" }
-arrow-flight = { path = "../arrow-rs/arrow-flight" }
-arrow-ipc = { path = "../arrow-rs/arrow-ipc" }
-arrow-json = { path = "../arrow-rs/arrow-json" }
-arrow-ord = { path = "../arrow-rs/arrow-ord" }
-arrow-row = { path = "../arrow-rs/arrow-row" }
-arrow-schema = { path = "../arrow-rs/arrow-schema" }
-arrow-select = { path = "../arrow-rs/arrow-select" }
-arrow-string = { path = "../arrow-rs/arrow-string" }
-parquet = { path = "../arrow-rs/parquet" } # TODO(DF55): repoint at spiceai-59-patches (local eed0d7b89) once pushed
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "eed0d7b890d56e292afd401c8f1f3f8d62b2da0a" } # branch: viktor/df-55-upgrade
+arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "eed0d7b890d56e292afd401c8f1f3f8d62b2da0a" }
+arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "eed0d7b890d56e292afd401c8f1f3f8d62b2da0a" }
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "eed0d7b890d56e292afd401c8f1f3f8d62b2da0a" }
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "eed0d7b890d56e292afd401c8f1f3f8d62b2da0a" }
+arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "eed0d7b890d56e292afd401c8f1f3f8d62b2da0a" }
+arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "eed0d7b890d56e292afd401c8f1f3f8d62b2da0a" }
+arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "eed0d7b890d56e292afd401c8f1f3f8d62b2da0a" }
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "eed0d7b890d56e292afd401c8f1f3f8d62b2da0a" }
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "eed0d7b890d56e292afd401c8f1f3f8d62b2da0a" }
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "eed0d7b890d56e292afd401c8f1f3f8d62b2da0a" }
+arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "eed0d7b890d56e292afd401c8f1f3f8d62b2da0a" }
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "eed0d7b890d56e292afd401c8f1f3f8d62b2da0a" }
+arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "eed0d7b890d56e292afd401c8f1f3f8d62b2da0a" }
+arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "eed0d7b890d56e292afd401c8f1f3f8d62b2da0a" }
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "eed0d7b890d56e292afd401c8f1f3f8d62b2da0a" }
