@@ -1,5 +1,6 @@
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::optimizer::OptimizerRule;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion_federation::sql::{
@@ -64,8 +65,8 @@ impl<T, P> SQLExecutor for AdbcDBTable<T, P> {
         self.base_table.dialect()
     }
 
-    fn logical_optimizer(&self) -> Option<datafusion_federation::sql::LogicalOptimizer> {
-        self.base_table.logical_optimizer()
+    fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
+        self.base_table.can_execute_plan(plan)
     }
 
     fn pre_federation_optimizer_rules(&self) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {

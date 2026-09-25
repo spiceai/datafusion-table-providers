@@ -82,34 +82,18 @@ impl<T, P> SQLExecutor for SqlTable<T, P> {
         Arc::clone(dialect) as Arc<_>
     }
 
-    // FIXME(DF55): `SQLExecutor::can_execute_plan` (a plan-level bool gate consulted
-    // by the federation optimizer *before* it commits to federating a sub-plan, so an
-    // unsupported function fell back to local DataFusion execution) no longer exists
-    // on `datafusion-federation` 0.5.7's `SQLExecutor` trait. `logical_optimizer` is
-    // the closest remaining hook, but it runs *inside* the already-federated execution
-    // path (`final_sql` -> `execute`), after the optimizer has committed to federating
-    // this scan — an `Err` here surfaces as a query execution failure, not a graceful
-    // "run it locally instead". This preserves the safety property (never unparse a
-    // plan the remote can't handle) but changes the failure mode from a silent local
-    // fallback to a hard error, unverified against a real federated query and flagged
-    // here for product/behavior review before this ships.
-    fn logical_optimizer(&self) -> Option<datafusion_federation::sql::LogicalOptimizer> {
-        let function_support = self.function_support.clone();
-        Some(Box::new(move |plan: LogicalPlan| {
-            let unsupported = function_support.as_ref().is_some_and(|func_supp| {
-                contains_unsupported_functions(&plan, func_supp).unwrap_or(true)
-            });
-            if unsupported {
-                return Err(DataFusionError::Execution(
-                    "This plan contains a function the remote engine does not support and \
-                     cannot be federated; DF55 removed the pre-federation plan gate this \
-                     check used to run under, so it now surfaces as a query error instead \
-                     of falling back to local execution."
-                        .to_string(),
-                ));
-            }
-            Ok(plan)
-        }))
+    fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
+        // Default to not federating the plan if a [`FunctionSupport`] policy is
+        // configured and the plan contains an unsupported function; otherwise
+        // allow federation. Functions that can't be federated are left for
+        // DataFusion to execute locally instead of being unparsed into remote SQL.
+        //
+        // Fail safe: if the support check itself errors, treat the plan as
+        // containing unsupported functions (i.e. do not federate) so we never
+        // unparse a plan the remote can't handle.
+        self.function_support.as_ref().is_none_or(|func_supp| {
+            !contains_unsupported_functions(plan, func_supp).unwrap_or(true)
+        })
     }
 
     fn execute(
@@ -225,14 +209,8 @@ mod tests {
             .expect("build")
     }
 
-    /// `logical_optimizer` is the replacement hook for the removed
-    /// `SQLExecutor::can_execute_plan` (see the `FIXME(DF55)` above); it accepts a
-    /// federatable plan with `Ok`, and signals a non-federatable one with `Err`.
     fn can_execute_plan(table: &SqlTable<(), &'static dyn ToString>, plan: &LogicalPlan) -> bool {
-        let mut optimizer = table
-            .logical_optimizer()
-            .expect("logical_optimizer is always Some");
-        optimizer(plan.clone()).is_ok()
+        SQLExecutor::can_execute_plan(table, plan)
     }
 
     #[test]

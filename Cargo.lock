@@ -1903,6 +1903,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.5.7"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=40fefe6426addce7864b80261bdf771ddb19d8ab#40fefe6426addce7864b80261bdf771ddb19d8ab"
 dependencies = [
  "arrow-json",
  "async-stream",
@@ -2809,6 +2810,7 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 [[package]]
 name = "duckdb"
 version = "1.4.4"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=875974763e847eb4dc4e071f875f5bbecdd63b47#875974763e847eb4dc4e071f875f5bbecdd63b47"
 dependencies = [
  "arrow",
  "cast",
@@ -3991,6 +3993,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libduckdb-sys"
 version = "1.4.4"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=875974763e847eb4dc4e071f875f5bbecdd63b47#875974763e847eb4dc4e071f875f5bbecdd63b47"
 dependencies = [
  "cc",
  "flate2",
@@ -8095,63 +8098,79 @@ dependencies = [
 [[patch.unused]]
 name = "arrow"
 version = "59.2.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
 
 [[patch.unused]]
 name = "arrow-arith"
 version = "59.2.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
 
 [[patch.unused]]
 name = "arrow-array"
 version = "59.2.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
 
 [[patch.unused]]
 name = "arrow-buffer"
 version = "59.2.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
 
 [[patch.unused]]
 name = "arrow-cast"
 version = "59.2.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
 
 [[patch.unused]]
 name = "arrow-csv"
 version = "59.2.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
 
 [[patch.unused]]
 name = "arrow-data"
 version = "59.2.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
 
 [[patch.unused]]
 name = "arrow-flight"
 version = "59.2.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
 
 [[patch.unused]]
 name = "arrow-ipc"
 version = "59.2.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
 
 [[patch.unused]]
 name = "arrow-json"
 version = "59.2.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
 
 [[patch.unused]]
 name = "arrow-ord"
 version = "59.2.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
 
 [[patch.unused]]
 name = "arrow-row"
 version = "59.2.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
 
 [[patch.unused]]
 name = "arrow-schema"
 version = "59.2.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
 
 [[patch.unused]]
 name = "arrow-select"
 version = "59.2.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
 
 [[patch.unused]]
 name = "arrow-string"
 version = "59.2.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
 
 [[patch.unused]]
 name = "parquet"
 version = "59.2.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"

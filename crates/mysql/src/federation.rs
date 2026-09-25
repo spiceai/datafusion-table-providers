@@ -1,5 +1,6 @@
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::sql::sqlparser::ast::{self, VisitMut};
 use datafusion::sql::unparser::dialect::Dialect;
@@ -85,8 +86,8 @@ impl SQLExecutor for MySQLTable {
         Some(AstAnalyzer::new(vec![Box::new(mysql_ast_analyzer)]))
     }
 
-    fn logical_optimizer(&self) -> Option<datafusion_federation::sql::LogicalOptimizer> {
-        self.base_table.logical_optimizer()
+    fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
+        self.base_table.can_execute_plan(plan)
     }
 
     fn execute(

@@ -1,4 +1,5 @@
 use arrow::datatypes::SchemaRef;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion_federation::sql::{
@@ -81,8 +82,8 @@ impl<T, P> SQLExecutor for DuckDBTable<T, P> {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn logical_optimizer(&self) -> Option<datafusion_federation::sql::LogicalOptimizer> {
-        self.base_table.logical_optimizer()
+    fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
+        self.base_table.can_execute_plan(plan)
     }
 
     async fn table_names(&self) -> DataFusionResult<Vec<String>> {
