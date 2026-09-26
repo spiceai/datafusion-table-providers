@@ -270,8 +270,21 @@ pub fn schema_to_mongo_projection(projected_schema: &SchemaRef) -> Document {
 
     let has_id = projected_schema.fields().iter().any(|f| f.name() == "_id");
 
-    for field in projected_schema.fields() {
-        projection.insert(field.name(), 1);
+    let names: Vec<&str> = projected_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    for name in &names {
+        // MongoDB refuses a projection of a path beside one of its prefixes as
+        // a path collision. The prefix returns the whole embedded document,
+        // which unnesting flattens into the path's column too.
+        let covered = name
+            .match_indices('.')
+            .any(|(i, _)| names.contains(&&name[..i]));
+        if !covered {
+            projection.insert(*name, 1);
+        }
     }
 
     // MongoDB always includes _id unless explicitly suppressed
@@ -287,6 +300,21 @@ mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use mongodb::bson::doc;
+
+    #[test]
+    fn a_path_is_not_projected_beside_its_prefix() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Utf8, false),
+            Field::new("address", DataType::Utf8, true),
+            Field::new("address.city", DataType::Utf8, true),
+            Field::new("address.zip.code", DataType::Utf8, true),
+            Field::new("addressbook", DataType::Utf8, true),
+        ]));
+        assert_eq!(
+            schema_to_mongo_projection(&schema),
+            doc! { "_id": 1, "address": 1, "addressbook": 1 }
+        );
+    }
 
     #[test]
     fn test_projection_with_id() {
