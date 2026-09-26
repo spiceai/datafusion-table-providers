@@ -122,7 +122,6 @@ impl MongoDBConnection {
         projected_schema: &SchemaRef,
         filters_doc: &Document,
         limit: Option<i32>,
-        sort_doc: &Document,
         schema_projection: Option<&SchemaProjection>,
     ) -> Result<SendableRecordBatchStream> {
         let collection_name = table_reference.table();
@@ -139,10 +138,6 @@ impl MongoDBConnection {
         };
 
         let mut find = coll.find(filters_doc.clone()).projection(mongo_projection);
-
-        if !sort_doc.is_empty() {
-            find = find.sort(sort_doc.clone());
-        }
 
         if let Some(l) = limit {
             find = find.limit(l.into());
