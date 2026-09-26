@@ -798,3 +798,20 @@ fn a_nanosecond_column_is_null_for_a_date_beyond_its_range() {
         doc! { "naive": { "$type": ["date", "timestamp"], "$not": not_array() } }
     );
 }
+
+#[test]
+fn a_null_predicate_keeps_no_row_under_either_polarity() {
+    // `x IN (1, NULL)` reaches the scan as `x = 1 OR NULL`.
+    let null = lit(ScalarValue::Boolean(None));
+    let age = col("age").eq(lit(30));
+    assert_eq!(translate(&age.clone().or(null.clone())), translate(&age));
+    assert_eq!(translate(&null.clone().or(age.clone())), translate(&age));
+    // NOT (x OR NULL) is NOT x AND NULL, which is never true.
+    let never =
+        translate(&Expr::Not(Box::new(age.clone().or(null.clone())))).expect("translatable");
+    assert!(never.exact);
+    assert_eq!(never.document, nothing());
+    let never = translate(&age.and(null)).expect("translatable");
+    assert!(never.exact);
+    assert_eq!(never.document, nothing());
+}

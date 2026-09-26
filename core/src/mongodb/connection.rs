@@ -93,7 +93,7 @@ impl MongoDBConnection {
         };
         let Some(specification) = specification else {
             tracing::debug!(
-                "Could not read the collation of MongoDB collection '{collection}', so Spice evaluates its string inequalities and ranges instead of MongoDB"
+                "Could not read the collation of MongoDB collection '{collection}', so its string inequalities and ranges are not pushed down to MongoDB"
             );
             return StringComparison::Fixed;
         };

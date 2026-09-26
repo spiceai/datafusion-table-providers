@@ -62,6 +62,11 @@ impl MongoFilter {
             exact: false,
         }
     }
+
+    /// Whether this selects exactly no row: a predicate that is never true.
+    fn is_nothing(&self) -> bool {
+        self.exact && self.document == nothing()
+    }
 }
 
 /// What a collection's columns are, beyond their Arrow types.
@@ -501,6 +506,14 @@ fn combine(operator: &str, documents: Vec<Document>) -> Document {
 }
 
 fn and(left: Option<MongoFilter>, right: Option<MongoFilter>) -> Option<MongoFilter> {
+    // Where either side is never true, so is the conjunction.
+    if let Some(never) = [&left, &right]
+        .into_iter()
+        .flatten()
+        .find(|filter| filter.is_nothing())
+    {
+        return Some(never.clone());
+    }
     match (left, right) {
         (Some(l), Some(r)) => Some(MongoFilter {
             document: all_of(vec![l.document, r.document]),
@@ -515,6 +528,13 @@ fn and(left: Option<MongoFilter>, right: Option<MongoFilter>) -> Option<MongoFil
 
 fn or(left: Option<MongoFilter>, right: Option<MongoFilter>) -> Option<MongoFilter> {
     let (l, r) = (left?, right?);
+    // A side that is never true adds no row.
+    if l.is_nothing() {
+        return Some(r);
+    }
+    if r.is_nothing() {
+        return Some(l);
+    }
     Some(MongoFilter {
         document: any_of(vec![l.document, r.document]),
         exact: l.exact && r.exact,
@@ -695,6 +715,12 @@ impl Translator<'_> {
                 }
             }
             Expr::Like(like) => self.like(like, negated),
+            // A NULL used as a predicate, which is what `DataFusion` leaves of
+            // `x = NULL` in a simplified `x IN (1, NULL)`, is neither true nor
+            // false, so it keeps no row either way.
+            Expr::Literal(ScalarValue::Boolean(None) | ScalarValue::Null, _) => {
+                Some(MongoFilter::exact(nothing()))
+            }
             _ => None,
         }
     }
