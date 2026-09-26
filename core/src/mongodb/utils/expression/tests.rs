@@ -816,3 +816,11 @@ fn a_null_predicate_keeps_no_row_under_either_polarity() {
     assert!(never.exact);
     assert_eq!(never.document, nothing());
 }
+
+#[test]
+fn a_predicate_that_is_never_true_matches_no_document_even_without_an_id() {
+    // A view can project `_id` away, which `{_id: {$exists: false}}` would
+    // then match on every document.
+    assert_eq!(nothing(), doc! { "_id": { "$in": [] } });
+    assert_eq!(exact(&col("age").eq(lit(2.5))), nothing());
+}

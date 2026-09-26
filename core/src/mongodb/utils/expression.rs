@@ -468,9 +468,10 @@ fn types(types: &[&str]) -> Bson {
     }
 }
 
-/// Matches no document. Every document has an `_id`.
+/// Matches no document. `$in` with no values matches nothing, a missing
+/// field included, which matters because a view can project `_id` away.
 fn nothing() -> Document {
-    doc! { "_id": { "$exists": false } }
+    doc! { "_id": { "$in": [] } }
 }
 
 fn all_of(documents: Vec<Document>) -> Document {
