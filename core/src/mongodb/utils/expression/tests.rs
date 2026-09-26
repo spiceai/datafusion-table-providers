@@ -739,18 +739,19 @@ fn a_cast_to_a_finer_unit_is_not_unwrapped() {
 fn a_cast_that_moves_the_instant_into_a_zone_is_not_unwrapped() {
     let zoned = |tz: &str| DataType::Timestamp(TimeUnit::Millisecond, Some(tz.into()));
     let epoch = |tz: &str| lit(ScalarValue::TimestampMillisecond(Some(0), Some(tz.into())));
-    // Arrow reads a naive timestamp as wall-clock time in the zone it gains.
-    assert!(translate_timestamp(&cast("naive", zoned("+01:00")).lt(epoch("+01:00"))).is_none());
-    assert!(translate_timestamp(
-        &cast("naive", zoned("America/New_York")).lt(epoch("America/New_York"))
-    )
-    .is_none());
-    // In UTC, and between zones, only the display changes.
-    for (column, tz) in [("naive", "+00:00"), ("naive", "UTC"), ("utc", "+01:00")] {
-        let filter =
-            translate_timestamp(&cast(column, zoned(tz)).lt(epoch(tz))).expect("translatable");
-        assert!(filter.exact, "{column} as {tz}");
+    // Arrow reads a naive timestamp as wall-clock time in the zone it gains,
+    // through chrono, whose range is narrower than a BSON date's, so a
+    // distant date is NULL under TRY_CAST even in UTC.
+    for tz in ["+01:00", "America/New_York", "+00:00", "UTC"] {
+        assert!(
+            translate_timestamp(&cast("naive", zoned(tz)).lt(epoch(tz))).is_none(),
+            "{tz}"
+        );
     }
+    // Between zones, and out of one, only the display changes.
+    let filter = translate_timestamp(&cast("utc", zoned("+01:00")).lt(epoch("+01:00")))
+        .expect("translatable");
+    assert!(filter.exact);
     let naive = DataType::Timestamp(TimeUnit::Millisecond, None);
     let epoch = lit(ScalarValue::TimestampMillisecond(Some(0), None));
     assert!(translate_timestamp(&cast("utc", naive).lt(epoch)).is_some_and(|f| f.exact));

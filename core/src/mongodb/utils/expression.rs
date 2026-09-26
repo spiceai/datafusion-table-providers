@@ -574,23 +574,15 @@ fn preserves_values(from: &DataType, to: &DataType) -> bool {
         // Rounds beyond 2^53, which the comparison of such a cast accounts for.
         | (Int64 | UInt64, Float64) => true,
         // A finer unit overflows for a distant instant, which a cast turns into
-        // an error and `TRY_CAST` into NULL, and a coarser one truncates.
-        (Timestamp(from_unit, from_tz), Timestamp(to_unit, to_tz)) if from_unit == to_unit => {
-            match (from_tz, to_tz) {
-                // Arrow reads a timestamp without a time zone as wall-clock time
-                // in the zone it gains, which moves the instant unless that
-                // zone is UTC.
-                (None, Some(tz)) => is_utc(tz),
-                // Only the zone the instant is displayed in changes.
-                _ => true,
-            }
+        // an error and `TRY_CAST` into NULL, and a coarser one truncates. A zone
+        // added to a timestamp without one reads it as wall-clock time there,
+        // through chrono, whose range is narrower than a BSON date's, so even
+        // UTC can make it NULL. Otherwise only the zone it displays in changes.
+        (Timestamp(from_unit, from_tz), Timestamp(to_unit, to_tz)) => {
+            from_unit == to_unit && (from_tz.is_some() || to_tz.is_none())
         }
         _ => false,
     }
-}
-
-fn is_utc(tz: &str) -> bool {
-    matches!(tz, "UTC" | "+00:00" | "Z" | "Etc/UTC")
 }
 
 /// Whether `name` can be addressed as a field path in a query document. A
