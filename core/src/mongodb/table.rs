@@ -1,3 +1,4 @@
+use crate::mongodb::connection::StringComparison;
 use crate::mongodb::connection_pool::MongoDBConnectionPool;
 use crate::mongodb::utils::expression::{translate_filter, FilterScope};
 use crate::mongodb::Error;
@@ -19,6 +20,7 @@ use datafusion::physical_plan::{
 use datafusion::sql::TableReference;
 use futures::TryStreamExt;
 use mongodb::bson::{doc, Document};
+use mongodb::options::Collation;
 use serde_json;
 use std::{collections::HashSet, fmt, sync::Arc};
 
@@ -29,6 +31,7 @@ pub struct MongoDBTable {
     table_reference: Arc<TableReference>,
     projection: Option<SchemaProjection>,
     filter_scope: FilterScope,
+    strings: StringComparison,
 }
 
 impl MongoDBTable {
@@ -39,11 +42,11 @@ impl MongoDBTable {
         projection: Option<SchemaProjection>,
     ) -> Result<Self, Error> {
         let table_reference = table_reference.into();
-        let schema = pool
-            .connect()
-            .await?
+        let connection = pool.connect().await?;
+        let schema = connection
             .get_schema(&table_reference, declared_schema)
             .await?;
+        let strings = connection.string_comparison(table_reference.table()).await;
 
         // When a JSON-nesting / declared-schema projection is configured, the
         // exposed schema is the projected one (declared columns + catch-all).
@@ -63,6 +66,12 @@ impl MongoDBTable {
         let filter_scope = FilterScope {
             unpushable_columns,
             unnest_depth: pool.unnest_depth(),
+            // A catch-all folds in every undeclared field, so each scan reads
+            // whole documents.
+            whole_documents: projection
+                .as_ref()
+                .is_some_and(SchemaProjection::has_catch_all),
+            code_point_strings: strings != StringComparison::Fixed,
         };
 
         Ok(Self {
@@ -71,6 +80,7 @@ impl MongoDBTable {
             table_reference: Arc::new(table_reference),
             projection,
             filter_scope,
+            strings,
         })
     }
 }
@@ -99,6 +109,7 @@ impl TableProvider for MongoDBTable {
             projection,
             filters,
             &self.filter_scope,
+            self.strings,
             limit,
             self.projection.clone(),
         )?))
@@ -137,6 +148,7 @@ struct MongoDBExec {
     pool: Arc<MongoDBConnectionPool>,
     projected_schema: SchemaRef,
     filters_doc: Document,
+    collation: Option<Collation>,
     limit: Option<i32>,
     properties: Arc<PlanProperties>,
     schema_projection: Option<SchemaProjection>,
@@ -151,6 +163,7 @@ impl MongoDBExec {
         projections: Option<&Vec<usize>>,
         filters: &[Expr],
         filter_scope: &FilterScope,
+        strings: StringComparison,
         limit: Option<usize>,
         schema_projection: Option<SchemaProjection>,
     ) -> DataFusionResult<Self> {
@@ -200,12 +213,14 @@ impl MongoDBExec {
             1 => documents.pop().unwrap_or_default(),
             _ => doc! { "$and": documents },
         };
+        let collation = strings.collation_for(&mongo_filters_doc);
 
         Ok(Self {
             table_reference: Arc::clone(&table_reference),
             pool,
             projected_schema: Arc::clone(&projected_schema),
             filters_doc: mongo_filters_doc,
+            collation,
             limit,
             properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
@@ -235,6 +250,10 @@ impl DisplayAs for MongoDBExec {
             columns.join(", "),
             filters,
         )?;
+
+        if let Some(collation) = &self.collation {
+            write!(f, " collation=[{}]", collation.locale)?;
+        }
 
         if let Some(limit) = self.limit {
             write!(f, " limit=[{limit}]")?;
@@ -279,6 +298,7 @@ impl ExecutionPlan for MongoDBExec {
         let pool = Arc::clone(&self.pool);
         let projected_schema = Arc::clone(&self.projected_schema);
         let filters_doc = self.filters_doc.clone();
+        let collation = self.collation.clone();
         let limit = self.limit;
         let schema_projection = self.schema_projection.clone();
 
@@ -289,6 +309,7 @@ impl ExecutionPlan for MongoDBExec {
                 &table_reference,
                 &projected_schema,
                 &filters_doc,
+                collation.as_ref(),
                 limit,
                 schema_projection.as_ref(),
             )
@@ -307,7 +328,6 @@ pub fn to_execution_error(
 ) -> DataFusionError {
     DataFusionError::Execution(format!("{}", e.into()).to_string())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -329,6 +349,8 @@ mod tests {
         FilterScope {
             unpushable_columns: HashSet::new(),
             unnest_depth: Some(0),
+            whole_documents: false,
+            code_point_strings: true,
         }
     }
 
@@ -343,6 +365,14 @@ mod tests {
     }
 
     fn exec(filters: &[Expr], limit: Option<usize>) -> DataFusionResult<MongoDBExec> {
+        exec_comparing(filters, StringComparison::CodePoint, limit)
+    }
+
+    fn exec_comparing(
+        filters: &[Expr],
+        strings: StringComparison,
+        limit: Option<usize>,
+    ) -> DataFusionResult<MongoDBExec> {
         MongoDBExec::new(
             Arc::new(TableReference::bare("users")),
             Arc::new(MongoDBConnectionPool::new_stub()),
@@ -350,6 +380,7 @@ mod tests {
             None,
             filters,
             &scope(),
+            strings,
             limit,
             None,
         )
@@ -389,7 +420,7 @@ mod tests {
     fn a_catch_all_column_is_not_pushed_down() {
         let scope = FilterScope {
             unpushable_columns: HashSet::from(["name".to_string()]),
-            unnest_depth: Some(0),
+            ..scope()
         };
         assert_eq!(
             supports_filters_pushdown(&[&col("name").is_null()], &test_schema(), &scope),
@@ -399,8 +430,8 @@ mod tests {
 
     #[tokio::test]
     async fn filters_are_combined_with_and() {
-        let exec = exec(&[col("age").gt(lit(18)), col("active").eq(lit(true))], None)
-            .expect("exec");
+        let exec =
+            exec(&[col("age").gt(lit(18)), col("active").eq(lit(true))], None).expect("exec");
         let conditions = exec.filters_doc.get_array("$and").expect("$and");
         assert_eq!(conditions.len(), 2);
         let display = format_exec(&exec);
@@ -438,11 +469,35 @@ mod tests {
             Some(&vec![]),
             &[],
             &scope(),
+            StringComparison::CodePoint,
             None,
             None,
         )
         .expect("exec");
         assert!(format_exec(&exec).contains("projection=[_id]"));
+    }
+
+    #[tokio::test]
+    async fn a_collated_collection_compares_strings_by_code_point_only_when_a_filter_orders_them() {
+        let ordered = [col("name").gt(lit("b"))];
+        let excluded = [col("name").not_eq(lit("bob"))];
+        let equal = [col("name").eq(lit("bob")), col("age").gt(lit(18))];
+
+        for filters in [&ordered[..], &excluded[..]] {
+            let exec = exec_comparing(filters, StringComparison::Collated, None).expect("exec");
+            assert_eq!(
+                exec.collation.as_ref().map(|c| c.locale.as_str()),
+                Some("simple")
+            );
+            assert!(format_exec(&exec).contains("collation=[simple]"));
+        }
+        // A collation only widens `$in`, and it is the collection's indexes
+        // that are built with it.
+        let exec = exec_comparing(&equal, StringComparison::Collated, None).expect("exec");
+        assert!(exec.collation.is_none());
+        // Without a collation there is nothing to replace.
+        let exec = exec_comparing(&ordered, StringComparison::CodePoint, None).expect("exec");
+        assert!(exec.collation.is_none());
     }
 
     #[tokio::test]

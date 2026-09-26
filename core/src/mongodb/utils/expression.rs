@@ -73,6 +73,19 @@ pub struct FilterScope {
     /// How many levels of embedded documents are flattened into dotted
     /// columns, or `None` when the flattening is not depth based.
     pub unnest_depth: Option<usize>,
+    /// Whether rows are read from whole documents rather than from a
+    /// projection of the columns. Unnesting a whole document reads a field
+    /// whose name contains a dot into the dotted column of that name, and no
+    /// query path addresses such a field, so a dotted column is then not
+    /// pushed down.
+    pub whole_documents: bool,
+    /// Whether the query can compare strings by code point, as SQL does: the
+    /// collection has no collation, or one the query replaces with the simple
+    /// collation. A collation can hold unequal strings equal and order them
+    /// differently, which narrows `$nin` and the range operators, so without
+    /// this only the string predicates a collation cannot narrow are pushed
+    /// down.
+    pub code_point_strings: bool,
 }
 
 /// Translates a filter over a collection whose rows have `schema`, or returns
@@ -132,8 +145,12 @@ enum Kind {
     /// `double`, `int` and `long` values, as `f64`.
     Float64,
     /// A timestamp in milliseconds or finer, or `Date64`: a `date` as its
-    /// milliseconds, a BSON `timestamp` as its seconds.
-    Instant,
+    /// milliseconds, a BSON `timestamp` as its seconds, each only within the
+    /// milliseconds from `min` to `max` the unit can represent.
+    Instant {
+        min: i128,
+        max: i128,
+    },
     /// The UTC day of a `date`.
     Date32,
     Binary,
@@ -156,13 +173,30 @@ impl Kind {
             DataType::UInt32 => integer(&["int", "long"], 0, u32::MAX.into()),
             DataType::UInt64 => integer(&["int", "long"], 0, i64::MAX.into()),
             DataType::Float64 => Some(Self::Float64),
-            DataType::Timestamp(TimeUnit::Millisecond | TimeUnit::Microsecond, _)
-            | DataType::Timestamp(TimeUnit::Nanosecond, _)
-            | DataType::Date64 => Some(Self::Instant),
+            DataType::Timestamp(TimeUnit::Millisecond, _) | DataType::Date64 => {
+                Some(Self::Instant {
+                    min: i64::MIN.into(),
+                    max: i64::MAX.into(),
+                })
+            }
+            // The conversion nulls a `date` whose milliseconds overflow the unit.
+            DataType::Timestamp(TimeUnit::Microsecond, _) => Some(Self::instant_per_milli(1_000)),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                Some(Self::instant_per_milli(1_000_000))
+            }
             DataType::Date32 => Some(Self::Date32),
             DataType::Binary | DataType::LargeBinary => Some(Self::Binary),
             DataType::List(_) => Some(Self::List),
             _ => None,
+        }
+    }
+
+    /// An instant in a unit `per_milli` times finer than a millisecond, whose
+    /// `i64` holds only the milliseconds that do not overflow once scaled.
+    fn instant_per_milli(per_milli: i64) -> Self {
+        Self::Instant {
+            min: (i64::MIN / per_milli).into(),
+            max: (i64::MAX / per_milli).into(),
         }
     }
 }
@@ -389,9 +423,9 @@ fn instant_millis(value: &ScalarValue) -> Option<(i128, i128)> {
 
 fn string(value: &ScalarValue) -> Option<&str> {
     match value {
-        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) | ScalarValue::Utf8View(Some(s)) => {
-            Some(s)
-        }
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => Some(s),
         _ => None,
     }
 }
@@ -421,7 +455,11 @@ fn millis(v: i128) -> Bson {
 fn types(types: &[&str]) -> Bson {
     match types {
         [one] => Bson::String((*one).to_string()),
-        many => Bson::Array(many.iter().map(|t| Bson::String((*t).to_string())).collect()),
+        many => Bson::Array(
+            many.iter()
+                .map(|t| Bson::String((*t).to_string()))
+                .collect(),
+        ),
     }
 }
 
@@ -487,10 +525,12 @@ fn or(left: Option<MongoFilter>, right: Option<MongoFilter>) -> Option<MongoFilt
 fn literal(expr: &Expr) -> Option<ScalarValue> {
     match expr {
         Expr::Literal(value, _) => Some(value.clone()),
-        Expr::Cast(Cast { expr, field }) | Expr::TryCast(TryCast { expr, field }) => match expr.as_ref() {
-            Expr::Literal(value, _) => value.cast_to(field.data_type()).ok(),
-            _ => None,
-        },
+        Expr::Cast(Cast { expr, field }) | Expr::TryCast(TryCast { expr, field }) => {
+            match expr.as_ref() {
+                Expr::Literal(value, _) => value.cast_to(field.data_type()).ok(),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -513,26 +553,33 @@ fn preserves_values(from: &DataType, to: &DataType) -> bool {
         | (UInt32, Int64 | UInt64 | Float64)
         // Rounds beyond 2^53, which the comparison of such a cast accounts for.
         | (Int64 | UInt64, Float64) => true,
-        (Timestamp(from_unit, _), Timestamp(to_unit, _)) => {
-            unit_rank(*to_unit) >= unit_rank(*from_unit)
+        // A finer unit overflows for a distant instant, which a cast turns into
+        // an error and `TRY_CAST` into NULL, and a coarser one truncates.
+        (Timestamp(from_unit, from_tz), Timestamp(to_unit, to_tz)) if from_unit == to_unit => {
+            match (from_tz, to_tz) {
+                // Arrow reads a timestamp without a time zone as wall-clock time
+                // in the zone it gains, which moves the instant unless that
+                // zone is UTC.
+                (None, Some(tz)) => is_utc(tz),
+                // Only the zone the instant is displayed in changes.
+                _ => true,
+            }
         }
         _ => false,
     }
 }
 
-fn unit_rank(unit: TimeUnit) -> u8 {
-    match unit {
-        TimeUnit::Second => 0,
-        TimeUnit::Millisecond => 1,
-        TimeUnit::Microsecond => 2,
-        TimeUnit::Nanosecond => 3,
-    }
+fn is_utc(tz: &str) -> bool {
+    matches!(tz, "UTC" | "+00:00" | "Z" | "Etc/UTC")
 }
 
 /// Whether `name` can be addressed as a field path in a query document. A
 /// leading `$` would be read as an operator, and a NUL cannot be encoded.
 fn is_addressable(name: &str) -> bool {
-    !name.contains('\0') && name.split('.').all(|segment| !segment.is_empty() && !segment.starts_with('$'))
+    !name.contains('\0')
+        && name
+            .split('.')
+            .all(|segment| !segment.is_empty() && !segment.starts_with('$'))
 }
 
 struct Translator<'a> {
@@ -581,11 +628,19 @@ impl Translator<'_> {
             }
             Expr::IsNull(inner) => {
                 let field = self.field(inner)?;
-                Some(if negated { self.not_null(&field) } else { self.is_null(&field) })
+                Some(if negated {
+                    self.not_null(&field)
+                } else {
+                    self.is_null(&field)
+                })
             }
             Expr::IsNotNull(inner) => {
                 let field = self.field(inner)?;
-                Some(if negated { self.is_null(&field) } else { self.not_null(&field) })
+                Some(if negated {
+                    self.is_null(&field)
+                } else {
+                    self.not_null(&field)
+                })
             }
             Expr::IsTrue(inner) => self.truth(inner, true, negated),
             Expr::IsFalse(inner) => self.truth(inner, false, negated),
@@ -668,7 +723,7 @@ impl Translator<'_> {
         // it, a field whose name has a dot, which a query path cannot address.
         let unnest_depth = self.scope.unnest_depth?;
         let depth = path.matches('.').count();
-        if depth > unnest_depth {
+        if depth > unnest_depth || (depth > 0 && self.scope.whole_documents) {
             return None;
         }
         Some(Field {
@@ -679,7 +734,10 @@ impl Translator<'_> {
     }
 
     fn column_type(&self, name: &str) -> Option<&DataType> {
-        self.schema.field_with_name(name).ok().map(|f| f.data_type())
+        self.schema
+            .field_with_name(name)
+            .ok()
+            .map(|f| f.data_type())
     }
 
     /// `spec` applied to `field`, requiring each parent along its path to be a
@@ -718,7 +776,10 @@ impl Translator<'_> {
                 };
                 any_of(vec![
                     self.at(field, doc! { "$type": "array" }),
-                    self.at(field, doc! { "$exists": true, "$not": { "$type": types(absent) } }),
+                    self.at(
+                        field,
+                        doc! { "$exists": true, "$not": { "$type": types(absent) } },
+                    ),
                 ])
             }
             Kind::Boolean => self.scalar(field, &["bool"], Document::new()),
@@ -726,7 +787,10 @@ impl Translator<'_> {
                 self.integers(field, types, min, max, IntSet::ALL.within(min, max))
             }
             Kind::Float64 => self.scalar(field, NUMBER_TYPES, Document::new()),
-            Kind::Instant => self.scalar(field, INSTANT_TYPES, Document::new()),
+            Kind::Instant { min, max } if min <= i64::MIN.into() && max >= i64::MAX.into() => {
+                self.scalar(field, INSTANT_TYPES, Document::new())
+            }
+            Kind::Instant { min, max } => self.instants(field, IntSet::ALL, min, max),
             Kind::Date32 => self.days(field, IntSet::ALL),
             Kind::Binary => self.scalar(field, &["binData"], Document::new()),
             Kind::List => self.at(field, doc! { "$type": "array" }),
@@ -797,18 +861,27 @@ impl Translator<'_> {
                         integer_float_set(cmp, x)
                     }
                 };
-                Some(MongoFilter::exact(self.integers(field, types, min, max, set.within(min, max))))
+                Some(MongoFilter::exact(self.integers(
+                    field,
+                    types,
+                    min,
+                    max,
+                    set.within(min, max),
+                )))
             }
             Kind::Float64 => self.compare_float(field, cmp, value),
-            Kind::Instant => {
+            Kind::Instant { min, max } => {
                 let (num, den) = instant_millis(value)?;
-                Some(MongoFilter::exact(self.instants(field, IntSet::compare_ratio(cmp, num, den))))
+                let set = IntSet::compare_ratio(cmp, num, den);
+                Some(MongoFilter::exact(self.instants(field, set, min, max)))
             }
             Kind::Date32 => {
                 let ScalarValue::Date32(Some(day)) = value else {
                     return None;
                 };
-                Some(MongoFilter::exact(self.days(field, IntSet::compare(cmp, (*day).into()))))
+                Some(MongoFilter::exact(
+                    self.days(field, IntSet::compare(cmp, (*day).into())),
+                ))
             }
             Kind::Binary | Kind::List => None,
         }
@@ -816,7 +889,14 @@ impl Translator<'_> {
 
     /// Integers of `accepted` types in `set`, which already lies within the
     /// column's range.
-    fn integers(&self, field: &Field<'_>, accepted: &[&str], min: i128, max: i128, set: IntSet) -> Document {
+    fn integers(
+        &self,
+        field: &Field<'_>,
+        accepted: &[&str],
+        min: i128,
+        max: i128,
+        set: IntSet,
+    ) -> Document {
         // The range the accepted BSON types can hold on their own.
         let (natural_min, natural_max) = if accepted.contains(&"long") {
             (i64::MIN.into(), i64::MAX.into())
@@ -850,14 +930,24 @@ impl Translator<'_> {
         self.scalar(field, accepted, conditions)
     }
 
-    /// Instants whose milliseconds lie in `set`: a `date` by its milliseconds,
-    /// a BSON `timestamp` by the milliseconds of its seconds.
-    fn instants(&self, field: &Field<'_>, set: IntSet) -> Document {
-        let mut branches = Vec::with_capacity(2);
-        let dates = set.within(i64::MIN.into(), i64::MAX.into());
-        if let Some(date) = self.bounded(field, "date", dates, i64::MIN.into(), i64::MAX.into(), millis) {
-            branches.push(date);
+    /// Instants whose milliseconds lie in `set` and in `min..=max`, the range
+    /// the column's unit represents: a `date` by its milliseconds, a BSON
+    /// `timestamp` by the milliseconds of its seconds.
+    fn instants(&self, field: &Field<'_>, set: IntSet, min: i128, max: i128) -> Document {
+        let set = set.within(min, max);
+        let date = |set: IntSet| {
+            self.bounded(field, "date", set, i64::MIN.into(), i64::MAX.into(), millis)
+        };
+        let mut branches = Vec::with_capacity(3);
+        match set {
+            // `$ne` alone would keep the dates beyond the unit's range too.
+            IntSet::AllBut(k) if min > i64::MIN.into() || max < i64::MAX.into() => {
+                branches.extend(date(IntSet::Range(min, k - 1).within(min, max)));
+                branches.extend(date(IntSet::Range(k + 1, max).within(min, max)));
+            }
+            set => branches.extend(date(set)),
         }
+        // Every BSON `timestamp` lies within any unit's range.
         let seconds = set.scaled_down(1_000).within(0, u32::MAX.into());
         let first = |second: i128| timestamp(second, 0);
         let last = |second: i128| timestamp(second, u32::MAX);
@@ -894,7 +984,9 @@ impl Translator<'_> {
             IntSet::Empty => IntSet::Empty,
             IntSet::Range(lo, hi) => IntSet::Range(
                 lo.saturating_mul(MILLIS_PER_DAY),
-                hi.saturating_add(1).saturating_mul(MILLIS_PER_DAY).saturating_sub(1),
+                hi.saturating_add(1)
+                    .saturating_mul(MILLIS_PER_DAY)
+                    .saturating_sub(1),
             ),
             IntSet::AllBut(_) => IntSet::ALL,
         };
@@ -904,7 +996,9 @@ impl Translator<'_> {
                 let after = to_millis(IntSet::Range(day + 1, i128::MAX)).within(min, max);
                 let branches: Vec<Document> = [before, after]
                     .into_iter()
-                    .filter_map(|set| self.bounded(field, "date", set, i64::MIN.into(), i64::MAX.into(), millis))
+                    .filter_map(|set| {
+                        self.bounded(field, "date", set, i64::MIN.into(), i64::MAX.into(), millis)
+                    })
                     .collect();
                 if branches.is_empty() {
                     nothing()
@@ -913,7 +1007,14 @@ impl Translator<'_> {
                 }
             }
             set => self
-                .bounded(field, "date", to_millis(set).within(min, max), i64::MIN.into(), i64::MAX.into(), millis)
+                .bounded(
+                    field,
+                    "date",
+                    to_millis(set).within(min, max),
+                    i64::MIN.into(),
+                    i64::MAX.into(),
+                    millis,
+                )
                 .unwrap_or_else(nothing),
         }
     }
@@ -950,7 +1051,12 @@ impl Translator<'_> {
         Some(self.scalar(field, &[accepted], conditions))
     }
 
-    fn compare_boolean(&self, field: &Field<'_>, cmp: Cmp, value: &ScalarValue) -> Option<MongoFilter> {
+    fn compare_boolean(
+        &self,
+        field: &Field<'_>,
+        cmp: Cmp,
+        value: &ScalarValue,
+    ) -> Option<MongoFilter> {
         let ScalarValue::Boolean(Some(b)) = value else {
             return None;
         };
@@ -968,7 +1074,12 @@ impl Translator<'_> {
         Some(MongoFilter::exact(document))
     }
 
-    fn compare_float(&self, field: &Field<'_>, cmp: Cmp, value: &ScalarValue) -> Option<MongoFilter> {
+    fn compare_float(
+        &self,
+        field: &Field<'_>,
+        cmp: Cmp,
+        value: &ScalarValue,
+    ) -> Option<MongoFilter> {
         let x = match numeric(value)? {
             Numeric::Float(x) => x,
             Numeric::Int(k) if k.unsigned_abs() <= 1 << 53 => k as f64,
@@ -1006,6 +1117,10 @@ impl Translator<'_> {
     }
 
     fn compare_utf8(&self, field: &Field<'_>, cmp: Cmp, s: &str) -> Option<MongoFilter> {
+        // A collation can only widen `$in`, which is why equality survives one.
+        if cmp != Cmp::Eq && !self.scope.code_point_strings {
+            return None;
+        }
         let object_id = object_id(s);
         let document = match cmp {
             Cmp::Eq => {
@@ -1045,14 +1160,23 @@ impl Translator<'_> {
 
     /// A superset of the rows of a `Utf8` column not equal to any of `values`.
     fn utf8_excluding(&self, field: &Field<'_>, values: &[&str]) -> Document {
-        let mut excluded: Vec<Bson> = values.iter().map(|s| Bson::String((*s).to_string())).collect();
-        excluded.extend(values.iter().filter_map(|s| object_id(s)).map(Bson::ObjectId));
+        let mut excluded: Vec<Bson> = values
+            .iter()
+            .map(|s| Bson::String((*s).to_string()))
+            .collect();
+        excluded.extend(
+            values
+                .iter()
+                .filter_map(|s| object_id(s))
+                .map(Bson::ObjectId),
+        );
         excluded.push(Bson::Null);
         any_of(vec![
             self.at(field, doc! { "$nin": excluded }),
-            // `$nin` rules out an array holding an excluded value, which the
+            // `$nin` also rules out a symbol spelled like an excluded string,
+            // and an array holding an excluded value, each of which the
             // conversion renders as a string that equals none of them.
-            self.at(field, doc! { "$type": "array" }),
+            self.rendered(field, true),
         ])
     }
 
@@ -1060,8 +1184,16 @@ impl Translator<'_> {
         match field.kind {
             Kind::Utf8 => {
                 let strings = values.iter().map(string).collect::<Option<Vec<_>>>()?;
-                let mut matches: Vec<Bson> = strings.iter().map(|s| Bson::String((*s).to_string())).collect();
-                matches.extend(strings.iter().filter_map(|s| object_id(s)).map(Bson::ObjectId));
+                let mut matches: Vec<Bson> = strings
+                    .iter()
+                    .map(|s| Bson::String((*s).to_string()))
+                    .collect();
+                matches.extend(
+                    strings
+                        .iter()
+                        .filter_map(|s| object_id(s))
+                        .map(Bson::ObjectId),
+                );
                 Some(MongoFilter::inexact(any_of(vec![
                     self.at(field, doc! { "$in": matches }),
                     self.rendered(field, true),
@@ -1079,13 +1211,21 @@ impl Translator<'_> {
                 if members.is_empty() {
                     return Some(MongoFilter::exact(nothing()));
                 }
-                Some(MongoFilter::exact(self.scalar(field, types, doc! { "$in": members })))
+                Some(MongoFilter::exact(self.scalar(
+                    field,
+                    types,
+                    doc! { "$in": members },
+                )))
             }
             _ => self.in_list_by_comparison(field, values),
         }
     }
 
-    fn in_list_by_comparison(&self, field: &Field<'_>, values: &[ScalarValue]) -> Option<MongoFilter> {
+    fn in_list_by_comparison(
+        &self,
+        field: &Field<'_>,
+        values: &[ScalarValue],
+    ) -> Option<MongoFilter> {
         let mut filters = values.iter().map(|v| self.compare(field, Cmp::Eq, v));
         let first = filters.next()?;
         filters.fold(first, or)
@@ -1093,6 +1233,7 @@ impl Translator<'_> {
 
     fn not_in_list(&self, field: &Field<'_>, values: &[ScalarValue]) -> Option<MongoFilter> {
         match field.kind {
+            Kind::Utf8 if !self.scope.code_point_strings => None,
             Kind::Utf8 => {
                 let strings = values.iter().map(string).collect::<Option<Vec<_>>>()?;
                 Some(MongoFilter::inexact(self.utf8_excluding(field, &strings)))
@@ -1107,8 +1248,16 @@ impl Translator<'_> {
                     }
                 }
                 let mut conditions = doc! { "$nin": excluded };
-                let natural_min: i128 = if types.contains(&"long") { i64::MIN.into() } else { i32::MIN.into() };
-                let natural_max: i128 = if types.contains(&"long") { i64::MAX.into() } else { i32::MAX.into() };
+                let natural_min: i128 = if types.contains(&"long") {
+                    i64::MIN.into()
+                } else {
+                    i32::MIN.into()
+                };
+                let natural_max: i128 = if types.contains(&"long") {
+                    i64::MAX.into()
+                } else {
+                    i32::MAX.into()
+                };
                 if min > natural_min {
                     conditions.insert("$gte", integer(min));
                 }
@@ -1121,7 +1270,11 @@ impl Translator<'_> {
         }
     }
 
-    fn not_in_list_by_comparison(&self, field: &Field<'_>, values: &[ScalarValue]) -> Option<MongoFilter> {
+    fn not_in_list_by_comparison(
+        &self,
+        field: &Field<'_>,
+        values: &[ScalarValue],
+    ) -> Option<MongoFilter> {
         let mut filters = values.iter().map(|v| self.compare(field, Cmp::NotEq, v));
         let first = filters.next()?;
         filters.fold(first, and)
@@ -1147,6 +1300,41 @@ impl Translator<'_> {
             strings,
             self.rendered(&field, false),
         ])))
+    }
+}
+
+/// Whether `document` holds a string comparison that a collation other than
+/// the simple one could narrow: `$nin`, `$ne` or a range operator over a
+/// string, or an equality under a negation. Such a query has to run under the
+/// simple collation to compare strings by code point, as SQL does.
+#[must_use]
+pub fn orders_strings(document: &Document) -> bool {
+    document
+        .iter()
+        .any(|(key, value)| orders_strings_in(key, value, false))
+}
+
+fn orders_strings_in(key: &str, value: &Bson, negated: bool) -> bool {
+    let holds_string = |value: &Bson| match value {
+        Bson::String(_) | Bson::Symbol(_) => true,
+        Bson::Array(values) => values
+            .iter()
+            .any(|v| matches!(v, Bson::String(_) | Bson::Symbol(_))),
+        _ => false,
+    };
+    let negated = negated || matches!(key, "$nor" | "$not");
+    match key {
+        "$nin" | "$ne" | "$lt" | "$lte" | "$gt" | "$gte" if holds_string(value) => true,
+        "$in" | "$eq" | "$all" if negated && holds_string(value) => true,
+        _ => match value {
+            Bson::Document(inner) => inner.iter().any(|(k, v)| orders_strings_in(k, v, negated)),
+            Bson::Array(items) => items
+                .iter()
+                .any(|item| orders_strings_in(key, item, negated)),
+            // A bare string under a field name is an implicit `$eq`.
+            Bson::String(_) | Bson::Symbol(_) => negated && !key.starts_with('$'),
+            _ => false,
+        },
     }
 }
 
