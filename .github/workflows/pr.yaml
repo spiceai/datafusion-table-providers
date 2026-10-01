@@ -195,6 +195,12 @@ jobs:
           enable-cache: true
           cache-dependency-glob: 'python/pyproject.toml'
 
+      # Building datafusion-python from source (see python/pyproject.toml) needs protoc.
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install ODBC, Sqlite and Roapi
         run: |
           sudo apt-get install -y unixodbc-dev libsqliteodbc
