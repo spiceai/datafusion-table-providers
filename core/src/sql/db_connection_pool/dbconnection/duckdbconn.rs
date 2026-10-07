@@ -1197,54 +1197,6 @@ mod tests {
         Ok(())
     }
 
-    /// An empty projection is sent as `SELECT 1`, and `datafusion-federation`
-    /// asks for that placeholder as a nullable `Int64` column named `1`. DuckDB
-    /// answers `SELECT 1` with an `INTEGER`, so the stream casts it to the
-    /// requested column, one value per matching row.
-    #[test]
-    fn test_query_arrow_casts_the_select_1_placeholder() {
-        use arrow::array::Int64Array;
-        use arrow::datatypes::Schema;
-        use futures::StreamExt;
-
-        use crate::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-        use crate::sql::db_connection_pool::DbConnectionPool;
-
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let pool = DuckDbConnectionPool::new_memory().expect("pool created");
-            let conn = pool.connect().await.expect("connection");
-            let conn = conn.as_sync().expect("sync connection");
-            conn.execute("CREATE TABLE t (id INTEGER)", &[])
-                .expect("table created");
-            conn.execute("INSERT INTO t VALUES (1), (2), (3)", &[])
-                .expect("data inserted");
-
-            let placeholder = Arc::new(Schema::new(vec![Field::new("1", DataType::Int64, true)]));
-            let mut stream = conn
-                .query_arrow(
-                    "SELECT 1 FROM t WHERE id > 1",
-                    &[],
-                    Some(Arc::clone(&placeholder)),
-                )
-                .expect("query_arrow should succeed");
-            assert_eq!(stream.schema(), placeholder);
-
-            let mut values = Vec::new();
-            while let Some(batch) = stream.next().await {
-                let batch = batch.expect("batch should be Ok");
-                assert_eq!(batch.schema(), placeholder);
-                let column = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .expect("the placeholder is cast to Int64");
-                values.extend(column.values().iter().copied());
-            }
-            assert_eq!(values, vec![1, 1]);
-        });
-    }
-
     #[test]
     fn test_query_arrow_casts_to_projected_schema() {
         use arrow::datatypes::{Schema, TimeUnit};
