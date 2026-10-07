@@ -70,6 +70,11 @@ pub fn rows_to_arrow(
     num_cols: usize,
     projected_schema: Option<SchemaRef>,
 ) -> Result<RecordBatch> {
+    // The projected schema describes the statement's columns only when it has
+    // one field per column. An empty projection is sent as `SELECT 1`, whose
+    // placeholder column the projected schema does not list: decode it by
+    // SQLite's own type and let the schema cast drop it.
+    let projected_schema = projected_schema.filter(|schema| schema.fields().len() == num_cols);
     let mut arrow_fields: Vec<Field> = Vec::new();
     let mut arrow_columns_builders: Vec<Box<dyn ArrayBuilder>> = Vec::new();
     let mut arrow_types: Vec<DataType> = Vec::new();
@@ -334,6 +339,27 @@ mod tests {
 
     fn int64_schema(name: &str) -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, true)]))
+    }
+
+    /// An empty projection is sent as `SELECT 1`, whose placeholder column the
+    /// empty projected schema does not list. It decodes by SQLite's own type,
+    /// one value per row, so the schema cast can drop it and keep the rows.
+    #[test]
+    fn empty_projected_schema_decodes_the_placeholder_column() {
+        let batch = query_to_arrow(
+            "SELECT 1 FROM (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3)",
+            Some(Arc::new(Schema::empty())),
+        )
+        .expect("decoded");
+
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_columns(), 1);
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("an INTEGER placeholder decodes as Int64");
+        assert_eq!(column.values().as_ref(), &[1, 1, 1]);
     }
 
     #[test]
