@@ -1197,6 +1197,48 @@ mod tests {
         Ok(())
     }
 
+    /// An empty projection is sent as `SELECT 1`. DuckDB answers with one
+    /// placeholder column the zero-field projected schema does not list; the
+    /// stream keeps every row and yields no column.
+    #[test]
+    fn test_query_arrow_empty_projection_keeps_row_count() {
+        use arrow::datatypes::Schema;
+        use futures::StreamExt;
+
+        use crate::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+        use crate::sql::db_connection_pool::DbConnectionPool;
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let pool = DuckDbConnectionPool::new_memory().expect("pool created");
+            let conn = pool.connect().await.expect("connection");
+            let conn = conn.as_sync().expect("sync connection");
+            conn.execute("CREATE TABLE t (id INTEGER)", &[])
+                .expect("table created");
+            conn.execute("INSERT INTO t VALUES (1), (2), (3)", &[])
+                .expect("data inserted");
+
+            let projected_schema = Arc::new(Schema::empty());
+            let mut stream = conn
+                .query_arrow(
+                    "SELECT 1 FROM t WHERE id > 1",
+                    &[],
+                    Some(Arc::clone(&projected_schema)),
+                )
+                .expect("query_arrow should succeed");
+            assert_eq!(stream.schema(), projected_schema);
+
+            let mut rows = 0;
+            while let Some(batch) = stream.next().await {
+                let batch = batch.expect("batch should be Ok");
+                assert_eq!(batch.schema(), projected_schema);
+                assert_eq!(batch.num_columns(), 0);
+                rows += batch.num_rows();
+            }
+            assert_eq!(rows, 2);
+        });
+    }
+
     #[test]
     fn test_query_arrow_casts_to_projected_schema() {
         use arrow::datatypes::{Schema, TimeUnit};
