@@ -96,6 +96,13 @@ impl<T, P> SQLExecutor for SqlTable<T, P> {
         })
     }
 
+    /// Uses the same switch as the scan's own sort pushdown
+    /// ([`SqlTable::with_allow_physical_sort_pushdown`]): an engine that orders
+    /// rows as `DataFusion` would for one does so for the other.
+    fn supports_sort_pushdown(&self) -> bool {
+        self.allow_physical_sort_pushdown
+    }
+
     fn execute(
         &self,
         query: &str,
@@ -239,5 +246,16 @@ mod tests {
         let plan = filter_plan(col("val").like(lit("u%")));
 
         assert!(SQLExecutor::can_execute_plan(&test_table(), &plan));
+    }
+
+    /// A federated scan takes a sort exactly when the table's own scan does: an
+    /// engine whose `ORDER BY` the table keeps away from its scan (`ScyllaDB`
+    /// turns the switch off) must not receive one through federation either.
+    #[test]
+    fn federated_sort_pushdown_follows_the_scans_switch() {
+        assert!(SQLExecutor::supports_sort_pushdown(&test_table()));
+        assert!(!SQLExecutor::supports_sort_pushdown(
+            &test_table().with_allow_physical_sort_pushdown(false)
+        ));
     }
 }
