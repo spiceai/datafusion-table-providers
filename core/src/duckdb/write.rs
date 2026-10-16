@@ -2001,6 +2001,13 @@ mod test {
                 col("ts_ns").eq(nanos_lit(MIDNIGHT_NANOS + 999_123)),
                 vec![1, 3],
             ),
+            // ts_us holds `.000999`, which is not `.000999123`: nothing is deleted.
+            (
+                col("ts_us").eq(nanos_lit(MIDNIGHT_NANOS + 999_123)),
+                vec![1, 2, 3],
+            ),
+            // A bound in 2300 is past the nanosecond range and still names every row.
+            (col("ts_ns").lt(micros(10_413_792_000_000_000)), vec![]),
         ];
 
         for (filter, remaining) in cases {
