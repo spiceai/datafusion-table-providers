@@ -231,7 +231,9 @@ fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> 
                             let right_nanos =
                                 match duckdb_timestamp_literal_nanos(&binary_expr.right) {
                                     Some(nanos) => nanos?.to_string(),
-                                    None => format!("epoch_ns({right})"),
+                                    // A `TIMESTAMPTZ` holds microseconds and reaches years
+                                    // `epoch_ns` cannot, so it is scaled in a `HUGEINT`.
+                                    None => format!("(epoch_us({right})::HUGEINT * 1000)"),
                                 };
                             return Ok(format!("epoch_ns({left}) {op} {right_nanos}"));
                         }
@@ -613,7 +615,8 @@ enum DuckDBTimestampNormalization {
 ///   extension, which the bundled build links statically.
 /// - A naive `TIMESTAMP_NS` holds digits no `TIMESTAMPTZ` can, so a comparison is made on
 ///   `epoch_ns(<operand>)` against the other side's instant in nanoseconds: the literal's own count
-///   when it is a timestamp literal, `epoch_ns(<other side>)` otherwise. A subtraction yields an
+///   when it is a timestamp literal, and otherwise the other side's microseconds scaled in a
+///   `HUGEINT`, since `epoch_ns` of a `TIMESTAMPTZ` outside 1677–2262 is an error. A subtraction yields an
 ///   `INTERVAL`, which holds microseconds, so it takes the `AT TIME ZONE` rendering instead.
 /// - A naive `TIMESTAMP_S` or `TIMESTAMP_MS` carries nothing below the millisecond, so
 ///   `TO_TIMESTAMP(EPOCH_MS(<operand>) / 1000)` loses nothing and is kept.
@@ -1905,7 +1908,7 @@ mod tests {
         .expect("to unparse");
         assert_eq!(
             compared,
-            "epoch_ns(\"ts\") > epoch_ns(TO_TIMESTAMP(EPOCH(CAST('2026-01-01 00:00:00' AS TIMESTAMP))))"
+            "epoch_ns(\"ts\") > (epoch_us(TO_TIMESTAMP(EPOCH(CAST('2026-01-01 00:00:00' AS TIMESTAMP))))::HUGEINT * 1000)"
         );
 
         let subtracted = to_sql_with_engine_and_schema(
@@ -2798,6 +2801,65 @@ mod duckdb_naive_timestamp_execution_tests {
                     rows_selected_by(&filter, unit, timezone),
                     labels(&["b_999us", "c_999us_123ns", "d_2ms"]),
                     "{unit:?} under TimeZone={timezone}"
+                );
+            }
+        }
+    }
+
+    /// A bound outside the range a nanosecond count holds still compares, rather than failing the
+    /// statement: `epoch_ns` of a `TIMESTAMPTZ` in 2300 is a DuckDB conversion error.
+    #[test]
+    fn a_naive_nanosecond_column_compares_against_a_bound_past_2262() {
+        let far = Expr::Cast(Cast::new(
+            Box::new(lit("2300-01-01 00:00:00")),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ));
+
+        for timezone in TIMEZONES {
+            assert_eq!(
+                rows_selected_by(&col("ts").lt(far.clone()), TimeUnit::Nanosecond, timezone),
+                labels(&["a_midnight", "b_999us", "c_999us_123ns", "d_2ms"]),
+                "under TimeZone={timezone}"
+            );
+        }
+    }
+
+    /// A subtraction is pinned to UTC and yields the interval the column is past the bound,
+    /// whatever the session's `TimeZone`.
+    #[test]
+    fn a_naive_column_subtracts_in_utc() {
+        for unit in [TimeUnit::Microsecond, TimeUnit::Nanosecond] {
+            let schema = schema_with_ts(DataType::Timestamp(unit, None));
+            // An interval literal has no rendering of its own, so the subtraction is checked by
+            // evaluating its rendered SQL directly.
+            let difference = to_sql_with_engine_and_schema(
+                &(col("ts") - micros_literal(MIDNIGHT_NANOS / 1_000)),
+                Some(Engine::DuckDB),
+                Some(&schema),
+            )
+            .expect("to unparse");
+
+            for timezone in TIMEZONES {
+                let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+                let column_type = if unit == TimeUnit::Nanosecond {
+                    "TIMESTAMP_NS"
+                } else {
+                    "TIMESTAMP"
+                };
+                conn.execute_batch(&format!(
+                    "SET TimeZone='{timezone}'; CREATE TABLE t AS SELECT CAST('2026-01-01 00:00:00.000999' AS {column_type}) ts"
+                ))
+                .expect("create");
+                let micros: i64 = conn
+                    .query_row(
+                        &format!("SELECT epoch_us(TIMESTAMP '1970-01-01' + ({difference})) FROM t"),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("query");
+                assert_eq!(
+                    micros, 999,
+                    "{unit:?} under TimeZone={timezone}: {difference}"
                 );
             }
         }

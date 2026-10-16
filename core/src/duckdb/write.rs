@@ -2036,8 +2036,8 @@ mod test {
 
             assert_eq!(ids, remaining, "rows left by DELETE WHERE {filter}");
             assert_eq!(
-                count,
-                (3 - remaining.len()) as u64,
+                usize::try_from(count).expect("count fits usize"),
+                3 - remaining.len(),
                 "count for DELETE WHERE {filter}"
             );
         }
