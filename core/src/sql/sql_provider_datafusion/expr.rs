@@ -218,14 +218,18 @@ fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> 
                                 "TO_TIMESTAMP(EPOCH_MS({left}) / 1000) {op} {grouped_right}"
                             ));
                         }
-                        DuckDBTimestampNormalization::AtTimeZoneUtc => {
-                            return Ok(format!("({left} AT TIME ZONE 'UTC') {op} {grouped_right}"));
+                        DuckDBTimestampNormalization::EpochMicros => {
+                            return Ok(format!(
+                                "make_timestamptz(epoch_us({left})) {op} {grouped_right}"
+                            ));
                         }
-                        // A `TIMESTAMPTZ` holds microseconds, so the subtraction (whose result
-                        // is an `INTERVAL`, which holds microseconds too) cannot keep the
-                        // nanoseconds either way; pinning the frame is all it needs.
+                        // A subtraction yields an `INTERVAL`, which holds microseconds, so it
+                        // cannot keep the nanoseconds either way; pinning the frame is all it
+                        // needs.
                         DuckDBTimestampNormalization::EpochNanos if op == Operator::Minus => {
-                            return Ok(format!("({left} AT TIME ZONE 'UTC') {op} {grouped_right}"));
+                            return Ok(format!(
+                                "make_timestamptz(epoch_us({left})) {op} {grouped_right}"
+                            ));
                         }
                         DuckDBTimestampNormalization::EpochNanos => {
                             let right_nanos =
@@ -593,8 +597,8 @@ enum DuckDBTimestampNormalization {
     None,
     /// `TO_TIMESTAMP(EPOCH_MS(<operand>) / 1000)`.
     EpochMillis,
-    /// `(<operand> AT TIME ZONE 'UTC')`.
-    AtTimeZoneUtc,
+    /// `make_timestamptz(epoch_us(<operand>))`.
+    EpochMicros,
     /// `epoch_ns(<operand>)`, compared with the other side's instant in nanoseconds.
     EpochNanos,
 }
@@ -610,14 +614,15 @@ enum DuckDBTimestampNormalization {
 /// `TIMESTAMP_S` and type `TIMESTAMP WITH TIME ZONE`"* — and a microsecond `TIMESTAMP`, which does
 /// compare, would be read in the session's `TimeZone` where the rendered literal is a UTC instant.
 ///
-/// - A naive `TIMESTAMP` (microseconds) renders as `<operand> AT TIME ZONE 'UTC'`, which pins UTC
-///   exactly and whatever the session's `TimeZone` is. `AT TIME ZONE` comes from DuckDB's ICU
-///   extension, which the bundled build links statically.
+/// - A naive `TIMESTAMP` (microseconds) renders as `make_timestamptz(epoch_us(<operand>))`: the
+///   column's own microsecond count read as a UTC instant, exact and independent of the session.
+///   `<operand> AT TIME ZONE 'UTC'` is exact too, but it converts through the session's
+///   `Calendar` — under `Calendar='islamic'` a 2026 row compares above 2027.
 /// - A naive `TIMESTAMP_NS` holds digits no `TIMESTAMPTZ` can, so a comparison is made on
 ///   `epoch_ns(<operand>)` against the other side's instant in nanoseconds: the literal's own count
 ///   when it is a timestamp literal, and otherwise the other side's microseconds scaled in a
 ///   `HUGEINT`, since `epoch_ns` of a `TIMESTAMPTZ` outside 1677–2262 is an error. A subtraction yields an
-///   `INTERVAL`, which holds microseconds, so it takes the `AT TIME ZONE` rendering instead.
+///   `INTERVAL`, which holds microseconds, so it takes the microsecond rendering instead.
 /// - A naive `TIMESTAMP_S` or `TIMESTAMP_MS` carries nothing below the millisecond, so
 ///   `TO_TIMESTAMP(EPOCH_MS(<operand>) / 1000)` loses nothing and is kept.
 ///
@@ -661,7 +666,7 @@ fn duckdb_timestamp_normalization(
 
     match field.data_type() {
         DataType::Timestamp(TimeUnit::Microsecond, None) => {
-            DuckDBTimestampNormalization::AtTimeZoneUtc
+            DuckDBTimestampNormalization::EpochMicros
         }
         DataType::Timestamp(TimeUnit::Nanosecond, None) => DuckDBTimestampNormalization::EpochNanos,
         DataType::Timestamp(TimeUnit::Second | TimeUnit::Millisecond, None)
@@ -1870,7 +1875,7 @@ mod tests {
             ),
             (
                 TimeUnit::Microsecond,
-                "(\"ts\" AT TIME ZONE 'UTC') < make_timestamptz(1767225600000000)",
+                "make_timestamptz(epoch_us(\"ts\")) < make_timestamptz(1767225600000000)",
             ),
             (
                 TimeUnit::Nanosecond,
@@ -1919,7 +1924,7 @@ mod tests {
         .expect("to unparse");
         assert_eq!(
             subtracted,
-            "(\"ts\" AT TIME ZONE 'UTC') - make_timestamptz(1767225600000000)"
+            "make_timestamptz(epoch_us(\"ts\")) - make_timestamptz(1767225600000000)"
         );
     }
 
@@ -2861,6 +2866,47 @@ mod duckdb_naive_timestamp_execution_tests {
                     micros, 999,
                     "{unit:?} under TimeZone={timezone}: {difference}"
                 );
+            }
+        }
+    }
+
+    /// The column is read as a UTC instant without converting through the session's calendar:
+    /// under `Calendar='islamic'`, `AT TIME ZONE 'UTC'` reads a 2026 wall clock centuries later.
+    #[test]
+    fn a_naive_column_does_not_depend_on_the_session_calendar() {
+        for (unit, column_type) in [
+            (TimeUnit::Microsecond, "TIMESTAMP"),
+            (TimeUnit::Nanosecond, "TIMESTAMP_NS"),
+        ] {
+            let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+            conn.execute_batch(&format!(
+                "SET Calendar='islamic'; SET TimeZone='America/New_York'; \
+                 CREATE TABLE t AS SELECT CAST('2026-01-01 00:00:00.000999' AS {column_type}) ts"
+            ))
+            .expect("create");
+            let schema = schema_with_ts(DataType::Timestamp(unit, None));
+            // 2027-01-01 00:00:00 UTC.
+            let after = micros_literal(1_798_761_600_000_000);
+
+            for (filter, expected) in [
+                (col("ts").gt(after.clone()), 0_i64),
+                (col("ts").lt(after.clone()), 1),
+                (
+                    col("ts").eq(micros_literal(MIDNIGHT_NANOS / 1_000 + 999)),
+                    1,
+                ),
+            ] {
+                let where_clause =
+                    to_sql_with_engine_and_schema(&filter, Some(Engine::DuckDB), Some(&schema))
+                        .expect("to unparse");
+                let count: i64 = conn
+                    .query_row(
+                        &format!("SELECT count(*) FROM t WHERE {where_clause}"),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("query");
+                assert_eq!(count, expected, "{unit:?}: {where_clause}");
             }
         }
     }
