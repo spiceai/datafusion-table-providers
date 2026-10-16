@@ -143,8 +143,8 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
 
 /// [`to_sql_with_engine`], given the schema the expression's columns belong to.
 ///
-/// Only [`Engine::DuckDB`] consults the schema, and only to decide whether a comparison's operand
-/// needs the timestamp normalization described on [`duckdb_normalizes_timestamp_operand`]. Passing
+/// Only [`Engine::DuckDB`] consults the schema, and only to decide how a comparison's operand
+/// takes the timestamp normalization described on [`duckdb_timestamp_normalization`]. Passing
 /// `None` — or a schema that does not carry the column — renders exactly what
 /// [`to_sql_with_engine`] renders, so a caller with no schema to offer loses nothing.
 pub fn to_sql_with_engine_and_schema(
@@ -207,15 +207,47 @@ fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> 
                 if normalizes_timestamp_operands
                     && is_duckdb_timestamp_operand(&binary_expr.right)
                     && !is_duckdb_timestamp_operand(&binary_expr.left)
-                    && duckdb_normalizes_timestamp_operand(&binary_expr.left, schema)
                 {
-                    // `EPOCH_MS(..)` parenthesizes the left operand on its own.
-                    return Ok(format!(
-                        "TO_TIMESTAMP(EPOCH_MS({}) / 1000) {} {}",
-                        left,
-                        binary_expr.op,
-                        group_if_binary(&binary_expr.right, &right)
-                    ));
+                    let op = binary_expr.op;
+                    let grouped_right = group_if_binary(&binary_expr.right, &right);
+                    let literal_nanos = duckdb_timestamp_literal_nanos(&binary_expr.right);
+                    match (
+                        duckdb_timestamp_normalization(&binary_expr.left, schema),
+                        literal_nanos,
+                    ) {
+                        (DuckDBTimestampNormalization::None, _) => {}
+                        // A subtraction yields an `INTERVAL`, which holds microseconds, so it
+                        // cannot keep a nanosecond either way; pinning the frame is all it needs.
+                        (
+                            DuckDBTimestampNormalization::EpochMicros
+                            | DuckDBTimestampNormalization::EpochNanos,
+                            Some(_),
+                        ) if op == Operator::Minus => {
+                            return Ok(format!(
+                                "make_timestamptz(epoch_us({left})) {op} {grouped_right}"
+                            ));
+                        }
+                        // The literal is compared at its own precision, which can be finer than
+                        // the column's, and over a range wider than a nanosecond `BIGINT`.
+                        (DuckDBTimestampNormalization::EpochMicros, Some(nanos)) => {
+                            return Ok(format!("(epoch_us({left})::HUGEINT * 1000) {op} {nanos}"));
+                        }
+                        (DuckDBTimestampNormalization::EpochNanos, Some(nanos)) => {
+                            return Ok(format!("epoch_ns({left}) {op} {nanos}"));
+                        }
+                        // A microsecond or nanosecond column compared with a bound that is not a
+                        // literal lands here too: such a bound is rendered at a precision of its
+                        // own (`handle_cast` reads a cast through `EPOCH`), so reading the column
+                        // exactly against it would trade one wrong answer for another
+                        // (https://github.com/spiceai/spiceai/issues/15222).
+                        //
+                        // `EPOCH_MS(..)` parenthesizes the left operand on its own.
+                        _ => {
+                            return Ok(format!(
+                                "TO_TIMESTAMP(EPOCH_MS({left}) / 1000) {op} {grouped_right}"
+                            ));
+                        }
+                    }
                 }
             }
 
@@ -481,7 +513,7 @@ fn group_if_binary(expr: &Expr, rendered: &str) -> String {
 ///
 /// A bare [`Expr::Column`] is *not* treated as a timestamp here, so a comparison between two
 /// timestamp columns is left un-normalized and DuckDB refuses it. Resolving the operand's type
-/// against a schema — which [`duckdb_normalizes_timestamp_operand`] now does for the other side of
+/// against a schema — which [`duckdb_timestamp_normalization`] now does for the other side of
 /// the comparison — would settle that case too, but it would extend the rewrite to expressions it
 /// has never covered rather than narrow it: <https://github.com/spiceai/spiceai/issues/13145>.
 fn is_duckdb_timestamp_operand(expr: &Expr) -> bool {
@@ -563,23 +595,50 @@ fn duckdb_timestamp_literal(value: i64, unit: TimeUnit, expr: &Expr) -> Result<S
     Ok(format!("make_timestamptz({micros})"))
 }
 
-/// Whether the DuckDB timestamp normalization has to be applied to `expr`, given the schema its
-/// columns come from.
+/// How [`render_expr`] renders the left operand of a comparison with a `TIMESTAMPTZ` under
+/// [`Engine::DuckDB`] — see [`duckdb_timestamp_normalization`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DuckDBTimestampNormalization {
+    /// Rendered as it stands.
+    None,
+    /// `TO_TIMESTAMP(EPOCH_MS(<operand>) / 1000)`.
+    EpochMillis,
+    /// The operand's `epoch_us` count.
+    EpochMicros,
+    /// The operand's `epoch_ns` count.
+    EpochNanos,
+}
+
+/// How the DuckDB timestamp normalization renders `expr`, given the schema its columns come from.
 ///
-/// The normalization renders its operand as `TO_TIMESTAMP(EPOCH_MS(<operand>) / 1000)`, which makes
-/// DuckDB read it as a `TIMESTAMPTZ` fixed to UTC. Whether the operand carries a timezone is what
-/// decides it; the unit does not.
+/// The normalization makes DuckDB read the operand as an instant in UTC, so it compares with the
+/// `TIMESTAMPTZ` the other side renders as. Whether the operand carries a timezone decides whether
+/// it is needed; the unit decides which rendering keeps every digit the operand holds.
 ///
-/// A **naive** timestamp needs it, at every unit. DuckDB v1.5.5 refuses to compare `TIMESTAMP_S`,
+/// A **naive** timestamp needs it, at every unit. DuckDB refuses to compare `TIMESTAMP_S`,
 /// `TIMESTAMP_MS` or `TIMESTAMP_NS` with a `TIMESTAMPTZ` at all — *"Cannot compare values of type
 /// `TIMESTAMP_S` and type `TIMESTAMP WITH TIME ZONE`"* — and a microsecond `TIMESTAMP`, which does
 /// compare, would be read in the session's `TimeZone` where the rendered literal is a UTC instant.
 ///
-/// It is not free for all of them: `EPOCH_MS` yields whole milliseconds, so a naive `TIMESTAMP` or
-/// `TIMESTAMP_NS` is still truncated to the millisecond by the very rewrite that makes it compare
-/// in the right frame. `TIMESTAMP_S` and `TIMESTAMP_MS` carry nothing finer and lose nothing. The
-/// remaining truncation is <https://github.com/spiceai/spiceai/issues/13146>; pinning UTC losslessly
-/// needs `AT TIME ZONE`, which is an ICU-extension dependency this rendering does not take.
+/// - A naive `TIMESTAMP` or `TIMESTAMP_NS` compared with a timestamp or date **literal** is read
+///   through its own integer count — `epoch_us` or `epoch_ns` — and compared in nanoseconds, in a
+///   `HUGEINT`, with the literal's own count. That involves neither the session's `TimeZone` nor
+///   its `Calendar` (`<operand> AT TIME ZONE 'UTC'` is exact too, but it converts through the
+///   `Calendar`: under `Calendar='islamic'` a 2026 row compares above 2027), a literal finer than
+///   the column is not truncated to the column's unit, and a coarse literal outside 1677–2262 does
+///   not overflow. A subtraction yields an `INTERVAL`, which holds microseconds, so it renders the
+///   column as `make_timestamptz(epoch_us(<operand>))`.
+/// - Compared with any other bound, a naive `TIMESTAMP` or `TIMESTAMP_NS` keeps the `EPOCH_MS`
+///   rendering below. Such a bound is rendered at a precision of its own — `handle_cast` reads a
+///   cast through `EPOCH` — so reading the column exactly against it trades one wrong answer for
+///   another rather than fixing it.
+/// - A naive `TIMESTAMP_S` or `TIMESTAMP_MS` carries nothing below the millisecond, so
+///   `TO_TIMESTAMP(EPOCH_MS(<operand>) / 1000)` loses nothing and is kept.
+///
+/// `EPOCH_MS` yields whole milliseconds, so rendering a microsecond or nanosecond column through it
+/// read `.000999` as `.000` — a comparison inside that millisecond selected the wrong rows, and a
+/// `DELETE` built from one removed rows its predicate excluded
+/// (<https://github.com/spiceai/spiceai/issues/13146>).
 ///
 /// A **date** needs it for the reference frame alone. DuckDB promotes a bare `DATE` to a
 /// `TIMESTAMPTZ` at midnight in the *session's* `TimeZone`, while `EPOCH_MS` pins the same midnight
@@ -598,23 +657,55 @@ fn duckdb_timestamp_literal(value: i64, unit: TimeUnit, expr: &Expr) -> Result<S
 /// names the types that could not be compared.
 ///
 /// A column the schema does not carry, a non-`Column` operand, or no schema at all leaves the
-/// decision where it was — normalize — because that is what makes the types the rewrite exists for
-/// bind. Only a *resolved* type declines it.
-fn duckdb_normalizes_timestamp_operand(expr: &Expr, schema: Option<&Schema>) -> bool {
+/// decision where it was — `EPOCH_MS` — because that is the one rendering that binds for every type
+/// the operand could have. Only a *resolved* type chooses another.
+fn duckdb_timestamp_normalization(
+    expr: &Expr,
+    schema: Option<&Schema>,
+) -> DuckDBTimestampNormalization {
     let (Expr::Column(column), Some(schema)) = (expr, schema) else {
-        return true;
+        return DuckDBTimestampNormalization::EpochMillis;
     };
     // `column_with_name` rather than `field_with_name`: the latter builds a `Vec` of every field
     // name and formats it into an error string that this discards, and a caller passing a schema
     // without the column is a supported path rather than an accident.
     let Some((_, field)) = schema.column_with_name(&column.name) else {
-        return true;
+        return DuckDBTimestampNormalization::EpochMillis;
     };
 
-    matches!(
-        field.data_type(),
-        DataType::Timestamp(_, None) | DataType::Date32 | DataType::Date64
-    )
+    match field.data_type() {
+        DataType::Timestamp(TimeUnit::Microsecond, None) => {
+            DuckDBTimestampNormalization::EpochMicros
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => DuckDBTimestampNormalization::EpochNanos,
+        DataType::Timestamp(TimeUnit::Second | TimeUnit::Millisecond, None)
+        | DataType::Date32
+        | DataType::Date64 => DuckDBTimestampNormalization::EpochMillis,
+        _ => DuckDBTimestampNormalization::None,
+    }
+}
+
+/// The instant a timestamp or date literal names, in nanoseconds since the epoch, or `None` when
+/// `expr` is not one. It is an `i128` so that every count a coarser unit holds scales without
+/// overflow; DuckDB reads an integer literal past `BIGINT` as a `HUGEINT`. A `Date64` is read in
+/// whole seconds, as its `TO_TIMESTAMP` rendering reads it.
+fn duckdb_timestamp_literal_nanos(expr: &Expr) -> Option<i128> {
+    let Expr::Literal(value, _) = expr else {
+        return None;
+    };
+    match value {
+        ScalarValue::TimestampNanosecond(Some(value), _) => Some(i128::from(*value)),
+        ScalarValue::TimestampMicrosecond(Some(value), _) => Some(i128::from(*value) * 1_000),
+        ScalarValue::TimestampMillisecond(Some(value), _) => Some(i128::from(*value) * 1_000_000),
+        ScalarValue::TimestampSecond(Some(value), _) => Some(i128::from(*value) * 1_000_000_000),
+        ScalarValue::Date32(Some(days)) => {
+            Some(i128::from(*days) * i128::from(SECONDS_IN_DAY) * 1_000_000_000)
+        }
+        ScalarValue::Date64(Some(millis)) => {
+            Some(i128::from(millis.div_euclid(1_000)) * 1_000_000_000)
+        }
+        _ => None,
+    }
 }
 
 fn handle_cast(
@@ -1780,16 +1871,29 @@ mod tests {
 
     /// The types the normalization exists for keep it. `TIMESTAMP_S`, `TIMESTAMP_MS` and
     /// `TIMESTAMP_NS` cannot be compared with a `TIMESTAMPTZ` at all, and a naive `TIMESTAMP`
-    /// would be compared in the session's `TimeZone` instead of in UTC.
+    /// would be compared in the session's `TimeZone` instead of in UTC. Each unit takes the
+    /// rendering that keeps every digit it holds.
     #[test]
     fn test_duckdb_still_normalizes_a_naive_timestamp_column() {
         let expr = col("ts").lt(ts_lit());
 
-        for unit in [
-            TimeUnit::Second,
-            TimeUnit::Millisecond,
-            TimeUnit::Microsecond,
-            TimeUnit::Nanosecond,
+        for (unit, expected) in [
+            (
+                TimeUnit::Second,
+                "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < make_timestamptz(1767225600000000)",
+            ),
+            (
+                TimeUnit::Millisecond,
+                "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < make_timestamptz(1767225600000000)",
+            ),
+            (
+                TimeUnit::Microsecond,
+                "(epoch_us(\"ts\")::HUGEINT * 1000) < 1767225600000000000",
+            ),
+            (
+                TimeUnit::Nanosecond,
+                "epoch_ns(\"ts\") < 1767225600000000000",
+            ),
         ] {
             let schema = schema_with_ts(DataType::Timestamp(unit, None));
 
@@ -1797,10 +1901,78 @@ mod tests {
                 .expect("to unparse");
 
             assert_eq!(
-                sql, "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) < make_timestamptz(1767225600000000)",
+                sql, expected,
                 "a naive timestamp column ({unit:?}) must still be normalized"
             );
         }
+    }
+
+    /// A naive microsecond or nanosecond column compared with a bound that is not a literal keeps
+    /// the `EPOCH_MS` rendering, byte for byte; a subtraction from a literal only pins the frame,
+    /// since its `INTERVAL` result holds microseconds.
+    #[test]
+    fn test_duckdb_keeps_epoch_ms_for_a_naive_column_against_a_non_literal() {
+        for unit in [TimeUnit::Microsecond, TimeUnit::Nanosecond] {
+            let schema = schema_with_ts(DataType::Timestamp(unit, None));
+            let cast = Expr::Cast(Cast::new(
+                Box::new(datafusion::prelude::lit("2026-01-01 00:00:00")),
+                DataType::Timestamp(unit, None),
+            ));
+
+            let compared = to_sql_with_engine_and_schema(
+                &col("ts").gt(cast),
+                Some(Engine::DuckDB),
+                Some(&schema),
+            )
+            .expect("to unparse");
+            assert_eq!(
+                compared,
+                "TO_TIMESTAMP(EPOCH_MS(\"ts\") / 1000) > TO_TIMESTAMP(EPOCH(CAST('2026-01-01 00:00:00' AS TIMESTAMP)))",
+                "{unit:?}"
+            );
+        }
+
+        let schema = schema_with_ts(DataType::Timestamp(TimeUnit::Nanosecond, None));
+
+        let subtracted = to_sql_with_engine_and_schema(
+            &(col("ts") - ts_lit()),
+            Some(Engine::DuckDB),
+            Some(&schema),
+        )
+        .expect("to unparse");
+        assert_eq!(
+            subtracted,
+            "make_timestamptz(epoch_us(\"ts\")) - make_timestamptz(1767225600000000)"
+        );
+    }
+
+    /// A coarser literal compared with a naive nanosecond column is scaled up exactly, including
+    /// one whose count does not fit in a nanosecond `BIGINT`.
+    #[test]
+    fn test_duckdb_scales_a_coarser_literal_to_nanoseconds() {
+        let schema = schema_with_ts(DataType::Timestamp(TimeUnit::Nanosecond, None));
+        let seconds = |value| Expr::Literal(ScalarValue::TimestampSecond(Some(value), None), None);
+
+        let sql = to_sql_with_engine_and_schema(
+            &col("ts").eq(seconds(1_767_225_600)),
+            Some(Engine::DuckDB),
+            Some(&schema),
+        )
+        .expect("to unparse");
+        assert_eq!(sql, "epoch_ns(\"ts\") = 1767225600000000000");
+
+        // 2300-01-01 is past the last instant a nanosecond `BIGINT` holds; its count is rendered
+        // whole, as DuckDB's `HUGEINT`, rather than overflowing.
+        let far = to_sql_with_engine_and_schema(
+            &col("ts").lt(Expr::Literal(
+                ScalarValue::TimestampMicrosecond(Some(10_413_792_000_000_000), None),
+                None,
+            )),
+            Some(Engine::DuckDB),
+            Some(&schema),
+        )
+        .expect("to unparse");
+        assert_eq!(far, "epoch_ns(\"ts\") < 10413792000000000000");
     }
 
     /// A `Date32`/`Date64` column keeps the normalization too, and for the reference frame rather
@@ -2452,6 +2624,349 @@ mod duckdb_date_execution_tests {
                     rows_selected_by(&filter, DataType::Date64, session_timezone),
                     vec![label.to_string()],
                     "Date64({millis}) under TimeZone {session_timezone}"
+                );
+            }
+        }
+    }
+}
+
+/// A naive timestamp column has to be pinned to UTC before DuckDB compares it with the
+/// `TIMESTAMPTZ` a literal renders as, and the pinning must keep every digit the column holds.
+/// These run the comparison DuckDB actually evaluates against a naive `TIMESTAMP` and a
+/// `TIMESTAMP_NS` column, under several session time zones, and assert on which rows survive it:
+/// a rendering that truncates the column to the millisecond is well-formed SQL that selects the
+/// wrong rows (<https://github.com/spiceai/spiceai/issues/13146>).
+#[cfg(all(test, feature = "duckdb"))]
+mod duckdb_naive_timestamp_execution_tests {
+    use super::tests::schema_with_ts;
+    use super::*;
+    use datafusion::prelude::*;
+    use duckdb::Connection;
+
+    /// `2026-01-01 00:00:00` UTC, in nanoseconds.
+    const MIDNIGHT_NANOS: i64 = 1_767_225_600_000_000_000;
+
+    /// The rows sit inside one millisecond, and two of them inside one microsecond, so a rendering
+    /// that drops the column's digits below either unit cannot tell them apart. They are inserted
+    /// from their text form, a route the rendering under test does not use.
+    const ROWS: [(&str, &str); 4] = [
+        ("a_midnight", "2026-01-01 00:00:00"),
+        ("b_999us", "2026-01-01 00:00:00.000999"),
+        ("c_999us_123ns", "2026-01-01 00:00:00.000999123"),
+        ("d_2ms", "2026-01-01 00:00:00.002"),
+    ];
+
+    const TIMEZONES: [&str; 3] = ["UTC", "America/New_York", "Asia/Kolkata"];
+
+    /// Runs `filter` against a naive column of `unit` as DuckDB would receive it and returns the
+    /// labels of the rows it keeps.
+    fn rows_selected_by(filter: &Expr, unit: TimeUnit, session_timezone: &str) -> Vec<String> {
+        let column_type = match unit {
+            TimeUnit::Microsecond => "TIMESTAMP",
+            TimeUnit::Nanosecond => "TIMESTAMP_NS",
+            other => panic!("no fixture for {other:?}"),
+        };
+        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+        conn.execute_batch(&format!(
+            "SET TimeZone='{session_timezone}'; CREATE TABLE t (label VARCHAR, ts {column_type})"
+        ))
+        .expect("create");
+        for (label, wall_clock) in ROWS {
+            conn.execute_batch(&format!(
+                "INSERT INTO t VALUES ('{label}', CAST('{wall_clock}' AS {column_type}))"
+            ))
+            .expect("insert");
+        }
+
+        let schema = schema_with_ts(DataType::Timestamp(unit, None));
+        let where_clause =
+            to_sql_with_engine_and_schema(filter, Some(Engine::DuckDB), Some(&schema))
+                .expect("to unparse");
+
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT label FROM t WHERE {where_clause} ORDER BY label"
+            ))
+            .expect("prepare");
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("rows")
+    }
+
+    fn micros_literal(micros: i64) -> Expr {
+        Expr::Literal(ScalarValue::TimestampMicrosecond(Some(micros), None), None)
+    }
+
+    fn nanos_literal(nanos: i64) -> Expr {
+        Expr::Literal(ScalarValue::TimestampNanosecond(Some(nanos), None), None)
+    }
+
+    fn labels(expected: &[&str]) -> Vec<String> {
+        expected.iter().map(ToString::to_string).collect()
+    }
+
+    /// A bound half a millisecond past midnight keeps the row at `.000999` above it. Truncated to
+    /// the millisecond, that row reads as midnight and falls below the bound — which is how a
+    /// `DELETE` with this predicate removed a row it did not name.
+    #[test]
+    fn a_naive_microsecond_column_keeps_its_sub_millisecond_digits() {
+        let bound = micros_literal(MIDNIGHT_NANOS / 1_000 + 500);
+
+        for timezone in TIMEZONES {
+            assert_eq!(
+                rows_selected_by(
+                    &col("ts").lt(bound.clone()),
+                    TimeUnit::Microsecond,
+                    timezone
+                ),
+                labels(&["a_midnight"]),
+                "ts < .000500 under TimeZone={timezone}"
+            );
+            assert_eq!(
+                rows_selected_by(
+                    &col("ts").gt(bound.clone()),
+                    TimeUnit::Microsecond,
+                    timezone
+                ),
+                // `c_999us_123ns` is stored at microsecond precision by a `TIMESTAMP` column.
+                labels(&["b_999us", "c_999us_123ns", "d_2ms"]),
+                "ts > .000500 under TimeZone={timezone}"
+            );
+        }
+    }
+
+    /// Equality has to find the exact microsecond, and only it.
+    #[test]
+    fn a_naive_microsecond_column_matches_the_microsecond_it_holds() {
+        let filter = col("ts").eq(micros_literal(MIDNIGHT_NANOS / 1_000 + 999));
+
+        for timezone in TIMEZONES {
+            assert_eq!(
+                rows_selected_by(&filter, TimeUnit::Microsecond, timezone),
+                labels(&["b_999us", "c_999us_123ns"]),
+                "under TimeZone={timezone}"
+            );
+        }
+    }
+
+    /// A nanosecond column keeps its nanoseconds too: a bound one nanosecond either side of
+    /// `.000999123` splits it from `.000999000`, which sits in the same microsecond.
+    #[test]
+    fn a_naive_nanosecond_column_keeps_its_sub_microsecond_digits() {
+        let row = MIDNIGHT_NANOS + 999_123;
+
+        for timezone in TIMEZONES {
+            assert_eq!(
+                rows_selected_by(
+                    &col("ts").gt(nanos_literal(row - 1)),
+                    TimeUnit::Nanosecond,
+                    timezone
+                ),
+                labels(&["c_999us_123ns", "d_2ms"]),
+                "ts > .000999122 under TimeZone={timezone}"
+            );
+            assert_eq!(
+                rows_selected_by(
+                    &col("ts").lt(nanos_literal(row + 1)),
+                    TimeUnit::Nanosecond,
+                    timezone
+                ),
+                labels(&["a_midnight", "b_999us", "c_999us_123ns"]),
+                "ts < .000999124 under TimeZone={timezone}"
+            );
+            assert_eq!(
+                rows_selected_by(
+                    &col("ts").eq(nanos_literal(row)),
+                    TimeUnit::Nanosecond,
+                    timezone
+                ),
+                labels(&["c_999us_123ns"]),
+                "ts = .000999123 under TimeZone={timezone}"
+            );
+            assert_eq!(
+                rows_selected_by(
+                    &col("ts").not_eq(nanos_literal(MIDNIGHT_NANOS + 999_000)),
+                    TimeUnit::Nanosecond,
+                    timezone
+                ),
+                labels(&["a_midnight", "c_999us_123ns", "d_2ms"]),
+                "ts <> .000999000 under TimeZone={timezone}"
+            );
+        }
+    }
+
+    /// A literal in a coarser unit than the column is the same instant scaled up, not truncated.
+    #[test]
+    fn a_naive_nanosecond_column_compares_against_a_coarser_literal() {
+        let filter = col("ts").gt_eq(micros_literal(MIDNIGHT_NANOS / 1_000 + 999));
+
+        for timezone in TIMEZONES {
+            assert_eq!(
+                rows_selected_by(&filter, TimeUnit::Nanosecond, timezone),
+                labels(&["b_999us", "c_999us_123ns", "d_2ms"]),
+                "under TimeZone={timezone}"
+            );
+        }
+    }
+
+    /// A non-literal bound outside the range a nanosecond count holds still compares, rather than
+    /// failing the statement (`epoch_ns` of a `TIMESTAMPTZ` in 2300 is a DuckDB conversion error).
+    #[test]
+    fn a_naive_nanosecond_column_compares_against_a_bound_past_2262() {
+        // A nanosecond timestamp cannot hold 2300, so the bound is a microsecond one.
+        let far = Expr::Cast(Cast::new(
+            Box::new(lit("2300-01-01 00:00:00")),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+        ));
+
+        for timezone in TIMEZONES {
+            assert_eq!(
+                rows_selected_by(&col("ts").lt(far.clone()), TimeUnit::Nanosecond, timezone),
+                labels(&["a_midnight", "b_999us", "c_999us_123ns", "d_2ms"]),
+                "under TimeZone={timezone}"
+            );
+        }
+    }
+
+    /// A subtraction is pinned to UTC and yields the interval the column is past the bound,
+    /// whatever the session's `TimeZone`.
+    #[test]
+    fn a_naive_column_subtracts_in_utc() {
+        for unit in [TimeUnit::Microsecond, TimeUnit::Nanosecond] {
+            let schema = schema_with_ts(DataType::Timestamp(unit, None));
+            // An interval literal has no rendering of its own, so the subtraction is checked by
+            // evaluating its rendered SQL directly.
+            let difference = to_sql_with_engine_and_schema(
+                &(col("ts") - micros_literal(MIDNIGHT_NANOS / 1_000)),
+                Some(Engine::DuckDB),
+                Some(&schema),
+            )
+            .expect("to unparse");
+
+            for timezone in TIMEZONES {
+                let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+                let column_type = if unit == TimeUnit::Nanosecond {
+                    "TIMESTAMP_NS"
+                } else {
+                    "TIMESTAMP"
+                };
+                conn.execute_batch(&format!(
+                    "SET TimeZone='{timezone}'; CREATE TABLE t AS SELECT CAST('2026-01-01 00:00:00.000999' AS {column_type}) ts"
+                ))
+                .expect("create");
+                let micros: i64 = conn
+                    .query_row(
+                        &format!("SELECT epoch_us(TIMESTAMP '1970-01-01' + ({difference})) FROM t"),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("query");
+                assert_eq!(
+                    micros, 999,
+                    "{unit:?} under TimeZone={timezone}: {difference}"
+                );
+            }
+        }
+    }
+
+    /// The column is read as a UTC instant without converting through the session's calendar:
+    /// under `Calendar='islamic'`, `AT TIME ZONE 'UTC'` reads a 2026 wall clock centuries later.
+    #[test]
+    fn a_naive_column_does_not_depend_on_the_session_calendar() {
+        for (unit, column_type) in [
+            (TimeUnit::Microsecond, "TIMESTAMP"),
+            (TimeUnit::Nanosecond, "TIMESTAMP_NS"),
+        ] {
+            let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+            conn.execute_batch(&format!(
+                "SET Calendar='islamic'; SET TimeZone='America/New_York'; \
+                 CREATE TABLE t AS SELECT CAST('2026-01-01 00:00:00.000999' AS {column_type}) ts"
+            ))
+            .expect("create");
+            let schema = schema_with_ts(DataType::Timestamp(unit, None));
+            // 2027-01-01 00:00:00 UTC.
+            let after = micros_literal(1_798_761_600_000_000);
+
+            for (filter, expected) in [
+                (col("ts").gt(after.clone()), 0_i64),
+                (col("ts").lt(after.clone()), 1),
+                (
+                    col("ts").eq(micros_literal(MIDNIGHT_NANOS / 1_000 + 999)),
+                    1,
+                ),
+            ] {
+                let where_clause =
+                    to_sql_with_engine_and_schema(&filter, Some(Engine::DuckDB), Some(&schema))
+                        .expect("to unparse");
+                let count: i64 = conn
+                    .query_row(
+                        &format!("SELECT count(*) FROM t WHERE {where_clause}"),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("query");
+                assert_eq!(count, expected, "{unit:?}: {where_clause}");
+            }
+        }
+    }
+
+    /// A bound finer than the column is compared at its own precision: a microsecond row is not
+    /// equal to a bound 123 ns past it, which a bound truncated to the column's unit would be.
+    #[test]
+    fn a_naive_microsecond_column_compares_against_a_finer_literal() {
+        let row = MIDNIGHT_NANOS + 999_000;
+
+        for timezone in TIMEZONES {
+            assert_eq!(
+                rows_selected_by(
+                    &col("ts").eq(nanos_literal(row + 123)),
+                    TimeUnit::Microsecond,
+                    timezone
+                ),
+                Vec::<String>::new(),
+                "ts = .000999123 under TimeZone={timezone}"
+            );
+            assert_eq!(
+                rows_selected_by(
+                    &col("ts").lt(nanos_literal(row + 123)),
+                    TimeUnit::Microsecond,
+                    timezone
+                ),
+                labels(&["a_midnight", "b_999us", "c_999us_123ns"]),
+                "ts < .000999123 under TimeZone={timezone}"
+            );
+        }
+    }
+
+    /// A coarse literal past the range of a nanosecond `BIGINT` still compares.
+    #[test]
+    fn a_naive_nanosecond_column_compares_against_a_literal_past_2262() {
+        // 2300-01-01 00:00:00 UTC.
+        let far = micros_literal(10_413_792_000_000_000);
+
+        for timezone in TIMEZONES {
+            assert_eq!(
+                rows_selected_by(&col("ts").lt(far.clone()), TimeUnit::Nanosecond, timezone),
+                labels(&["a_midnight", "b_999us", "c_999us_123ns", "d_2ms"]),
+                "under TimeZone={timezone}"
+            );
+        }
+    }
+
+    /// A date literal is midnight UTC exactly, so a row a microsecond past it is after it.
+    #[test]
+    fn a_naive_column_compares_against_a_date_literal() {
+        // 2026-01-01.
+        let day = Expr::Literal(ScalarValue::Date32(Some(20_454)), None);
+
+        for unit in [TimeUnit::Microsecond, TimeUnit::Nanosecond] {
+            for timezone in TIMEZONES {
+                assert_eq!(
+                    rows_selected_by(&col("ts").gt(day.clone()), unit, timezone),
+                    labels(&["b_999us", "c_999us_123ns", "d_2ms"]),
+                    "{unit:?} under TimeZone={timezone}"
                 );
             }
         }
