@@ -2457,3 +2457,206 @@ mod duckdb_date_execution_tests {
         }
     }
 }
+
+/// A naive timestamp column has to be pinned to UTC before DuckDB compares it with the
+/// `TIMESTAMPTZ` a literal renders as, and the pinning must keep every digit the column holds.
+/// These run the comparison DuckDB actually evaluates against a naive `TIMESTAMP` and a
+/// `TIMESTAMP_NS` column, under several session time zones, and assert on which rows survive it:
+/// a rendering that truncates the column to the millisecond is well-formed SQL that selects the
+/// wrong rows (<https://github.com/spiceai/spiceai/issues/13146>).
+#[cfg(all(test, feature = "duckdb"))]
+mod duckdb_naive_timestamp_execution_tests {
+    use super::tests::schema_with_ts;
+    use super::*;
+    use datafusion::prelude::*;
+    use duckdb::Connection;
+
+    /// `2026-01-01 00:00:00` UTC, in nanoseconds.
+    const MIDNIGHT_NANOS: i64 = 1_767_225_600_000_000_000;
+
+    /// The rows sit inside one millisecond, and two of them inside one microsecond, so a rendering
+    /// that drops the column's digits below either unit cannot tell them apart. They are inserted
+    /// from their text form, a route the rendering under test does not use.
+    const ROWS: [(&str, &str); 4] = [
+        ("a_midnight", "2026-01-01 00:00:00"),
+        ("b_999us", "2026-01-01 00:00:00.000999"),
+        ("c_999us_123ns", "2026-01-01 00:00:00.000999123"),
+        ("d_2ms", "2026-01-01 00:00:00.002"),
+    ];
+
+    const TIMEZONES: [&str; 3] = ["UTC", "America/New_York", "Asia/Kolkata"];
+
+    /// Runs `filter` against a naive column of `unit` as DuckDB would receive it and returns the
+    /// labels of the rows it keeps.
+    fn rows_selected_by(filter: &Expr, unit: TimeUnit, session_timezone: &str) -> Vec<String> {
+        let column_type = match unit {
+            TimeUnit::Microsecond => "TIMESTAMP",
+            TimeUnit::Nanosecond => "TIMESTAMP_NS",
+            other => panic!("no fixture for {other:?}"),
+        };
+        let conn = Connection::open_in_memory().expect("in-memory DuckDB");
+        conn.execute_batch(&format!(
+            "SET TimeZone='{session_timezone}'; CREATE TABLE t (label VARCHAR, ts {column_type})"
+        ))
+        .expect("create");
+        for (label, wall_clock) in ROWS {
+            conn.execute_batch(&format!(
+                "INSERT INTO t VALUES ('{label}', CAST('{wall_clock}' AS {column_type}))"
+            ))
+            .expect("insert");
+        }
+
+        let schema = schema_with_ts(DataType::Timestamp(unit, None));
+        let where_clause =
+            to_sql_with_engine_and_schema(filter, Some(Engine::DuckDB), Some(&schema))
+                .expect("to unparse");
+
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT label FROM t WHERE {where_clause} ORDER BY label"
+            ))
+            .expect("prepare");
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("rows")
+    }
+
+    fn micros_literal(micros: i64) -> Expr {
+        Expr::Literal(ScalarValue::TimestampMicrosecond(Some(micros), None), None)
+    }
+
+    fn nanos_literal(nanos: i64) -> Expr {
+        Expr::Literal(ScalarValue::TimestampNanosecond(Some(nanos), None), None)
+    }
+
+    fn labels(expected: &[&str]) -> Vec<String> {
+        expected.iter().map(ToString::to_string).collect()
+    }
+
+    /// A bound half a millisecond past midnight keeps the row at `.000999` above it. Truncated to
+    /// the millisecond, that row reads as midnight and falls below the bound — which is how a
+    /// `DELETE` with this predicate removed a row it did not name.
+    #[test]
+    fn a_naive_microsecond_column_keeps_its_sub_millisecond_digits() {
+        let bound = micros_literal(MIDNIGHT_NANOS / 1_000 + 500);
+
+        for timezone in TIMEZONES {
+            assert_eq!(
+                rows_selected_by(
+                    &col("ts").lt(bound.clone()),
+                    TimeUnit::Microsecond,
+                    timezone
+                ),
+                labels(&["a_midnight"]),
+                "ts < .000500 under TimeZone={timezone}"
+            );
+            assert_eq!(
+                rows_selected_by(
+                    &col("ts").gt(bound.clone()),
+                    TimeUnit::Microsecond,
+                    timezone
+                ),
+                // `c_999us_123ns` is stored at microsecond precision by a `TIMESTAMP` column.
+                labels(&["b_999us", "c_999us_123ns", "d_2ms"]),
+                "ts > .000500 under TimeZone={timezone}"
+            );
+        }
+    }
+
+    /// Equality has to find the exact microsecond, and only it.
+    #[test]
+    fn a_naive_microsecond_column_matches_the_microsecond_it_holds() {
+        let filter = col("ts").eq(micros_literal(MIDNIGHT_NANOS / 1_000 + 999));
+
+        for timezone in TIMEZONES {
+            assert_eq!(
+                rows_selected_by(&filter, TimeUnit::Microsecond, timezone),
+                labels(&["b_999us", "c_999us_123ns"]),
+                "under TimeZone={timezone}"
+            );
+        }
+    }
+
+    /// A nanosecond column keeps its nanoseconds too: a bound one nanosecond either side of
+    /// `.000999123` splits it from `.000999000`, which sits in the same microsecond.
+    #[test]
+    fn a_naive_nanosecond_column_keeps_its_sub_microsecond_digits() {
+        let row = MIDNIGHT_NANOS + 999_123;
+
+        for timezone in TIMEZONES {
+            assert_eq!(
+                rows_selected_by(
+                    &col("ts").gt(nanos_literal(row - 1)),
+                    TimeUnit::Nanosecond,
+                    timezone
+                ),
+                labels(&["c_999us_123ns", "d_2ms"]),
+                "ts > .000999122 under TimeZone={timezone}"
+            );
+            assert_eq!(
+                rows_selected_by(
+                    &col("ts").lt(nanos_literal(row + 1)),
+                    TimeUnit::Nanosecond,
+                    timezone
+                ),
+                labels(&["a_midnight", "b_999us", "c_999us_123ns"]),
+                "ts < .000999124 under TimeZone={timezone}"
+            );
+            assert_eq!(
+                rows_selected_by(
+                    &col("ts").eq(nanos_literal(row)),
+                    TimeUnit::Nanosecond,
+                    timezone
+                ),
+                labels(&["c_999us_123ns"]),
+                "ts = .000999123 under TimeZone={timezone}"
+            );
+            assert_eq!(
+                rows_selected_by(
+                    &col("ts").not_eq(nanos_literal(MIDNIGHT_NANOS + 999_000)),
+                    TimeUnit::Nanosecond,
+                    timezone
+                ),
+                labels(&["a_midnight", "c_999us_123ns", "d_2ms"]),
+                "ts <> .000999000 under TimeZone={timezone}"
+            );
+        }
+    }
+
+    /// A literal in a coarser unit than the column is the same instant scaled up, not truncated.
+    #[test]
+    fn a_naive_nanosecond_column_compares_against_a_coarser_literal() {
+        let filter = col("ts").gt_eq(micros_literal(MIDNIGHT_NANOS / 1_000 + 999));
+
+        for timezone in TIMEZONES {
+            assert_eq!(
+                rows_selected_by(&filter, TimeUnit::Nanosecond, timezone),
+                labels(&["b_999us", "c_999us_123ns", "d_2ms"]),
+                "under TimeZone={timezone}"
+            );
+        }
+    }
+
+    /// The right side need not be a literal: a cast to a timestamp renders as a `TIMESTAMPTZ`
+    /// expression, which the column is compared against with every digit it holds.
+    #[test]
+    fn a_naive_column_compares_against_a_cast_with_all_its_digits() {
+        for unit in [TimeUnit::Microsecond, TimeUnit::Nanosecond] {
+            let midnight = Expr::Cast(Cast::new(
+                Box::new(lit("2026-01-01 00:00:00")),
+                DataType::Timestamp(unit, None),
+            ));
+            let filter = col("ts").gt(midnight);
+
+            for timezone in TIMEZONES {
+                assert_eq!(
+                    rows_selected_by(&filter, unit, timezone),
+                    labels(&["b_999us", "c_999us_123ns", "d_2ms"]),
+                    "{unit:?} under TimeZone={timezone}"
+                );
+            }
+        }
+    }
+}
