@@ -1834,8 +1834,25 @@ mod test {
         ids: Vec<i64>,
         names: Vec<&str>,
     ) -> (DuckDBTableWriter, Arc<DuckDbConnectionPool>) {
-        let pool = get_mem_duckdb();
         let table_definition = get_basic_table_definition();
+        let batch = RecordBatch::try_new(
+            table_definition.schema(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .expect("should create a record batch");
+        setup_writer_with_batch(table_definition, batch).await
+    }
+
+    /// Helper: create `table_definition` as a DuckDB base table, insert `batch`, and return
+    /// `(DuckDBTableWriter, pool)`.
+    async fn setup_writer_with_batch(
+        table_definition: Arc<TableDefinition>,
+        batch: RecordBatch,
+    ) -> (DuckDBTableWriter, Arc<DuckDbConnectionPool>) {
+        let pool = get_mem_duckdb();
 
         // Create a base (non-internal) table so DELETE/UPDATE can target it by name.
         {
@@ -1863,16 +1880,8 @@ mod test {
             None,
             Arc::clone(&schema),
         );
-        let batches = vec![RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(ids)),
-                Arc::new(StringArray::from(names)),
-            ],
-        )
-        .expect("should create a record batch")];
         let stream = Box::pin(
-            MemoryStream::try_new(batches, Arc::clone(&schema), None).expect("to get stream"),
+            MemoryStream::try_new(vec![batch], Arc::clone(&schema), None).expect("to get stream"),
         );
         Arc::new(duckdb_sink)
             .write_all(stream, &Arc::new(TaskContext::default()))
@@ -1952,6 +1961,118 @@ mod test {
         assert_eq!(ids.len(), 2, "should have 2 rows remaining");
         assert_eq!(ids, vec![1, 3]);
         assert_eq!(names, vec!["a", "c"]);
+    }
+
+    /// A `DELETE` whose predicate bounds a naive timestamp column inside one millisecond removes
+    /// exactly the rows it names. The predicate reaches DuckDB through the timestamp
+    /// normalization, and a rendering that truncates the column to the millisecond reads
+    /// `.000999` as midnight — deleting a row the predicate excludes
+    /// (<https://github.com/spiceai/spiceai/issues/13146>).
+    #[tokio::test]
+    async fn test_delete_from_naive_timestamp_keeps_sub_millisecond_rows() {
+        use arrow::array::{TimestampMicrosecondArray, TimestampNanosecondArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use datafusion::logical_expr::{col, lit};
+        use datafusion::scalar::ScalarValue;
+
+        const MIDNIGHT_NANOS: i64 = 1_767_225_600_000_000_000;
+
+        let _guard = init_tracing(None);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "ts_us",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new(
+                "ts_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]));
+        let nanos = [
+            MIDNIGHT_NANOS,
+            MIDNIGHT_NANOS + 999_123,
+            MIDNIGHT_NANOS + 2_000_000,
+        ];
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(TimestampMicrosecondArray::from(
+                    nanos.iter().map(|n| n / 1_000).collect::<Vec<_>>(),
+                )),
+                Arc::new(TimestampNanosecondArray::from(nanos.to_vec())),
+            ],
+        )
+        .expect("should create a record batch");
+
+        let micros = |v: i64| lit(ScalarValue::TimestampMicrosecond(Some(v), None));
+        let nanos_lit = |v: i64| lit(ScalarValue::TimestampNanosecond(Some(v), None));
+        let cases = [
+            // ts_us < .000500 names only the midnight row; `.000999` is above the bound.
+            (
+                col("ts_us").lt(micros(MIDNIGHT_NANOS / 1_000 + 500)),
+                vec![2, 3],
+            ),
+            // ts_ns > .000999122 names the `.000999123` row and the `.002` row.
+            (
+                col("ts_ns").gt(nanos_lit(MIDNIGHT_NANOS + 999_122)),
+                vec![1],
+            ),
+            // ts_ns = .000999123 names exactly that row.
+            (
+                col("ts_ns").eq(nanos_lit(MIDNIGHT_NANOS + 999_123)),
+                vec![1, 3],
+            ),
+            // ts_us holds `.000999`, which is not `.000999123`: nothing is deleted.
+            (
+                col("ts_us").eq(nanos_lit(MIDNIGHT_NANOS + 999_123)),
+                vec![1, 2, 3],
+            ),
+            // A bound in 2300 is past the nanosecond range and still names every row.
+            (col("ts_ns").lt(micros(10_413_792_000_000_000)), vec![]),
+        ];
+
+        for (filter, remaining) in cases {
+            let (writer, pool) = setup_writer_with_batch(
+                Arc::new(TableDefinition::new(
+                    RelationName::new("test_table"),
+                    Arc::clone(&schema),
+                )),
+                batch.clone(),
+            )
+            .await;
+
+            let plan = writer
+                .delete_from(
+                    &datafusion::prelude::SessionContext::new().state(),
+                    vec![filter.clone()],
+                )
+                .await
+                .expect("delete_from should succeed");
+            let count = extract_count(plan).await;
+
+            let mut conn = Arc::clone(&pool).connect_sync().expect("to connect");
+            let duckdb = DuckDB::duckdb_conn(&mut conn).expect("to get duckdb conn");
+            let mut stmt = duckdb
+                .conn
+                .prepare("SELECT id FROM test_table ORDER BY id")
+                .expect("to prepare statement");
+            let ids = stmt
+                .query_map([], |row| row.get::<_, i64>(0))
+                .expect("to query")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("rows");
+
+            assert_eq!(ids, remaining, "rows left by DELETE WHERE {filter}");
+            assert_eq!(
+                usize::try_from(count).expect("count fits usize"),
+                3 - remaining.len(),
+                "count for DELETE WHERE {filter}"
+            );
+        }
     }
 
     #[tokio::test]
