@@ -100,7 +100,7 @@ macro_rules! handle_primitive_type {
             }
             .fail();
         };
-        let v = handle_null_error($row.get_opt::<$value_ty, usize>($index).transpose()).context(
+        let v = handle_null_error($row.take_opt::<$value_ty, usize>($index).transpose()).context(
             FailedToGetRowValueSnafu {
                 column: $column_name,
                 mysql_type: $type,
@@ -122,7 +122,7 @@ macro_rules! handle_primitive_type {
 /// Returns an error if there is a failure in converting the rows to a `RecordBatch`.
 #[allow(clippy::too_many_lines)]
 pub fn rows_to_arrow(
-    rows: &[Row],
+    rows: Vec<Row>,
     projected_schema: &Option<SchemaRef>,
     zero_date_behavior: MysqlZeroDateBehavior,
 ) -> Result<RecordBatch> {
@@ -209,14 +209,16 @@ pub fn rows_to_arrow(
         }
     }
 
-    for row in rows {
-        for (i, mysql_type) in mysql_types.iter().enumerate() {
-            let Some(builder) = arrow_columns_builders.get_mut(i) else {
-                return NoBuilderForIndexSnafu { index: i }.fail();
-            };
+    // Move values out of the rows instead of cloning them, one column at a time.
+    let mut rows = rows;
+    for (i, mysql_type) in mysql_types.iter().enumerate() {
+        let Some(builder) = arrow_columns_builders.get_mut(i) else {
+            return NoBuilderForIndexSnafu { index: i }.fail();
+        };
 
-            let column_name = column_names.get(i).cloned().unwrap_or_default();
+        let column_name = column_names.get(i).map_or("", String::as_str);
 
+        for row in &mut rows {
             match *mysql_type {
                 ColumnType::MYSQL_TYPE_NULL => {
                     let Some(builder) = builder else {
@@ -240,7 +242,7 @@ pub fn rows_to_arrow(
                         }
                         .fail();
                     };
-                    let value = row.get_opt::<Value, usize>(i).transpose().context(
+                    let value = row.take_opt::<Value, usize>(i).transpose().context(
                         FailedToGetRowValueSnafu {
                             column: column_name,
                             mysql_type: ColumnType::MYSQL_TYPE_BIT,
@@ -393,7 +395,7 @@ pub fn rows_to_arrow(
                                 .fail();
                             };
                             let val =
-                                handle_null_error(row.get_opt::<BigDecimal, usize>(i).transpose())
+                                handle_null_error(row.take_opt::<BigDecimal, usize>(i).transpose())
                                     .context(FailedToGetRowValueSnafu {
                                         column: column_name,
                                         mysql_type: ColumnType::MYSQL_TYPE_DECIMAL,
@@ -427,7 +429,7 @@ pub fn rows_to_arrow(
                             };
 
                             let val =
-                                handle_null_error(row.get_opt::<BigDecimal, usize>(i).transpose())
+                                handle_null_error(row.take_opt::<BigDecimal, usize>(i).transpose())
                                     .context(FailedToGetRowValueSnafu {
                                         column: column_name,
                                         mysql_type: ColumnType::MYSQL_TYPE_DECIMAL,
@@ -522,7 +524,7 @@ pub fn rows_to_arrow(
                             .fail();
                         };
 
-                        let v = handle_null_error(row.get_opt::<String, usize>(i).transpose())
+                        let v = handle_null_error(row.take_opt::<String, usize>(i).transpose())
                             .context(FailedToGetRowValueSnafu {
                                 column: column_name,
                                 mysql_type: ColumnType::MYSQL_TYPE_ENUM,
@@ -578,7 +580,7 @@ pub fn rows_to_arrow(
                         .fail();
                     };
 
-                    let v = match handle_null_error(row.get_opt::<NaiveDate, usize>(i).transpose())
+                    let v = match handle_null_error(row.take_opt::<NaiveDate, usize>(i).transpose())
                     {
                         Ok(v) => v,
                         Err(err) => {
@@ -595,7 +597,7 @@ pub fn rows_to_arrow(
                                 }
                             } else {
                                 return Err(Error::FailedToGetRowValue {
-                                    column: column_name,
+                                    column: column_name.to_string(),
                                     mysql_type: ColumnType::MYSQL_TYPE_DATE,
                                     source: err,
                                 });
@@ -623,7 +625,7 @@ pub fn rows_to_arrow(
                         }
                         .fail();
                     };
-                    let v = handle_null_error(row.get_opt::<NaiveTime, usize>(i).transpose())
+                    let v = handle_null_error(row.take_opt::<NaiveTime, usize>(i).transpose())
                         .context(FailedToGetRowValueSnafu {
                             column: column_name,
                             mysql_type: ColumnType::MYSQL_TYPE_TIME,
@@ -654,7 +656,7 @@ pub fn rows_to_arrow(
                         .fail();
                     };
                     let v = match handle_null_error(
-                        row.get_opt::<PrimitiveDateTime, usize>(i).transpose(),
+                        row.take_opt::<PrimitiveDateTime, usize>(i).transpose(),
                     ) {
                         Ok(v) => v,
                         Err(err) => {
@@ -671,7 +673,7 @@ pub fn rows_to_arrow(
                                 }
                             } else {
                                 return Err(Error::FailedToGetRowValue {
-                                    column: column_name,
+                                    column: column_name.to_string(),
                                     mysql_type: column_type,
                                     source: err,
                                 });
