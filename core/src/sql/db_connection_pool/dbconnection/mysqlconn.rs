@@ -224,7 +224,7 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
                     .collect::<Result<Vec<_>, _>>()
                     .context(QuerySnafu)?;
 
-                let rec = rows_to_arrow(&rows, &projected_schema, zero_date_behavior).context(ConversionSnafu)?;
+                let rec = rows_to_arrow(rows, &projected_schema, zero_date_behavior).context(ConversionSnafu)?;
                 yield Ok::<_, Error>(rec)
             }
         });
