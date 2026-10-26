@@ -48,7 +48,7 @@ datafusion-physical-expr = { version = "54.0" }
 datafusion-physical-plan = { version = "54.0" }
 datafusion-python = { version = "54.0" }
 datafusion-table-providers = { path = "core" }
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "a15f36bf0ac4a20e832f1e44efb8677f82046745" } # branch: sgrebnov/duckdb-1.4.4-arrow58 (DuckDB v1.4.4, arrow 58)
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "80ee5678a0361aa6b6c190679f16c4c7b3ade199" } # branch: spiceai-1.4.4-release-2.2 (DuckDB v1.4.4, arrow 58)
 adbc_core = { version = "0.23" }
 adbc_driver_manager = { version = "0.23" }
 parquet = "58"
