@@ -126,12 +126,15 @@ impl SQLExecutor for MySQLTable {
     }
 }
 
-// Keep unsupported grouping references and NULL ordering local. MySQL orders
+// Keep unsupported joins, grouping references and NULL ordering local. MySQL orders
 // NULLs first for ascending keys and last for descending keys.
 fn requires_local_evaluation(plan: &LogicalPlan) -> DataFusionResult<bool> {
     let mut found = false;
     plan.apply_with_subqueries(|node| {
         match node {
+            LogicalPlan::Join(join) => {
+                found |= join.join_type == datafusion::logical_expr::JoinType::Full;
+            }
             LogicalPlan::Filter(filter) => {
                 if let LogicalPlan::Aggregate(aggregate) = filter.input.as_ref() {
                     found |= filter.predicate.column_refs().iter().any(|column| {
