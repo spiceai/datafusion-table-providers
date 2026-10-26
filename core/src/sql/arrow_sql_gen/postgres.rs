@@ -315,9 +315,12 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
             let projected_json_complex_field =
                 projected_json_complex_field(projected_schema, column_name, column_type);
 
-            let projected_field = projected_schema
-                .as_ref()
-                .and_then(|schema| schema.field_with_name(column_name).ok());
+            let projected_field = numeric_destination_field(
+                projected_schema.as_ref(),
+                column_name,
+                column_index,
+                column_count,
+            );
 
             let mut numeric_scale: Option<u32> = None;
 
@@ -2164,6 +2167,22 @@ mod tests {
         assert_eq!(
             numeric_text_coefficient("1234567890123456789012345.123456789013", 38, 12),
             Ok(1_234_567_890_123_456_789_012_345_123_456_789_013)
+        );
+    }
+
+    #[test]
+    fn duplicate_result_names_keep_their_positional_nullability() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("id", DataType::Int32, true),
+        ]));
+        assert_eq!(
+            numeric_destination_field(Some(&schema), "id", 0, 2).map(Field::is_nullable),
+            Some(false)
+        );
+        assert_eq!(
+            numeric_destination_field(Some(&schema), "id", 1, 2).map(Field::is_nullable),
+            Some(true)
         );
     }
 
