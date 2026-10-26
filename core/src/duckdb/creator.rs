@@ -1886,7 +1886,8 @@ pub(crate) mod tests {
             "PRIMARY KEY",
         ];
         // One table per name with that name as its sole key, plus one with all of them as a
-        // composite key, each also carrying a unique index on the key column(s).
+        // composite key, each also carrying a unique index on the key column(s) and a plain index
+        // that starts with the first key column.
         let mut cases: Vec<Vec<&str>> = names.iter().map(|n| vec![*n]).collect();
         cases.push(names.to_vec());
 
@@ -1912,8 +1913,10 @@ pub(crate) mod tests {
                         ColumnReference::new(key.iter().map(|k| (*k).to_string()).collect()),
                         IndexType::Unique,
                     ),
+                    // Also spans `v`: an index on the key column alone would share the unique
+                    // index's name when the key is a single column.
                     (
-                        ColumnReference::new(vec![key[0].to_string()]),
+                        ColumnReference::new(vec![key[0].to_string(), "v".to_string()]),
                         IndexType::Enabled,
                     ),
                 ]),
