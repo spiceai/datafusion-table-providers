@@ -2,7 +2,8 @@ use crate::sql::db_connection_pool::dbconnection::{get_schema, Error as DbError}
 use crate::sql::sql_provider_datafusion::{get_stream, to_execution_error};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::sql::sqlparser::ast::{self, VisitMut};
 use datafusion::sql::unparser::dialect::Dialect;
@@ -85,6 +86,7 @@ impl SQLExecutor for MySQLTable {
 
     fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
         self.base_table.can_execute_plan(plan)
+            && computed_group_filter(plan).is_ok_and(|computed| !computed)
     }
 
     fn execute(
@@ -122,4 +124,28 @@ impl SQLExecutor for MySQLTable {
             .map_err(|e| DbError::UnableToGetSchema { source: e })
             .map_err(to_execution_error)
     }
+}
+
+// MySQL cannot bind an inlined computed grouping expression in every HAVING
+// scope. Keep its predicate local and federate the named aggregate output.
+fn computed_group_filter(plan: &LogicalPlan) -> DataFusionResult<bool> {
+    let mut found = false;
+    plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::Filter(filter) = node {
+            if let LogicalPlan::Aggregate(aggregate) = filter.input.as_ref() {
+                found |= filter.predicate.column_refs().iter().any(|column| {
+                    aggregate.schema.index_of_column(column).is_ok_and(|index| {
+                        index < aggregate.group_expr.len()
+                            && !matches!(aggregate.group_expr[index], Expr::Column(_))
+                    })
+                });
+            }
+        }
+        Ok(if found {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    })?;
+    Ok(found)
 }
