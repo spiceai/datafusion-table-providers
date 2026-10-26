@@ -1912,7 +1912,10 @@ pub(crate) mod tests {
                         ColumnReference::new(key.iter().map(|k| (*k).to_string()).collect()),
                         IndexType::Unique,
                     ),
-                    (ColumnReference::new(vec![key[0].to_string()]), IndexType::Enabled),
+                    (
+                        ColumnReference::new(vec![key[0].to_string()]),
+                        IndexType::Enabled,
+                    ),
                 ]),
             );
 
@@ -1952,10 +1955,7 @@ pub(crate) mod tests {
 
             // The key is enforced on the named column(s), not on something the parser split
             // the name into.
-            let cols = names
-                .iter()
-                .map(|n| expr::quoted_identifier(n))
-                .join(", ");
+            let cols = names.iter().map(|n| expr::quoted_identifier(n)).join(", ");
             let row = names.iter().map(|_| "'x'").join(", ");
             let insert = format!(
                 "INSERT INTO {} ({cols}, v) VALUES ({row}, 1)",
