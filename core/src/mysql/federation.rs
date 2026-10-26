@@ -2,8 +2,8 @@ use crate::sql::db_connection_pool::dbconnection::{get_schema, Error as DbError}
 use crate::sql::sql_provider_datafusion::{get_stream, to_execution_error};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::logical_expr::{Expr, LogicalPlan};
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::sql::sqlparser::ast::{self, VisitMut};
 use datafusion::sql::unparser::dialect::Dialect;
@@ -86,7 +86,7 @@ impl SQLExecutor for MySQLTable {
 
     fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
         self.base_table.can_execute_plan(plan)
-            && computed_group_filter(plan).is_ok_and(|computed| !computed)
+            && requires_local_evaluation(plan).is_ok_and(|computed| !computed)
     }
 
     fn execute(
@@ -126,20 +126,50 @@ impl SQLExecutor for MySQLTable {
     }
 }
 
-// MySQL cannot bind an inlined computed grouping expression in every HAVING
-// scope. Keep its predicate local and federate the named aggregate output.
-fn computed_group_filter(plan: &LogicalPlan) -> DataFusionResult<bool> {
+// Keep unsupported grouping references and NULL ordering local. MySQL orders
+// NULLs first for ascending keys and last for descending keys.
+fn requires_local_evaluation(plan: &LogicalPlan) -> DataFusionResult<bool> {
     let mut found = false;
     plan.apply_with_subqueries(|node| {
-        if let LogicalPlan::Filter(filter) = node {
-            if let LogicalPlan::Aggregate(aggregate) = filter.input.as_ref() {
-                found |= filter.predicate.column_refs().iter().any(|column| {
-                    aggregate.schema.index_of_column(column).is_ok_and(|index| {
-                        index < aggregate.group_expr.len()
-                            && !matches!(aggregate.group_expr[index], Expr::Column(_))
-                    })
-                });
+        match node {
+            LogicalPlan::Filter(filter) => {
+                if let LogicalPlan::Aggregate(aggregate) = filter.input.as_ref() {
+                    found |= filter.predicate.column_refs().iter().any(|column| {
+                        aggregate.schema.index_of_column(column).is_ok_and(|index| {
+                            index < aggregate.group_expr.len()
+                                && !matches!(aggregate.group_expr[index], Expr::Column(_))
+                        })
+                    });
+                }
             }
+            LogicalPlan::Sort(sort) => {
+                found |= sort
+                    .expr
+                    .iter()
+                    .any(|key| null_order_needs_local(key, sort.input.schema()));
+            }
+            LogicalPlan::Window(window) => {
+                for expression in &window.window_expr {
+                    expression.apply(|expression| {
+                        if let Expr::WindowFunction(function) = expression {
+                            found |= function
+                                .params
+                                .order_by
+                                .iter()
+                                .any(|key| null_order_needs_local(key, window.input.schema()));
+                        }
+                        Ok(if found {
+                            TreeNodeRecursion::Stop
+                        } else {
+                            TreeNodeRecursion::Continue
+                        })
+                    })?;
+                    if found {
+                        break;
+                    }
+                }
+            }
+            _ => {}
         }
         Ok(if found {
             TreeNodeRecursion::Stop
@@ -148,4 +178,11 @@ fn computed_group_filter(plan: &LogicalPlan) -> DataFusionResult<bool> {
         })
     })?;
     Ok(found)
+}
+
+fn null_order_needs_local(
+    sort: &datafusion::logical_expr::expr::Sort,
+    schema: &datafusion::common::DFSchema,
+) -> bool {
+    sort.nulls_first != sort.asc && sort.expr.nullable(schema).unwrap_or(true)
 }

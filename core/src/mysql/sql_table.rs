@@ -202,6 +202,14 @@ impl ExecutionPlan for MySQLSQLExec {
         &self,
         order: &[PhysicalSortExpr],
     ) -> DataFusionResult<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        let schema = self.base_exec.schema();
+        if order.iter().any(|key| {
+            let default_nulls_first = !key.options.descending;
+            key.options.nulls_first != default_nulls_first
+                && key.expr.nullable(schema.as_ref()).unwrap_or(true)
+        }) {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        }
         match self.base_exec.try_pushdown_sort(order)? {
             SortOrderPushdownResult::Exact { inner } => {
                 let base_exec = inner
