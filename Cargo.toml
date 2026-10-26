@@ -48,7 +48,7 @@ datafusion-physical-expr = { version = "55.0" }
 datafusion-physical-plan = { version = "55.0" }
 datafusion-python = { version = "55.0" }
 datafusion-table-providers = { path = "core" }
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "504debbf8269a76aef74daa2247b6296c2fe2290" } # branch: spiceai-1.4.4 (DuckDB v1.4.4, arrow 59; requires Rust 1.98.1)
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "b04e89c594789bf3fcdc50791ee1626a6f38426d" } # branch: spiceai-1.4.4 (DuckDB v1.4.4, arrow 59; requires Rust 1.98.1)
 adbc_core = { version = "0.24" }
 adbc_driver_manager = { version = "0.24" }
 parquet = "59"
