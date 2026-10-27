@@ -279,4 +279,66 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    /// Four rows, `id` 1 to 4, in a federated table called `table`.
+    async fn four_rows(table: &str) -> SessionContext {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4]))])
+                .expect("batch");
+        federated_session(table, batch).await
+    }
+
+    async fn count(ctx: &SessionContext, sql: &str) -> datafusion::error::Result<i64> {
+        let batches = ctx.sql(sql).await?.collect().await?;
+        Ok(batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count is an Int64")
+            .value(0))
+    }
+
+    /// SQLite has no `UNNEST`, so a join against one must not be sent to it: unparsed, an
+    /// `UNNEST` whose columns the query never reads became `(SELECT 1)`, and the join returned
+    /// one row for each of `t`'s instead of one for each pair.
+    #[tokio::test]
+    async fn a_cross_join_with_an_unnest_returns_every_pair() {
+        let ctx = four_rows("pairs").await;
+        for sql in [
+            "SELECT count(*) FROM pairs a CROSS JOIN (SELECT * FROM unnest(range(0, 100))) b",
+            "SELECT count(*) FROM (SELECT a.* FROM pairs a CROSS JOIN unnest(range(0, 100)) b)",
+            "SELECT count(*) FROM pairs a CROSS JOIN (SELECT unnest(make_array(1, 2, 3)) AS x) b",
+        ] {
+            let expected = if sql.contains("make_array") { 12 } else { 400 };
+            assert_eq!(count(&ctx, sql).await.expect(sql), expected, "{sql}");
+        }
+    }
+
+    /// A join that reads the unnested column returns its rows rather than failing with
+    /// SQLite's `no such column`.
+    #[tokio::test]
+    async fn a_join_on_an_unnested_column_returns_its_rows() {
+        let ctx = four_rows("matches").await;
+        let sql = "SELECT count(*) FROM matches a JOIN (SELECT unnest(make_array(1, 2, 3)) AS x) b ON a.id = b.x";
+        assert_eq!(count(&ctx, sql).await.expect(sql), 3);
+    }
+
+    /// The table's own scan is still sent to SQLite under a local `UNNEST`.
+    #[tokio::test]
+    async fn the_scan_under_an_unnest_join_is_still_federated() {
+        let ctx = four_rows("scanned").await;
+        let plan = ctx
+            .sql("SELECT count(*) FROM scanned a CROSS JOIN (SELECT * FROM unnest(range(0, 3))) b")
+            .await
+            .expect("the query plans")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let display = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(display.contains("VirtualExecutionPlan"), "{display}");
+        assert!(display.contains("UnnestExec"), "{display}");
+    }
 }
