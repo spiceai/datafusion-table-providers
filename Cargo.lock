@@ -1769,7 +1769,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.4.2"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=42d2d554ecc00d24856699b82b853884d530e3d7#42d2d554ecc00d24856699b82b853884d530e3d7"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=bd808b3ebc51796cce7a30f805971dd3613bd014#bd808b3ebc51796cce7a30f805971dd3613bd014"
 dependencies = [
  "arrow-json",
  "async-stream",
