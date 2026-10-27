@@ -2,8 +2,12 @@ use std::{fmt, sync::Arc};
 
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
+use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion::common::ScalarValue;
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::logical_expr::{BinaryExpr, Operator};
 use datafusion::{
     catalog::Session,
     common::TableReference,
@@ -136,6 +140,7 @@ impl TableProvider for SqliteTableWriter {
         _state: &dyn Session,
         filters: Vec<Expr>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let filters = timestamp_literals_as_stored_text(filters, &self.schema())?;
         let sql_where = if filters.is_empty() {
             None
         } else {
@@ -164,6 +169,7 @@ impl TableProvider for SqliteTableWriter {
         let set_clause = assignments_to_sql(&assignments, Some(expr::Engine::SQLite))?;
         let sqlite = self.sqlite();
 
+        let filters = timestamp_literals_as_stored_text(filters, &self.schema())?;
         let sql_where = if filters.is_empty() {
             None
         } else {
@@ -180,6 +186,92 @@ impl TableProvider for SqliteTableWriter {
             sql,
         }))))
     }
+}
+
+/// Rewrites each comparison of a timestamp column with a timestamp literal to compare the
+/// column with the text the column stores that instant as (see [`super::timestamp_text`]).
+///
+/// The column holds ISO-8601 text such as `2026-10-26T05:56:16`, while the literal renders as
+/// `datetime(<seconds>, 'unixepoch')`, whose text has a space where the column has its `T`.
+/// SQLite compares the two as text, so every row from the literal's own calendar day sorted
+/// after it: `ts < <cutoff>` kept all of that day's rows before the cutoff, and `datetime()`
+/// also dropped the literal's fraction of a second.
+fn timestamp_literals_as_stored_text(
+    filters: Vec<Expr>,
+    schema: &SchemaRef,
+) -> datafusion::error::Result<Vec<Expr>> {
+    filters
+        .into_iter()
+        .map(|filter| {
+            filter
+                .transform_up(|expr| {
+                    let Expr::BinaryExpr(BinaryExpr { left, op, right }) = &expr else {
+                        return Ok(Transformed::no(expr));
+                    };
+                    if !matches!(
+                        op,
+                        Operator::Eq
+                            | Operator::NotEq
+                            | Operator::Lt
+                            | Operator::LtEq
+                            | Operator::Gt
+                            | Operator::GtEq
+                    ) {
+                        return Ok(Transformed::no(expr));
+                    }
+                    let as_text = |column: &Expr, literal: &Expr| -> Option<Expr> {
+                        let Expr::Column(column) = column else {
+                            return None;
+                        };
+                        let Expr::Literal(value, _) = literal else {
+                            return None;
+                        };
+                        let Ok(field) = schema.field_with_name(&column.name) else {
+                            return None;
+                        };
+                        let DataType::Timestamp(_, timezone) = field.data_type() else {
+                            return None;
+                        };
+                        let nanos = match value {
+                            ScalarValue::TimestampSecond(Some(v), _) => {
+                                v.checked_mul(1_000_000_000)?
+                            }
+                            ScalarValue::TimestampMillisecond(Some(v), _) => {
+                                v.checked_mul(1_000_000)?
+                            }
+                            ScalarValue::TimestampMicrosecond(Some(v), _) => {
+                                v.checked_mul(1_000)?
+                            }
+                            ScalarValue::TimestampNanosecond(Some(v), _) => *v,
+                            _ => return None,
+                        };
+                        Some(Expr::Literal(
+                            ScalarValue::Utf8(Some(super::timestamp_text(
+                                nanos,
+                                timezone.as_deref(),
+                            ))),
+                            None,
+                        ))
+                    };
+                    if let Some(text) = as_text(left, right) {
+                        return Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr::new(
+                            left.clone(),
+                            *op,
+                            Box::new(text),
+                        ))));
+                    }
+                    if let Some(text) = as_text(right, left) {
+                        return Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr::new(
+                            Box::new(text),
+                            *op,
+                            right.clone(),
+                        ))));
+                    }
+                    Ok(Transformed::no(expr))
+                })
+                .data()
+        })
+        .collect()
 }
 
 struct SqliteDeletionSink {

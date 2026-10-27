@@ -514,6 +514,26 @@ fn to_datafusion_error(error: Error) -> DataFusionError {
 }
 
 /// Parse a timezone offset string like "+10:00" or "-05:30" to seconds
+/// The ISO-8601 text a timestamp column stores `nanos` as: `%Y-%m-%dT%H:%M:%S%.f` for a
+/// naive timestamp, RFC 3339 in the column's fixed offset (UTC for any other zone) otherwise.
+///
+/// Both forms print the fraction only as far as it is nonzero, in 3, 6 or 9 digits, so for
+/// years 0000-9999 two values of one column compare as text in the order of their instants.
+pub(crate) fn timestamp_text(nanos: i64, timezone: Option<&str>) -> String {
+    let datetime = chrono::DateTime::from_timestamp_nanos(nanos);
+    match timezone {
+        // Handle timezone-aware timestamps with offset format like "+10:00"
+        Some(tz) => match parse_timezone_offset_seconds(tz).and_then(chrono::FixedOffset::east_opt)
+        {
+            Some(offset) => datetime.with_timezone(&offset).to_rfc3339(),
+            // Unknown timezone format, use UTC
+            None => datetime.to_rfc3339(),
+        },
+        // Naive timestamp - format without timezone suffix
+        None => datetime.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
+    }
+}
+
 fn parse_timezone_offset_seconds(tz: &str) -> Option<i32> {
     let tz = tz.trim();
     if tz.is_empty() {
@@ -1017,26 +1037,7 @@ impl Sqlite {
                                 }
                             };
 
-                            // Format as ISO-8601 string (RFC3339 is a profile of ISO-8601)
-                            let datetime = chrono::DateTime::from_timestamp_nanos(nanos);
-                            let iso_string = if let Some(tz) = timezone {
-                                // Handle timezone-aware timestamps with offset format like "+10:00"
-                                if let Some(offset_secs) = parse_timezone_offset_seconds(tz) {
-                                    if let Some(offset) = chrono::FixedOffset::east_opt(offset_secs)
-                                    {
-                                        datetime.with_timezone(&offset).to_rfc3339()
-                                    } else {
-                                        datetime.to_rfc3339()
-                                    }
-                                } else {
-                                    // Unknown timezone format, use UTC
-                                    datetime.to_rfc3339()
-                                }
-                            } else {
-                                // Naive timestamp - format without timezone suffix
-                                datetime.format("%Y-%m-%dT%H:%M:%S%.f").to_string()
-                            };
-                            params.push(Box::new(iso_string));
+                            params.push(Box::new(timestamp_text(nanos, timezone.as_deref())));
                         }
                     }
                     DataType::Time32(unit) => {
