@@ -1109,6 +1109,126 @@ mod tests {
         (ids, names)
     }
 
+    /// Deletes the rows of a timestamp column before `cutoff`, with rows on both sides of it
+    /// within the cutoff's own calendar day, and returns how many it deleted and the ids left.
+    async fn delete_before_same_day_cutoff(
+        table_name: &str,
+        timezone: Option<&str>,
+    ) -> (u64, Vec<i64>) {
+        use datafusion::arrow::array::TimestampMicrosecondArray;
+        use datafusion::arrow::datatypes::{Field, TimeUnit};
+        use datafusion::common::ScalarValue;
+
+        let timezone: Option<Arc<str>> = timezone.map(Into::into);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, timezone.clone()),
+                false,
+            ),
+        ]));
+        let external_table = CreateExternalTable {
+            schema: ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema"),
+            name: TableReference::bare(table_name),
+            locations: vec![],
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::default(),
+            column_defaults: HashMap::default(),
+            temporary: false,
+            or_replace: false,
+        };
+        let ctx = SessionContext::new();
+        let table = SqliteTableProviderFactory::default()
+            .create(&ctx.state(), &external_table)
+            .await
+            .expect("table should be created");
+
+        // 2026-10-26T05:56:16Z, in microseconds.
+        let cutoff: i64 = 1_792_994_176_000_000;
+        let times = vec![
+            cutoff - 21_318_000_000, // 00:00:58 the same day
+            cutoff - 500_000,        // half a second before
+            cutoff - 1,              // a microsecond before
+            cutoff,                  // the cutoff itself
+            cutoff + 1,              // a microsecond after
+            cutoff + 64_000_000_000, // 23:42:56 the same day
+        ];
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from((1..=6).collect::<Vec<i64>>())),
+                Arc::new(
+                    TimestampMicrosecondArray::from(times).with_timezone_opt(timezone.clone()),
+                ),
+            ],
+        )
+        .expect("data should be created");
+        let insertion = table
+            .insert_into(
+                &ctx.state(),
+                Arc::new(MockExec::new(vec![Ok(data)], Arc::clone(&schema))),
+                InsertOp::Append,
+            )
+            .await
+            .expect("insertion should be successful");
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful");
+
+        let filter = col("ts").lt(lit(ScalarValue::TimestampMicrosecond(
+            Some(cutoff),
+            timezone,
+        )));
+        let plan = table
+            .delete_from(&ctx.state(), vec![filter])
+            .await
+            .expect("delete_from should succeed");
+        let deleted = extract_count(plan, &ctx).await;
+
+        let scan = table
+            .scan(&ctx.state(), Some(&vec![0]), &[], None)
+            .await
+            .expect("scan should succeed");
+        let mut ids: Vec<i64> = collect(scan, ctx.task_ctx())
+            .await
+            .expect("collect should succeed")
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id column should be Int64Array")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        (deleted, ids)
+    }
+
+    #[tokio::test]
+    async fn test_delete_before_a_naive_timestamp_cutoff_on_its_own_day() {
+        let (deleted, ids) = delete_before_same_day_cutoff("test_delete_naive_cutoff", None).await;
+        assert_eq!(deleted, 3, "the three rows before the cutoff are deleted");
+        assert_eq!(ids, vec![4, 5, 6], "the cutoff and every later row stay");
+    }
+
+    #[tokio::test]
+    async fn test_delete_before_an_offset_timestamp_cutoff_on_its_own_day() {
+        let (deleted, ids) =
+            delete_before_same_day_cutoff("test_delete_offset_cutoff", Some("+10:00")).await;
+        assert_eq!(deleted, 3, "the three rows before the cutoff are deleted");
+        assert_eq!(ids, vec![4, 5, 6], "the cutoff and every later row stay");
+    }
+
     #[tokio::test]
     async fn test_delete_from_with_filter() {
         let (table, ctx, _schema) =
