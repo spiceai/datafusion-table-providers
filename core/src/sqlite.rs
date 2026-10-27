@@ -533,6 +533,27 @@ pub(crate) fn timestamp_text(nanos: i64, timezone: Option<&str>) -> String {
     }
 }
 
+/// The text an inline (not prepared) insert stores `nanos` as: `%Y-%m-%d %H:%M:%S` and six
+/// fraction digits for a naive timestamp, or `%Y-%m-%d %H:%M:%S%.f %:z` in the column's zone
+/// otherwise, as [`InsertBuilder`] renders them.
+pub(crate) fn inline_timestamp_text(nanos: i64, timezone: Option<&str>) -> String {
+    use chrono::{Offset, TimeZone};
+    let datetime = chrono::DateTime::from_timestamp_nanos(nanos);
+    match timezone {
+        Some(tz) => {
+            let offset = tz
+                .parse::<arrow::array::timezone::Tz>()
+                .map(|tz| tz.offset_from_utc_datetime(&datetime.naive_utc()).fix())
+                .unwrap_or_else(|_| chrono::Utc.fix());
+            datetime
+                .with_timezone(&offset)
+                .format("%Y-%m-%d %H:%M:%S%.f %:z")
+                .to_string()
+        }
+        None => datetime.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
+    }
+}
+
 /// Parse a timezone offset string like "+10:00" or "-05:30" to seconds
 fn parse_timezone_offset_seconds(tz: &str) -> Option<i32> {
     let tz = tz.trim();

@@ -166,6 +166,7 @@ impl TableProvider for SqliteTableWriter {
             return make_count_exec(0);
         }
 
+        let assignments = timestamp_assignments_as_stored_text(assignments, &self.schema());
         let set_clause = assignments_to_sql(&assignments, Some(expr::Engine::SQLite))?;
         let sqlite = self.sqlite();
 
@@ -197,11 +198,11 @@ impl TableProvider for SqliteTableWriter {
 /// after it: `ts < <cutoff>` kept all of that day's rows before the cutoff, and `datetime()`
 /// also dropped the literal's fraction of a second.
 ///
-/// Not every row has the `T`, though. A file written before inserts were prepared statements,
-/// or a row an `UPDATE` set to a literal, holds a space there. Against such a row a `T` literal
-/// is just as wrong, in the other direction: `ts < <cutoff>` would delete that day's rows from
-/// after the cutoff. So each row is compared with the literal written the way that row is: see
-/// [`compare_in_row_format`].
+/// Not every row has the `T`, though. A row an inline (not prepared) insert wrote holds a space
+/// there, with six fraction digits for a naive timestamp and ` +hh:mm` for one with a zone.
+/// Against such a row a `T` literal is just as wrong, in the other direction: `ts < <cutoff>`
+/// would delete that day's rows from after the cutoff. So each row is compared with the literal
+/// written the way that row is: see [`compare_in_row_format`].
 fn timestamp_literals_as_stored_text(
     filters: Vec<Expr>,
     schema: &SchemaRef,
@@ -225,42 +226,39 @@ fn timestamp_literals_as_stored_text(
                     ) {
                         return Ok(Transformed::no(expr));
                     }
-                    let as_text = |column: &Expr, literal: &Expr| -> Option<String> {
-                        let Expr::Column(column) = column else {
-                            return None;
+                    let as_instant =
+                        |column: &Expr, literal: &Expr| -> Option<(i64, Option<Arc<str>>)> {
+                            let Expr::Column(column) = column else {
+                                return None;
+                            };
+                            let Expr::Literal(value, _) = literal else {
+                                return None;
+                            };
+                            let Ok(field) = schema.field_with_name(&column.name) else {
+                                return None;
+                            };
+                            let DataType::Timestamp(_, timezone) = field.data_type() else {
+                                return None;
+                            };
+                            let nanos = timestamp_literal_nanos(value)?;
+                            Some((nanos, timezone.clone()))
                         };
-                        let Expr::Literal(value, _) = literal else {
-                            return None;
-                        };
-                        let Ok(field) = schema.field_with_name(&column.name) else {
-                            return None;
-                        };
-                        let DataType::Timestamp(_, timezone) = field.data_type() else {
-                            return None;
-                        };
-                        let nanos = match value {
-                            ScalarValue::TimestampSecond(Some(v), _) => {
-                                v.checked_mul(1_000_000_000)?
-                            }
-                            ScalarValue::TimestampMillisecond(Some(v), _) => {
-                                v.checked_mul(1_000_000)?
-                            }
-                            ScalarValue::TimestampMicrosecond(Some(v), _) => {
-                                v.checked_mul(1_000)?
-                            }
-                            ScalarValue::TimestampNanosecond(Some(v), _) => *v,
-                            _ => return None,
-                        };
-                        Some(super::timestamp_text(nanos, timezone.as_deref()))
-                    };
-                    if let Some(text) = as_text(left, right) {
+                    if let Some((nanos, timezone)) = as_instant(left, right) {
                         return Ok(Transformed::yes(compare_in_row_format(
-                            left, *op, &text, true,
+                            left,
+                            *op,
+                            nanos,
+                            timezone.as_deref(),
+                            true,
                         )));
                     }
-                    if let Some(text) = as_text(right, left) {
+                    if let Some((nanos, timezone)) = as_instant(right, left) {
                         return Ok(Transformed::yes(compare_in_row_format(
-                            right, *op, &text, false,
+                            right,
+                            *op,
+                            nanos,
+                            timezone.as_deref(),
+                            false,
                         )));
                     }
                     Ok(Transformed::no(expr))
@@ -273,12 +271,56 @@ fn timestamp_literals_as_stored_text(
 /// Matches a timestamp stored with a space between its date and its time.
 const SPACE_SEPARATED: &str = "__________ %";
 
-/// Compares `column` with `text`, the writer's text for a timestamp, as
-/// `(column has a space AND column <op> text with a space) OR (column has no space AND column
-/// <op> text)`. A row is either one or the other, so it is compared with the literal written
-/// the way it is written itself, and a `NULL` makes both halves unknown just as it made the
-/// comparison. `text` without a `T` (a year outside 0000–9999) is compared as it is.
-fn compare_in_row_format(column: &Expr, op: Operator, text: &str, column_on_left: bool) -> Expr {
+/// A timestamp literal's instant in nanoseconds, or `None` for anything else.
+fn timestamp_literal_nanos(value: &ScalarValue) -> Option<i64> {
+    match value {
+        ScalarValue::TimestampSecond(Some(v), _) => v.checked_mul(1_000_000_000),
+        ScalarValue::TimestampMillisecond(Some(v), _) => v.checked_mul(1_000_000),
+        ScalarValue::TimestampMicrosecond(Some(v), _) => v.checked_mul(1_000),
+        ScalarValue::TimestampNanosecond(Some(v), _) => Some(*v),
+        _ => None,
+    }
+}
+
+/// Sets each timestamp column an `UPDATE` assigns a timestamp literal to the text an insert
+/// writes for that instant (see [`super::timestamp_text`]), not to `datetime(<seconds>,
+/// 'unixepoch')`. That would store the instant in UTC with no offset and no fraction, text that
+/// sorts against the column's other rows by neither its day nor its offset.
+fn timestamp_assignments_as_stored_text(
+    assignments: Vec<(String, Expr)>,
+    schema: &SchemaRef,
+) -> Vec<(String, Expr)> {
+    assignments
+        .into_iter()
+        .map(|(name, value)| {
+            let text = match (&value, schema.field_with_name(&name)) {
+                (Expr::Literal(literal, _), Ok(field)) => match field.data_type() {
+                    DataType::Timestamp(_, timezone) => timestamp_literal_nanos(literal)
+                        .map(|nanos| super::timestamp_text(nanos, timezone.as_deref())),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match text {
+                Some(text) => (name, Expr::Literal(ScalarValue::Utf8(Some(text)), None)),
+                None => (name, value),
+            }
+        })
+        .collect()
+}
+
+/// Compares `column` with the instant `nanos` as `(column has a space AND column <op> the
+/// inline insert's text) OR (column has no space AND column <op> the prepared insert's text)`.
+/// A row is either one or the other, so it is compared with the literal written the way it is
+/// written itself, and a `NULL` makes both halves unknown just as it made the comparison. A
+/// year outside 0000–9999 has no `T` to tell the two apart, so it is compared as it is.
+fn compare_in_row_format(
+    column: &Expr,
+    op: Operator,
+    nanos: i64,
+    timezone: Option<&str>,
+    column_on_left: bool,
+) -> Expr {
     let compare = |text: String| {
         let text = Expr::Literal(ScalarValue::Utf8(Some(text)), None);
         let (left, right) = if column_on_left {
@@ -288,17 +330,16 @@ fn compare_in_row_format(column: &Expr, op: Operator, text: &str, column_on_left
         };
         Expr::BinaryExpr(BinaryExpr::new(Box::new(left), op, Box::new(right)))
     };
+    let text = super::timestamp_text(nanos, timezone);
     if text.as_bytes().get(10) != Some(&b'T') {
-        return compare(text.to_string());
+        return compare(text);
     }
-    let mut spaced = text.to_string();
-    spaced.replace_range(10..11, " ");
     let pattern = || Expr::Literal(ScalarValue::Utf8(Some(SPACE_SEPARATED.to_string())), None);
-    let space_rows = column.clone().like(pattern()).and(compare(spaced));
-    let t_rows = column
+    let space_rows = column
         .clone()
-        .not_like(pattern())
-        .and(compare(text.to_string()));
+        .like(pattern())
+        .and(compare(super::inline_timestamp_text(nanos, timezone)));
+    let t_rows = column.clone().not_like(pattern()).and(compare(text));
     space_rows.or(t_rows)
 }
 
@@ -1238,6 +1279,7 @@ mod tests {
         table_name: &str,
         timezone: Option<&str>,
         set_by_update: bool,
+        prepared_inserts: bool,
     ) -> (u64, Vec<i64>) {
         use datafusion::arrow::array::TimestampMicrosecondArray;
         use datafusion::arrow::datatypes::{Field, TimeUnit};
@@ -1270,6 +1312,7 @@ mod tests {
         };
         let ctx = SessionContext::new();
         let table = SqliteTableProviderFactory::default()
+            .with_batch_insert_use_prepared_statements(prepared_inserts)
             .create(&ctx.state(), &external_table)
             .await
             .expect("table should be created");
@@ -1360,7 +1403,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_before_a_naive_timestamp_cutoff_on_its_own_day() {
         let (deleted, ids) =
-            delete_before_same_day_cutoff("test_delete_naive_cutoff", None, false).await;
+            delete_before_same_day_cutoff("test_delete_naive_cutoff", None, false, true).await;
         assert_eq!(deleted, 3, "the three rows before the cutoff are deleted");
         assert_eq!(ids, vec![4, 5, 6], "the cutoff and every later row stay");
     }
@@ -1368,7 +1411,8 @@ mod tests {
     #[tokio::test]
     async fn test_delete_before_an_offset_timestamp_cutoff_on_its_own_day() {
         let (deleted, ids) =
-            delete_before_same_day_cutoff("test_delete_offset_cutoff", Some("+10:00"), false).await;
+            delete_before_same_day_cutoff("test_delete_offset_cutoff", Some("+10:00"), false, true)
+                .await;
         assert_eq!(deleted, 3, "the three rows before the cutoff are deleted");
         assert_eq!(ids, vec![4, 5, 6], "the cutoff and every later row stay");
     }
@@ -1376,7 +1420,8 @@ mod tests {
     #[tokio::test]
     async fn test_delete_before_a_naive_timestamp_cutoff_on_its_own_day_from_rows_an_update_set() {
         let (deleted, ids) =
-            delete_before_same_day_cutoff("test_delete_naive_cutoff_updated", None, true).await;
+            delete_before_same_day_cutoff("test_delete_naive_cutoff_updated", None, true, true)
+                .await;
         assert_eq!(deleted, 3, "the three rows before the cutoff are deleted");
         assert_eq!(ids, vec![4, 5, 6], "the cutoff and every later row stay");
     }
@@ -1388,6 +1433,31 @@ mod tests {
             "test_delete_offset_cutoff_updated",
             Some("+10:00"),
             true,
+            true,
+        )
+        .await;
+        assert_eq!(deleted, 3, "the three rows before the cutoff are deleted");
+        assert_eq!(ids, vec![4, 5, 6], "the cutoff and every later row stay");
+    }
+
+    #[tokio::test]
+    async fn test_delete_before_a_naive_timestamp_cutoff_on_its_own_day_from_rows_an_inline_insert_wrote(
+    ) {
+        let (deleted, ids) =
+            delete_before_same_day_cutoff("test_delete_naive_cutoff_inline", None, false, false)
+                .await;
+        assert_eq!(deleted, 3, "the three rows before the cutoff are deleted");
+        assert_eq!(ids, vec![4, 5, 6], "the cutoff and every later row stay");
+    }
+
+    #[tokio::test]
+    async fn test_delete_before_an_offset_timestamp_cutoff_on_its_own_day_from_rows_an_inline_insert_wrote(
+    ) {
+        let (deleted, ids) = delete_before_same_day_cutoff(
+            "test_delete_offset_cutoff_inline",
+            Some("+10:00"),
+            false,
+            false,
         )
         .await;
         assert_eq!(deleted, 3, "the three rows before the cutoff are deleted");
