@@ -41,7 +41,7 @@ arrow-json = "59.0"
 arrow-odbc = { version = "25.3" }
 datafusion = { version = "55.0", default-features = false }
 datafusion-expr = { version = "55.0" }
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "b5988d7b5d99b84bea4e9ae2512dc06724136d23" } # branch: ben/preserve-computed-projection-names
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a9644a7bcb27499f3c2d5baf298cd8bf25d32629" } # branch: ben/preserve-computed-projection-names
 datafusion-ffi = { version = "55.0" }
 datafusion-proto = { version = "55.0" }
 datafusion-physical-expr = { version = "55.0" }
