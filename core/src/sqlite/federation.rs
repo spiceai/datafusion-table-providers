@@ -2,6 +2,7 @@ use crate::sql::db_connection_pool::dbconnection::{get_schema, Error as DbError}
 use crate::sql::sql_provider_datafusion::{get_stream, to_execution_error};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::sql::sqlparser::ast::{self, VisitMut};
@@ -141,8 +142,10 @@ impl<T, P> SQLExecutor for SQLiteTable<T, P> {
         Some(AstAnalyzer::new(vec![rule]))
     }
 
+    /// SQLite has no `UNNEST`, so a plan that unnests a column runs it in DataFusion. The
+    /// federation then sends SQLite the parts of the plan below the `Unnest` it can run.
     fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
-        self.base_table.can_execute_plan(plan)
+        !contains_unnest(plan) && self.base_table.can_execute_plan(plan)
     }
 
     fn execute(
@@ -180,6 +183,21 @@ impl<T, P> SQLExecutor for SQLiteTable<T, P> {
             .map_err(|e| DbError::UnableToGetSchema { source: e })
             .map_err(to_execution_error)
     }
+}
+
+/// Whether `plan`, or a subquery inside one of its expressions, has an `Unnest`. A plan that
+/// cannot be walked counts as having one, so it is never sent to SQLite.
+fn contains_unnest(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    let walked = plan.apply_with_subqueries(|node| {
+        found = matches!(node, LogicalPlan::Unnest(_));
+        Ok(if found {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    });
+    found || walked.is_err()
 }
 
 #[cfg(test)]
