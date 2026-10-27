@@ -7,7 +7,10 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::ScalarValue;
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
-use datafusion::logical_expr::{BinaryExpr, Operator};
+use datafusion::logical_expr::{
+    expr::ScalarFunction, BinaryExpr, ColumnarValue, Operator, ScalarFunctionArgs, ScalarUDF,
+    ScalarUDFImpl, Signature, Volatility,
+};
 use datafusion::{
     catalog::Session,
     common::TableReference,
@@ -190,19 +193,15 @@ impl TableProvider for SqliteTableWriter {
 }
 
 /// Rewrites each comparison of a timestamp column with a timestamp literal to compare the
-/// column with the text the column stores that instant as (see [`super::timestamp_text`]).
+/// instant each row's text names with the literal's instant.
 ///
-/// The column holds ISO-8601 text such as `2026-10-26T05:56:16`, while the literal renders as
-/// `datetime(<seconds>, 'unixepoch')`, whose text has a space where the column has its `T`.
-/// SQLite compares the two as text, so every row from the literal's own calendar day sorted
-/// after it: `ts < <cutoff>` kept all of that day's rows before the cutoff, and `datetime()`
-/// also dropped the literal's fraction of a second.
-///
-/// Not every row has the `T`, though. A row an inline (not prepared) insert wrote holds a space
-/// there, with six fraction digits for a naive timestamp and ` +hh:mm` for one with a zone.
-/// Against such a row a `T` literal is just as wrong, in the other direction: `ts < <cutoff>`
-/// would delete that day's rows from after the cutoff. So each row is compared with the literal
-/// written the way that row is: see [`compare_in_row_format`].
+/// The literal would render as `datetime(<seconds>, 'unixepoch')`, and SQLite compares it with
+/// the column as text. The column's rows are not all written one way: a prepared insert writes
+/// `2026-10-26T05:56:16` (RFC 3339 with an offset for a zoned column), an inline insert writes
+/// `2026-10-26 05:56:16.000000` (with ` +hh:mm` in the column's zone, which moves across a DST
+/// change), and an `UPDATE` from before this change wrote UTC with no fraction. No single literal
+/// text sorts in instant order against all of them, so the row's text is parsed instead: see
+/// [`compare_instants`].
 fn timestamp_literals_as_stored_text(
     filters: Vec<Expr>,
     schema: &SchemaRef,
@@ -226,39 +225,27 @@ fn timestamp_literals_as_stored_text(
                     ) {
                         return Ok(Transformed::no(expr));
                     }
-                    let as_instant =
-                        |column: &Expr, literal: &Expr| -> Option<(i64, Option<Arc<str>>)> {
-                            let Expr::Column(column) = column else {
-                                return None;
-                            };
-                            let Expr::Literal(value, _) = literal else {
-                                return None;
-                            };
-                            let Ok(field) = schema.field_with_name(&column.name) else {
-                                return None;
-                            };
-                            let DataType::Timestamp(_, timezone) = field.data_type() else {
-                                return None;
-                            };
-                            let nanos = timestamp_literal_nanos(value)?;
-                            Some((nanos, timezone.clone()))
+                    let as_instant = |column: &Expr, literal: &Expr| -> Option<i64> {
+                        let Expr::Column(column) = column else {
+                            return None;
                         };
-                    if let Some((nanos, timezone)) = as_instant(left, right) {
-                        return Ok(Transformed::yes(compare_in_row_format(
-                            left,
-                            *op,
-                            nanos,
-                            timezone.as_deref(),
-                            true,
-                        )));
+                        let Expr::Literal(value, _) = literal else {
+                            return None;
+                        };
+                        let field = schema.field_with_name(&column.name).ok()?;
+                        let DataType::Timestamp(..) = field.data_type() else {
+                            return None;
+                        };
+                        timestamp_literal_nanos(value)
+                    };
+                    if let Some(nanos) = as_instant(left, right) {
+                        return Ok(Transformed::yes(compare_instants(left, *op, nanos)));
                     }
-                    if let Some((nanos, timezone)) = as_instant(right, left) {
-                        return Ok(Transformed::yes(compare_in_row_format(
+                    if let Some(nanos) = as_instant(right, left) {
+                        return Ok(Transformed::yes(compare_instants(
                             right,
-                            *op,
+                            op.swap().unwrap_or(*op),
                             nanos,
-                            timezone.as_deref(),
-                            false,
                         )));
                     }
                     Ok(Transformed::no(expr))
@@ -267,9 +254,6 @@ fn timestamp_literals_as_stored_text(
         })
         .collect()
 }
-
-/// Matches a timestamp stored with a space between its date and its time.
-const SPACE_SEPARATED: &str = "__________ %";
 
 /// A timestamp literal's instant in nanoseconds, or `None` for anything else.
 fn timestamp_literal_nanos(value: &ScalarValue) -> Option<i64> {
@@ -309,38 +293,157 @@ fn timestamp_assignments_as_stored_text(
         .collect()
 }
 
-/// Compares `column` with the instant `nanos` as `(column has a space AND column <op> the
-/// inline insert's text) OR (column has no space AND column <op> the prepared insert's text)`.
-/// A row is either one or the other, so it is compared with the literal written the way it is
-/// written itself, and a `NULL` makes both halves unknown just as it made the comparison. A
-/// year outside 0000–9999 has no `T` to tell the two apart, so it is compared as it is.
-fn compare_in_row_format(
-    column: &Expr,
-    op: Operator,
-    nanos: i64,
-    timezone: Option<&str>,
-    column_on_left: bool,
-) -> Expr {
-    let compare = |text: String| {
-        let text = Expr::Literal(ScalarValue::Utf8(Some(text)), None);
-        let (left, right) = if column_on_left {
-            (column.clone(), text)
-        } else {
-            (text, column.clone())
-        };
-        Expr::BinaryExpr(BinaryExpr::new(Box::new(left), op, Box::new(right)))
-    };
-    let text = super::timestamp_text(nanos, timezone);
-    if text.as_bytes().get(10) != Some(&b'T') {
-        return compare(text);
+/// A SQLite function, by name, for an expression that is only ever rendered to SQL by
+/// [`filters_to_sql`] and never evaluated by `DataFusion`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct SqliteFunction {
+    name: &'static str,
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for SqliteFunction {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
-    let pattern = || Expr::Literal(ScalarValue::Utf8(Some(SPACE_SEPARATED.to_string())), None);
-    let space_rows = column
-        .clone()
-        .like(pattern())
-        .and(compare(super::inline_timestamp_text(nanos, timezone)));
-    let t_rows = column.clone().not_like(pattern()).and(compare(text));
-    space_rows.or(t_rows)
+
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(
+        &self,
+        _args: ScalarFunctionArgs,
+    ) -> datafusion::error::Result<ColumnarValue> {
+        datafusion::common::internal_err!("{} is only rendered for SQLite", self.name)
+    }
+}
+
+fn sqlite_call(name: &'static str, args: Vec<Expr>) -> Expr {
+    Expr::ScalarFunction(ScalarFunction::new_udf(
+        Arc::new(ScalarUDF::new_from_impl(SqliteFunction {
+            name,
+            signature: Signature::variadic_any(Volatility::Immutable),
+        })),
+        args,
+    ))
+}
+
+fn text(value: &str) -> Expr {
+    Expr::Literal(ScalarValue::Utf8(Some(value.to_string())), None)
+}
+
+fn int(value: i64) -> Expr {
+    Expr::Literal(ScalarValue::Int64(Some(value)), None)
+}
+
+fn binary(left: Expr, op: Operator, right: Expr) -> Expr {
+    Expr::BinaryExpr(BinaryExpr::new(Box::new(left), op, Box::new(right)))
+}
+
+fn as_integer(expr: Expr) -> Expr {
+    Expr::Cast(datafusion::logical_expr::Cast::new(
+        Box::new(expr),
+        DataType::Int64,
+    ))
+}
+
+/// The whole UTC epoch second a stored timestamp names, from its first 19 characters (the date
+/// and time of day, with a `T` or a space between them) and a trailing `+hh:mm` or `-hh:mm`
+/// offset if it has one. Text with no offset is UTC, as both naive timestamps and an old
+/// `UPDATE`'s text are. The fraction is left out: `strftime` rounds it to milliseconds, which
+/// can carry it into the next second.
+fn stored_epoch_second(column: &Expr) -> Expr {
+    let offset_sign = sqlite_call("substr", vec![column.clone(), int(-6), int(1)]);
+    let offset = sqlite_call(
+        "iif",
+        vec![
+            offset_sign.in_list(vec![text("+"), text("-")], false),
+            sqlite_call("substr", vec![column.clone(), int(-6)]),
+            text(""),
+        ],
+    );
+    let date_and_time = sqlite_call("substr", vec![column.clone(), int(1), int(19)]);
+    as_integer(sqlite_call(
+        "strftime",
+        vec![
+            text("%s"),
+            binary(date_and_time, Operator::StringConcat, offset),
+        ],
+    ))
+}
+
+/// The nanoseconds past its second a stored timestamp names, from the digits after the `.` that
+/// follows its seconds, or 0 when it has none. A `1` is put before the digits, so that their
+/// leading zeros survive the cast to an integer that stops at the first non-digit (an offset, a
+/// space or the end), and is dropped again before the digits are padded to nine.
+fn stored_nanosecond(column: &Expr) -> Expr {
+    let after_point = sqlite_call("substr", vec![column.clone(), int(21)]);
+    let marked = as_integer(binary(text("1"), Operator::StringConcat, after_point));
+    let digits = sqlite_call(
+        "substr",
+        vec![binary(marked, Operator::StringConcat, text("")), int(2)],
+    );
+    let padded = sqlite_call(
+        "substr",
+        vec![
+            binary(digits, Operator::StringConcat, text("000000000")),
+            int(1),
+            int(9),
+        ],
+    );
+    let has_fraction = binary(
+        sqlite_call("substr", vec![column.clone(), int(20), int(1)]),
+        Operator::Eq,
+        text("."),
+    );
+    sqlite_call("iif", vec![has_fraction, as_integer(padded), int(0)])
+}
+
+/// Compares the instant `column`'s text names with the instant `nanos`, as `column <op> nanos`,
+/// by comparing (UTC epoch second, nanosecond) pairs in order. Every format a row may be stored
+/// in parses to the same pair for the same instant, whatever its separator, fraction width or
+/// offset, so rows compare by instant even across a DST change. A `NULL`, or text that is not a
+/// timestamp, makes the comparison unknown and matches no row.
+fn compare_instants(column: &Expr, op: Operator, nanos: i64) -> Expr {
+    let cutoff_second = int(nanos.div_euclid(1_000_000_000));
+    let cutoff_nanosecond = int(nanos.rem_euclid(1_000_000_000));
+    let second = || stored_epoch_second(column);
+    let nanosecond = || stored_nanosecond(column);
+    let same_second = || binary(second(), Operator::Eq, cutoff_second.clone());
+    let ordered = |strict: Operator, fraction: Operator| {
+        binary(second(), strict, cutoff_second.clone()).or(same_second().and(binary(
+            nanosecond(),
+            fraction,
+            cutoff_nanosecond.clone(),
+        )))
+    };
+    match op {
+        Operator::Eq => same_second().and(binary(
+            nanosecond(),
+            Operator::Eq,
+            cutoff_nanosecond.clone(),
+        )),
+        // Not `second <> s OR nanosecond <> n`: a `NULL` row's nanosecond is 0, not `NULL`,
+        // so that would match it whenever the cutoff has a fraction.
+        Operator::NotEq => {
+            binary(second(), Operator::NotEq, cutoff_second.clone()).or(same_second().and(binary(
+                nanosecond(),
+                Operator::NotEq,
+                cutoff_nanosecond.clone(),
+            )))
+        }
+        Operator::Lt | Operator::LtEq => ordered(Operator::Lt, op),
+        Operator::Gt | Operator::GtEq => ordered(Operator::Gt, op),
+        _ => binary(column.clone(), op, int(nanos)),
+    }
 }
 
 struct SqliteDeletionSink {
@@ -588,6 +691,7 @@ mod tests {
     use datafusion::arrow::array::UInt64Array;
     use datafusion::logical_expr::{col, lit};
 
+    use super::{compare_instants, expr, filters_to_sql, Operator};
     use crate::sqlite::SqliteTableProviderFactory;
     use crate::util::test::MockExec;
 
@@ -1462,6 +1566,103 @@ mod tests {
         .await;
         assert_eq!(deleted, 3, "the three rows before the cutoff are deleted");
         assert_eq!(ids, vec![4, 5, 6], "the cutoff and every later row stay");
+    }
+
+    /// The ids of the rows whose stored `ts` text compares `<op>` the instant `nanos`, under the
+    /// filter a delete or an update sends to SQLite.
+    fn ids_comparing(op: Operator, nanos: i64, rows: &[Option<&str>]) -> Vec<i64> {
+        let filter = compare_instants(&col("ts"), op, nanos);
+        let sql_where = filters_to_sql(&[filter], Some(expr::Engine::SQLite)).expect("renders");
+        let conn = rusqlite::Connection::open_in_memory().expect("opens");
+        conn.execute("CREATE TABLE t (id INTEGER, ts TEXT)", [])
+            .expect("creates");
+        for (id, ts) in (1_i64..).zip(rows) {
+            conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![id, ts])
+                .expect("inserts");
+        }
+        let mut statement = conn
+            .prepare(&format!("SELECT id FROM t WHERE {sql_where} ORDER BY id"))
+            .expect("prepares");
+        statement
+            .query_map([], |row| row.get(0))
+            .expect("queries")
+            .collect::<Result<Vec<i64>, _>>()
+            .expect("reads")
+    }
+
+    #[test]
+    fn test_every_stored_form_of_an_instant_compares_equal_to_it() {
+        // 2026-10-26T05:56:16Z.
+        let cutoff = 1_792_994_176_000_000_000;
+        let rows = [
+            Some("2026-10-26T05:56:16"),               // prepared, naive
+            Some("2026-10-26T15:56:16+10:00"),         // prepared, offset
+            Some("2026-10-26 05:56:16.000000"),        // inline, naive
+            Some("2026-10-26 15:56:16 +10:00"),        // inline, offset
+            Some("2026-10-26 05:56:16"),               // an older UPDATE, UTC
+            Some("2026-10-26T01:56:16.000-04:00"),     // negative offset, fraction
+            Some("2026-10-26T05:56:16.000000001"),     // a nanosecond after
+            Some("2026-10-26 15:56:15.999999 +10:00"), // a microsecond before
+            None,
+        ];
+        assert_eq!(
+            ids_comparing(Operator::Eq, cutoff, &rows),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+        assert_eq!(ids_comparing(Operator::NotEq, cutoff, &rows), vec![7, 8]);
+        assert_eq!(ids_comparing(Operator::Lt, cutoff, &rows), vec![8]);
+        assert_eq!(
+            ids_comparing(Operator::LtEq, cutoff, &rows),
+            vec![1, 2, 3, 4, 5, 6, 8]
+        );
+        assert_eq!(ids_comparing(Operator::Gt, cutoff, &rows), vec![7]);
+        assert_eq!(
+            ids_comparing(Operator::GtEq, cutoff, &rows),
+            vec![1, 2, 3, 4, 5, 6, 7]
+        );
+    }
+
+    #[test]
+    fn test_rows_across_a_dst_fallback_compare_by_instant() {
+        // 2026-11-01T05:45:00Z, 01:45 EDT, in the hour America/New_York repeats.
+        let cutoff = 1_793_511_900_000_000_000;
+        let rows = [
+            Some("2026-11-01 01:15:00 -05:00"),     // 06:15Z, after
+            Some("2026-11-01 01:40:00.5 -04:00"),   // 05:40:00.5Z, before
+            Some("2026-11-01 01:50:00 -04:00"),     // 05:50Z, after
+            Some("2026-11-01 00:59:59.999 -05:00"), // 05:59:59.999Z, after
+        ];
+        assert_eq!(ids_comparing(Operator::Lt, cutoff, &rows), vec![2]);
+        assert_eq!(ids_comparing(Operator::Gt, cutoff, &rows), vec![1, 3, 4]);
+    }
+
+    #[test]
+    fn test_a_sub_microsecond_cutoff_keeps_its_nanoseconds() {
+        // 500 ns past 2026-10-26T05:56:16Z.
+        let cutoff = 1_792_994_176_000_000_500;
+        let rows = [
+            Some("2026-10-26 05:56:16.000000"),
+            Some("2026-10-26T05:56:16.0000005"),
+            Some("2026-10-26T05:56:16.000000501"),
+            None,
+        ];
+        assert_eq!(ids_comparing(Operator::Lt, cutoff, &rows), vec![1]);
+        assert_eq!(ids_comparing(Operator::Eq, cutoff, &rows), vec![2]);
+        assert_eq!(ids_comparing(Operator::Gt, cutoff, &rows), vec![3]);
+        assert_eq!(ids_comparing(Operator::NotEq, cutoff, &rows), vec![1, 3]);
+    }
+
+    #[test]
+    fn test_a_stored_fraction_keeps_its_leading_zeros() {
+        // 2026-10-26T05:56:16.05Z.
+        let cutoff = 1_792_994_176_050_000_000;
+        let rows = [
+            Some("2026-10-26T05:56:16.05"),
+            Some("2026-10-26T05:56:16.5"),
+            Some("2026-10-26T05:56:16.005Z"),
+        ];
+        assert_eq!(ids_comparing(Operator::Eq, cutoff, &rows), vec![1]);
+        assert_eq!(ids_comparing(Operator::Lt, cutoff, &rows), vec![3]);
     }
 
     #[tokio::test]
