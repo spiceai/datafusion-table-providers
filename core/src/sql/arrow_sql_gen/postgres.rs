@@ -312,17 +312,19 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
         for (column_index, column) in row.columns().iter().enumerate() {
             let column_name = column.name();
             let column_type = column.type_();
+            let projected_field = projected_destination_field(
+                projected_schema.as_ref(),
+                column_name,
+                column_index,
+                column_count,
+            );
             let projected_json_complex_field =
-                projected_json_complex_field(projected_schema, column_name, column_type);
-
-            let projected_field = projected_schema
-                .as_ref()
-                .and_then(|schema| schema.field_with_name(column_name).ok());
+                projected_json_complex_field(projected_field, column_type);
 
             let mut numeric_scale: Option<u32> = None;
 
             let mut data_type = if *column_type == Type::NUMERIC {
-                let destination = numeric_destination_field(
+                let destination = projected_destination_field(
                     projected_schema.as_ref(),
                     column_name,
                     column_index,
@@ -1109,8 +1111,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
 /// composite/array columns carry their own wire OIDs handled elsewhere — so this is safe
 /// to apply regardless of the source database variant.
 fn projected_json_complex_field(
-    projected_schema: &Option<SchemaRef>,
-    column_name: &str,
+    projected_field: Option<&Field>,
     column_type: &Type,
 ) -> Option<Arc<Field>> {
     // Only text-bearing wire types can carry a JSON serialization. These all have a
@@ -1125,8 +1126,7 @@ fn projected_json_complex_field(
         return None;
     }
 
-    let schema = projected_schema.as_ref()?;
-    let field = Arc::new(schema.field_with_name(column_name).ok()?.clone());
+    let field = Arc::new(projected_field?.clone());
     match field.data_type() {
         DataType::List(_) | DataType::LargeList(_) | DataType::Struct(_) | DataType::Map(_, _) => {
             Some(field)
@@ -1502,7 +1502,7 @@ impl<'a> FromSql<'a> for GeometryFromSql<'a> {
 /// name (`sum(x) AS avg`), collide on it. A name lookup first would bind the
 /// first `avg` to whichever field is *called* `avg`, which is the alias, and
 /// decode a fractional average as the alias's `Int64`.
-fn numeric_destination_field<'a>(
+fn projected_destination_field<'a>(
     projected_schema: Option<&'a SchemaRef>,
     column_name: &str,
     column_index: usize,
@@ -2168,33 +2168,52 @@ mod tests {
     }
 
     #[test]
-    fn numeric_destination_field_matches_by_position_when_the_widths_agree() {
+    fn duplicate_result_names_keep_their_positional_nullability() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("id", DataType::Int32, true),
+        ]));
+        assert_eq!(
+            projected_destination_field(Some(&schema), "id", 0, 2).map(Field::is_nullable),
+            Some(false)
+        );
+        assert_eq!(
+            projected_destination_field(Some(&schema), "id", 1, 2).map(Field::is_nullable),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn projected_destination_field_matches_by_position_when_the_widths_agree() {
         let schema: SchemaRef = Arc::new(Schema::new(vec![
             Field::new("avg(hits.UserID)", DataType::Float64, true),
             Field::new("sum(hits.UserID)", DataType::Int64, true),
         ]));
         // A bare `avg`/`sum` the unparser emitted is matched to its position.
         assert_eq!(
-            numeric_destination_field(Some(&schema), "avg", 0, 2).map(Field::data_type),
+            projected_destination_field(Some(&schema), "avg", 0, 2).map(Field::data_type),
             Some(&DataType::Float64)
         );
         assert_eq!(
-            numeric_destination_field(Some(&schema), "sum", 1, 2).map(Field::data_type),
+            projected_destination_field(Some(&schema), "sum", 1, 2).map(Field::data_type),
             Some(&DataType::Int64)
         );
         // No positional match when the projection is not one field per column;
         // the name decides, and a name the projection lacks resolves to nothing.
         assert_eq!(
-            numeric_destination_field(Some(&schema), "sum(hits.UserID)", 0, 3)
+            projected_destination_field(Some(&schema), "sum(hits.UserID)", 0, 3)
                 .map(Field::data_type),
             Some(&DataType::Int64)
         );
-        assert_eq!(numeric_destination_field(Some(&schema), "sum", 1, 3), None);
-        assert_eq!(numeric_destination_field(None, "sum", 1, 2), None);
+        assert_eq!(
+            projected_destination_field(Some(&schema), "sum", 1, 3),
+            None
+        );
+        assert_eq!(projected_destination_field(None, "sum", 1, 2), None);
     }
 
     #[test]
-    fn numeric_destination_field_is_not_captured_by_a_colliding_alias() {
+    fn projected_destination_field_is_not_captured_by_a_colliding_alias() {
         // `SELECT avg(x), sum(x) AS avg`: Postgres names both columns `avg`, and the
         // second plan field is literally called `avg`. Position keeps the first
         // column on the Float64 the average needs; a name lookup would have bound
@@ -2204,11 +2223,11 @@ mod tests {
             Field::new("avg", DataType::Int64, true),
         ]));
         assert_eq!(
-            numeric_destination_field(Some(&schema), "avg", 0, 2).map(Field::name),
+            projected_destination_field(Some(&schema), "avg", 0, 2).map(Field::name),
             Some(&"avg(t.x)".to_string())
         );
         assert_eq!(
-            numeric_destination_field(Some(&schema), "avg", 1, 2).map(Field::name),
+            projected_destination_field(Some(&schema), "avg", 1, 2).map(Field::name),
             Some(&"avg".to_string())
         );
     }
@@ -2740,7 +2759,11 @@ mod tests {
         let projected_schema = Some(schema);
 
         assert!(
-            projected_json_complex_field(&projected_schema, "payload", &Type::VARCHAR).is_some(),
+            projected_json_complex_field(
+                projected_destination_field(projected_schema.as_ref(), "payload", 0, 0),
+                &Type::VARCHAR
+            )
+            .is_some(),
             "VARCHAR column projected as Struct should decode as JSON"
         );
 
@@ -2751,7 +2774,11 @@ mod tests {
             true,
         )])));
         assert!(
-            projected_json_complex_field(&scalar_schema, "payload", &Type::VARCHAR).is_none(),
+            projected_json_complex_field(
+                projected_destination_field(scalar_schema.as_ref(), "payload", 0, 0),
+                &Type::VARCHAR
+            )
+            .is_none(),
             "VARCHAR column projected as Utf8 must stay a scalar string"
         );
     }
@@ -2784,7 +2811,11 @@ mod tests {
             true,
         )])));
         assert!(
-            projected_json_complex_field(&schema, "payload", &super_type).is_some(),
+            projected_json_complex_field(
+                projected_destination_field(schema.as_ref(), "payload", 0, 0),
+                &super_type
+            )
+            .is_some(),
             "super column projected as List<Struct> should decode as JSON"
         );
     }
@@ -2870,9 +2901,12 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![other_field, payload_field]));
         let projected_schema = Some(schema);
 
-        // Name match succeeds regardless of positional index.
-        let resolved = projected_json_complex_field(&projected_schema, "payload", &Type::JSONB)
-            .expect("field should resolve from projected schema");
+        // A width mismatch retains the name-based destination lookup.
+        let resolved = projected_json_complex_field(
+            projected_destination_field(projected_schema.as_ref(), "payload", 0, 0),
+            &Type::JSONB,
+        )
+        .expect("field should resolve from projected schema");
         assert_eq!(resolved.name(), "payload");
 
         let DataType::List(item_field) = resolved.data_type() else {
@@ -2883,10 +2917,11 @@ mod tests {
         };
         assert_eq!(fields[0].name(), "email");
 
-        // Name miss returns None — no positional fallback.
-        assert!(
-            projected_json_complex_field(&projected_schema, "no_such_column", &Type::JSONB)
-                .is_none()
-        );
+        // An unknown name cannot resolve through the width-mismatch fallback.
+        assert!(projected_json_complex_field(
+            projected_destination_field(projected_schema.as_ref(), "no_such_column", 0, 0),
+            &Type::JSONB
+        )
+        .is_none());
     }
 }
