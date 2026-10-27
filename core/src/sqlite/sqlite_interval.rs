@@ -101,7 +101,9 @@ pub fn mark_date_operands(plan: LogicalPlan) -> Result<LogicalPlan, DataFusionEr
     // `with_subqueries`: an `EXISTS`, `IN` or scalar subquery is a plan of its own
     // inside an expression, which a plain `transform_up` never reaches, and a
     // federated statement keeps its same-source subqueries.
-    // One instant for the whole statement, as DataFusion's own `now()` gives.
+    // One instant for everything this plan sends to SQLite. Each federated subtree is
+    // rewritten separately, so two SQLite subtrees of one query may see instants a few
+    // microseconds apart.
     let simplifier = ExprSimplifier::new(SimplifyContext::builder().with_current_time().build());
     plan.transform_up_with_subqueries(|node| {
         // The expressions of a node are evaluated against its inputs, or against its

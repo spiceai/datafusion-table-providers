@@ -513,7 +513,6 @@ fn to_datafusion_error(error: Error) -> DataFusionError {
     DataFusionError::External(Box::new(error))
 }
 
-/// Parse a timezone offset string like "+10:00" or "-05:30" to seconds
 /// The ISO-8601 text a timestamp column stores `nanos` as: `%Y-%m-%dT%H:%M:%S%.f` for a
 /// naive timestamp, RFC 3339 in the column's fixed offset (UTC for any other zone) otherwise.
 ///
@@ -534,6 +533,7 @@ pub(crate) fn timestamp_text(nanos: i64, timezone: Option<&str>) -> String {
     }
 }
 
+/// Parse a timezone offset string like "+10:00" or "-05:30" to seconds
 fn parse_timezone_offset_seconds(tz: &str) -> Option<i32> {
     let tz = tz.trim();
     if tz.is_empty() {

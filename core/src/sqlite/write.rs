@@ -196,6 +196,12 @@ impl TableProvider for SqliteTableWriter {
 /// SQLite compares the two as text, so every row from the literal's own calendar day sorted
 /// after it: `ts < <cutoff>` kept all of that day's rows before the cutoff, and `datetime()`
 /// also dropped the literal's fraction of a second.
+///
+/// Not every row has the `T`, though. A file written before inserts were prepared statements,
+/// or a row an `UPDATE` set to a literal, holds a space there. Against such a row a `T` literal
+/// is just as wrong, in the other direction: `ts < <cutoff>` would delete that day's rows from
+/// after the cutoff. So each row is compared with the literal written the way that row is: see
+/// [`compare_in_row_format`].
 fn timestamp_literals_as_stored_text(
     filters: Vec<Expr>,
     schema: &SchemaRef,
@@ -219,7 +225,7 @@ fn timestamp_literals_as_stored_text(
                     ) {
                         return Ok(Transformed::no(expr));
                     }
-                    let as_text = |column: &Expr, literal: &Expr| -> Option<Expr> {
+                    let as_text = |column: &Expr, literal: &Expr| -> Option<String> {
                         let Expr::Column(column) = column else {
                             return None;
                         };
@@ -245,33 +251,55 @@ fn timestamp_literals_as_stored_text(
                             ScalarValue::TimestampNanosecond(Some(v), _) => *v,
                             _ => return None,
                         };
-                        Some(Expr::Literal(
-                            ScalarValue::Utf8(Some(super::timestamp_text(
-                                nanos,
-                                timezone.as_deref(),
-                            ))),
-                            None,
-                        ))
+                        Some(super::timestamp_text(nanos, timezone.as_deref()))
                     };
                     if let Some(text) = as_text(left, right) {
-                        return Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr::new(
-                            left.clone(),
-                            *op,
-                            Box::new(text),
-                        ))));
+                        return Ok(Transformed::yes(compare_in_row_format(
+                            left, *op, &text, true,
+                        )));
                     }
                     if let Some(text) = as_text(right, left) {
-                        return Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr::new(
-                            Box::new(text),
-                            *op,
-                            right.clone(),
-                        ))));
+                        return Ok(Transformed::yes(compare_in_row_format(
+                            right, *op, &text, false,
+                        )));
                     }
                     Ok(Transformed::no(expr))
                 })
                 .data()
         })
         .collect()
+}
+
+/// Matches a timestamp stored with a space between its date and its time.
+const SPACE_SEPARATED: &str = "__________ %";
+
+/// Compares `column` with `text`, the writer's text for a timestamp, as
+/// `(column has a space AND column <op> text with a space) OR (column has no space AND column
+/// <op> text)`. A row is either one or the other, so it is compared with the literal written
+/// the way it is written itself, and a `NULL` makes both halves unknown just as it made the
+/// comparison. `text` without a `T` (a year outside 0000–9999) is compared as it is.
+fn compare_in_row_format(column: &Expr, op: Operator, text: &str, column_on_left: bool) -> Expr {
+    let compare = |text: String| {
+        let text = Expr::Literal(ScalarValue::Utf8(Some(text)), None);
+        let (left, right) = if column_on_left {
+            (column.clone(), text)
+        } else {
+            (text, column.clone())
+        };
+        Expr::BinaryExpr(BinaryExpr::new(Box::new(left), op, Box::new(right)))
+    };
+    if text.as_bytes().get(10) != Some(&b'T') {
+        return compare(text.to_string());
+    }
+    let mut spaced = text.to_string();
+    spaced.replace_range(10..11, " ");
+    let pattern = || Expr::Literal(ScalarValue::Utf8(Some(SPACE_SEPARATED.to_string())), None);
+    let space_rows = column.clone().like(pattern()).and(compare(spaced));
+    let t_rows = column
+        .clone()
+        .not_like(pattern())
+        .and(compare(text.to_string()));
+    space_rows.or(t_rows)
 }
 
 struct SqliteDeletionSink {
