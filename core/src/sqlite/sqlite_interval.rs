@@ -1318,5 +1318,47 @@ mod test {
             )
             .await;
         }
+
+        /// A filter on the current time federated to SQLite, which has no `now()`,
+        /// sends the instant it folds to and keeps the rows that instant selects.
+        #[tokio::test]
+        async fn a_filter_on_the_current_time_folds_to_its_instant() {
+            let now = chrono::Utc::now().timestamp_micros();
+            let hour = 3_600_000_000;
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 2, 3])),
+                    Arc::new(TimestampMicrosecondArray::from(vec![
+                        now - hour / 2,
+                        now - 72 * hour,
+                        now + 72 * hour,
+                    ])),
+                ],
+            )
+            .expect("batch");
+            let ctx = federated_session("recent", batch).await;
+            for (sql, expected) in [
+                (
+                    "SELECT id FROM recent WHERE ts > now() - INTERVAL '1 day' ORDER BY id",
+                    "+----+\n| id |\n+----+\n| 1  |\n| 3  |\n+----+",
+                ),
+                (
+                    "SELECT id FROM recent WHERE ts < now() - INTERVAL '2 days' ORDER BY id",
+                    "+----+\n| id |\n+----+\n| 2  |\n+----+",
+                ),
+            ] {
+                let (rows, display) = run(&ctx, sql).await;
+                assert!(
+                    !display.to_lowercase().contains("now("),
+                    "{sql}: SQLite has no now(), so it must not be sent:\n{display}"
+                );
+                assert_eq!(rows, expected, "{sql}");
+            }
+        }
     }
 }
