@@ -400,7 +400,14 @@ fn stored_nanosecond(column: &Expr) -> Expr {
         Operator::Eq,
         text("."),
     );
-    sqlite_call("iif", vec![has_fraction, as_integer(padded), int(0)])
+    // `+ second * 0` makes the nanosecond `NULL` exactly when the second is, so that a `NULL`
+    // or unparseable row leaves every comparison unknown rather than false, as it was before:
+    // `flag = (ts = <cutoff>)` must not match a row whose `flag` is false and `ts` is `NULL`.
+    binary(
+        sqlite_call("iif", vec![has_fraction, as_integer(padded), int(0)]),
+        Operator::Plus,
+        binary(stored_epoch_second(column), Operator::Multiply, int(0)),
+    )
 }
 
 /// Compares the instant `column`'s text names with the instant `nanos`, as `column <op> nanos`,
@@ -1619,6 +1626,43 @@ mod tests {
     }
 
     #[test]
+    fn test_a_null_timestamp_leaves_a_nested_comparison_unknown() {
+        // 500 ns past 2026-10-26T05:56:16Z: a fractional cutoff.
+        let cutoff = 1_792_994_176_000_000_500;
+        let conn = rusqlite::Connection::open_in_memory().expect("opens");
+        conn.execute_batch(
+            "CREATE TABLE t (id INTEGER, flag BOOLEAN, ts TEXT);
+             INSERT INTO t VALUES (1, false, NULL), (2, false, 'not a timestamp'),
+                                  (3, false, '2026-10-26T05:56:16');",
+        )
+        .expect("creates");
+        for op in [
+            Operator::Eq,
+            Operator::NotEq,
+            Operator::Lt,
+            Operator::LtEq,
+            Operator::Gt,
+            Operator::GtEq,
+        ] {
+            let filter = col("flag").eq(compare_instants(&col("ts"), op, cutoff));
+            let sql_where = filters_to_sql(&[filter], Some(expr::Engine::SQLite)).expect("renders");
+            let mut statement = conn
+                .prepare(&format!("SELECT id FROM t WHERE {sql_where} ORDER BY id"))
+                .expect("prepares");
+            let ids = statement
+                .query_map([], |row| row.get(0))
+                .expect("queries")
+                .collect::<Result<Vec<i64>, _>>()
+                .expect("reads");
+            let expected: Vec<i64> = match op {
+                Operator::Eq | Operator::Gt | Operator::GtEq => vec![3],
+                _ => vec![],
+            };
+            assert_eq!(ids, expected, "flag = (ts {op} cutoff)");
+        }
+    }
+
+    #[test]
     fn test_rows_across_a_dst_fallback_compare_by_instant() {
         // 2026-11-01T05:45:00Z, 01:45 EDT, in the hour America/New_York repeats.
         let cutoff = 1_793_511_900_000_000_000;
@@ -1646,6 +1690,7 @@ mod tests {
         assert_eq!(ids_comparing(Operator::Eq, cutoff, &rows), vec![2]);
         assert_eq!(ids_comparing(Operator::Gt, cutoff, &rows), vec![3]);
         assert_eq!(ids_comparing(Operator::NotEq, cutoff, &rows), vec![1, 3]);
+        assert_eq!(ids_comparing(Operator::LtEq, cutoff, &rows), vec![1, 2]);
     }
 
     #[test]
