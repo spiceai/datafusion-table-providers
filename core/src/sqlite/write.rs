@@ -1203,9 +1203,13 @@ mod tests {
 
     /// Deletes the rows of a timestamp column before `cutoff`, with rows on both sides of it
     /// within the cutoff's own calendar day, and returns how many it deleted and the ids left.
+    /// With `set_by_update`, every row's timestamp is then written again by an `UPDATE` that
+    /// sets it to a literal, which stores the text with a space for its `T`, as files from
+    /// before prepared inserts hold it.
     async fn delete_before_same_day_cutoff(
         table_name: &str,
         timezone: Option<&str>,
+        set_by_update: bool,
     ) -> (u64, Vec<i64>) {
         use datafusion::arrow::array::TimestampMicrosecondArray;
         use datafusion::arrow::datatypes::{Field, TimeUnit};
@@ -1244,7 +1248,7 @@ mod tests {
 
         // 2026-10-26T05:56:16Z, in microseconds.
         let cutoff: i64 = 1_792_994_176_000_000;
-        let times = vec![
+        let times = [
             cutoff - 21_318_000_000, // 00:00:58 the same day
             cutoff - 500_000,        // half a second before
             cutoff - 1,              // a microsecond before
@@ -1257,7 +1261,8 @@ mod tests {
             vec![
                 Arc::new(Int64Array::from((1..=6).collect::<Vec<i64>>())),
                 Arc::new(
-                    TimestampMicrosecondArray::from(times).with_timezone_opt(timezone.clone()),
+                    TimestampMicrosecondArray::from(times.to_vec())
+                        .with_timezone_opt(timezone.clone()),
                 ),
             ],
         )
@@ -1273,6 +1278,24 @@ mod tests {
         collect(insertion, ctx.task_ctx())
             .await
             .expect("insert successful");
+
+        if set_by_update {
+            for (id, ts) in (1_i64..=6).zip(times) {
+                let literal = lit(ScalarValue::TimestampMicrosecond(
+                    Some(ts),
+                    timezone.clone(),
+                ));
+                let plan = table
+                    .update(
+                        &ctx.state(),
+                        vec![("ts".to_string(), literal)],
+                        vec![col("id").eq(lit(id))],
+                    )
+                    .await
+                    .expect("update should succeed");
+                assert_eq!(extract_count(plan, &ctx).await, 1, "row {id} is updated");
+            }
+        }
 
         let filter = col("ts").lt(lit(ScalarValue::TimestampMicrosecond(
             Some(cutoff),
@@ -1308,7 +1331,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_before_a_naive_timestamp_cutoff_on_its_own_day() {
-        let (deleted, ids) = delete_before_same_day_cutoff("test_delete_naive_cutoff", None).await;
+        let (deleted, ids) =
+            delete_before_same_day_cutoff("test_delete_naive_cutoff", None, false).await;
         assert_eq!(deleted, 3, "the three rows before the cutoff are deleted");
         assert_eq!(ids, vec![4, 5, 6], "the cutoff and every later row stay");
     }
@@ -1316,7 +1340,28 @@ mod tests {
     #[tokio::test]
     async fn test_delete_before_an_offset_timestamp_cutoff_on_its_own_day() {
         let (deleted, ids) =
-            delete_before_same_day_cutoff("test_delete_offset_cutoff", Some("+10:00")).await;
+            delete_before_same_day_cutoff("test_delete_offset_cutoff", Some("+10:00"), false).await;
+        assert_eq!(deleted, 3, "the three rows before the cutoff are deleted");
+        assert_eq!(ids, vec![4, 5, 6], "the cutoff and every later row stay");
+    }
+
+    #[tokio::test]
+    async fn test_delete_before_a_naive_timestamp_cutoff_on_its_own_day_from_rows_an_update_set() {
+        let (deleted, ids) =
+            delete_before_same_day_cutoff("test_delete_naive_cutoff_updated", None, true).await;
+        assert_eq!(deleted, 3, "the three rows before the cutoff are deleted");
+        assert_eq!(ids, vec![4, 5, 6], "the cutoff and every later row stay");
+    }
+
+    #[tokio::test]
+    async fn test_delete_before_an_offset_timestamp_cutoff_on_its_own_day_from_rows_an_update_set()
+    {
+        let (deleted, ids) = delete_before_same_day_cutoff(
+            "test_delete_offset_cutoff_updated",
+            Some("+10:00"),
+            true,
+        )
+        .await;
         assert_eq!(deleted, 3, "the three rows before the cutoff are deleted");
         assert_eq!(ids, vec![4, 5, 6], "the cutoff and every later row stay");
     }
