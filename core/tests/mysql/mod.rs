@@ -1,10 +1,15 @@
 use datafusion::{datasource::memory::MemorySourceConfig, execution::context::SessionContext};
+use datafusion_table_providers::sql::db_connection_pool::mysqlpool::{
+    MySQLConnectionPool, MySQLServerIdentity,
+};
 use datafusion_table_providers::sql::{
     db_connection_pool::DbConnectionPool, sql_provider_datafusion::SqlTable,
 };
-use mysql_async::prelude::ToValue;
+use mysql_async::prelude::{Queryable, ToValue};
+use mysql_async::PoolConstraints;
 use rstest::{fixture, rstest};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::{
     array::*,
@@ -966,6 +971,121 @@ async fn test_arrow_mysql_roundtrip(
         table_name,
     )
     .await;
+}
+
+async fn mysql_connection_id(pool: &MySQLConnectionPool) -> u64 {
+    let connection = pool.connect_direct().await.expect("connection to open");
+    let mut conn = connection.conn.lock().await;
+    conn.query_first("SELECT CONNECTION_ID()")
+        .await
+        .expect("CONNECTION_ID() to run")
+        .expect("CONNECTION_ID() to return a row")
+}
+
+/// The pool options passed to `new_with_pool_opts` apply when the server is given as a
+/// `connection_string` URL, where `pool_min` and `pool_max` parameters are not read.
+#[test_log::test(tokio::test)]
+async fn test_mysql_pool_opts_apply_to_connection_string() {
+    let port = crate::get_random_port();
+    let mysql_container = start_mysql_container(port).await;
+    let pool = MySQLConnectionPool::new_with_pool_opts(
+        common::get_mysql_connection_string_params(port),
+        |pool_opts| {
+            pool_opts
+                .with_constraints(PoolConstraints::new(1, 1).expect("1..=1 is a valid pool size"))
+                .with_abs_conn_ttl(Some(Duration::from_secs(3)))
+        },
+    )
+    .await
+    .expect("pool to be created from the connection string");
+
+    // `pool_max` of 1: a second connection waits while the first is held. The URL alone
+    // would allow 100.
+    let held = pool.connect_direct().await.expect("connection to open");
+    let second = tokio::time::timeout(Duration::from_millis(300), pool.connect_direct()).await;
+    assert!(
+        second.is_err(),
+        "a second connection opened while the pool's only one was held"
+    );
+    drop(held);
+
+    // Within its lifetime, the pooled connection is reused.
+    let first_id = mysql_connection_id(&pool).await;
+    assert_eq!(first_id, mysql_connection_id(&pool).await);
+
+    // Past its lifetime, counted from when the pool opened it, it is replaced. The sleep is
+    // the lifetime under test.
+    tokio::time::sleep(Duration::from_millis(3_500)).await;
+    let replaced_id = mysql_connection_id(&pool).await;
+    assert_ne!(
+        first_id, replaced_id,
+        "the connection outlived its 3s lifetime"
+    );
+
+    mysql_container.remove().await.expect("container to stop");
+}
+
+/// The observer hears of each connection once, before its first use, with the server it
+/// reached, and not again when the pool hands the same connection out again.
+#[test_log::test(tokio::test)]
+async fn test_mysql_new_connection_observer() {
+    let port = crate::get_random_port();
+    let mysql_container = start_mysql_container(port).await;
+    let reported = Arc::new(std::sync::Mutex::new(Vec::<MySQLServerIdentity>::new()));
+    let pool = MySQLConnectionPool::new_with_pool_opts(
+        common::get_mysql_connection_string_params(port),
+        |pool_opts| {
+            pool_opts
+                .with_constraints(PoolConstraints::new(1, 1).expect("1..=1 is a valid pool size"))
+                .with_abs_conn_ttl(Some(Duration::from_secs(3)))
+        },
+    )
+    .await
+    .expect("pool to be created")
+    .with_new_connection_observer({
+        let reported = Arc::clone(&reported);
+        move |identity| reported.lock().expect("lock").push(identity.clone())
+    });
+
+    let first_id = mysql_connection_id(&pool).await;
+    assert_eq!(first_id, mysql_connection_id(&pool).await);
+    tokio::time::sleep(Duration::from_millis(3_500)).await;
+    let replaced_id = mysql_connection_id(&pool).await;
+    assert_ne!(first_id, replaced_id);
+
+    let server_hostname: String = {
+        let connection = pool.connect_direct().await.expect("connection to open");
+        let mut conn = connection.conn.lock().await;
+        conn.query_first("SELECT @@hostname")
+            .await
+            .expect("@@hostname to be read")
+            .expect("@@hostname to return a row")
+    };
+    let reported = reported.lock().expect("lock").clone();
+    let ids: Vec<u32> = reported
+        .iter()
+        .map(|identity| identity.connection_id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            u32::try_from(first_id).expect("id fits"),
+            u32::try_from(replaced_id).expect("id fits")
+        ]
+    );
+    for identity in &reported {
+        assert_eq!(identity.configured_host, "localhost");
+        assert_eq!(
+            identity.configured_port,
+            u16::try_from(port).expect("port fits")
+        );
+        // Inside the container the server listens on 3306, whatever the host port.
+        assert_eq!(identity.port, 3306);
+        assert_eq!(identity.hostname, server_hostname);
+        assert_eq!(identity.aurora_server_id, None);
+    }
+
+    mysql_container.remove().await.expect("container to stop");
 }
 
 #[rstest]
