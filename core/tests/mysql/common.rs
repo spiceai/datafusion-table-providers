@@ -70,6 +70,25 @@ pub async fn start_mysql_docker_container_with_args(
     port: usize,
     mysqld_args: &[&str],
 ) -> Result<RunningContainer, anyhow::Error> {
+    start_container(port, mysqld_args, false).await
+}
+
+/// Starts a MySQL container whose health check stops once the server is healthy. Each check
+/// opens a connection, which takes a connection id, so a test that arranges which ids its own
+/// connections get needs the checks to stop. Needs Docker 25 or later for `start_interval`.
+#[instrument]
+pub async fn start_quiet_mysql_docker_container(
+    port: usize,
+    mysqld_args: &[&str],
+) -> Result<RunningContainer, anyhow::Error> {
+    start_container(port, mysqld_args, true).await
+}
+
+async fn start_container(
+    port: usize,
+    mysqld_args: &[&str],
+    quiet_once_healthy: bool,
+) -> Result<RunningContainer, anyhow::Error> {
     let container_name = format!("{MYSQL_DOCKER_CONTAINER}-{port}");
 
     let port = port.try_into().unwrap_or(15432);
@@ -95,6 +114,22 @@ pub async fn start_mysql_docker_container_with_args(
             start_period: Some(500_000_000), // 100ms
             start_interval: None,
         });
+    if quiet_once_healthy {
+        // Checks every 500ms until the first passes within the start period, then hourly.
+        builder = builder.healthcheck(HealthConfig {
+            test: Some(vec![
+                "CMD-SHELL".to_string(),
+                format!(
+                    "mysqladmin ping --host=127.0.0.1 --port=3306 --password={MYSQL_ROOT_PASSWORD}"
+                ),
+            ]),
+            interval: Some(3_600_000_000_000),
+            timeout: Some(1_000_000_000),
+            retries: Some(5),
+            start_period: Some(120_000_000_000),
+            start_interval: Some(500_000_000),
+        });
+    }
     for arg in mysqld_args {
         builder = builder.add_cmd_arg(arg);
     }

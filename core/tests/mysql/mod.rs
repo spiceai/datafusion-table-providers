@@ -1230,8 +1230,13 @@ async fn test_mysql_new_connection_observer() {
 #[test_log::test(tokio::test)]
 async fn test_mysql_new_connection_observer_across_servers() {
     let (port_a, port_b) = (crate::get_random_port(), crate::get_random_port());
-    let server_a = start_mysql_container(port_a).await;
-    let server_b = start_mysql_container(port_b).await;
+    // Health checks stop once each server is up, so that only this test takes ids.
+    let server_a = common::start_quiet_mysql_docker_container(port_a, &[])
+        .await
+        .expect("MySQL container to start");
+    let server_b = common::start_quiet_mysql_docker_container(port_b, &[])
+        .await
+        .expect("MySQL container to start");
     let user = "observed";
     create_user(port_a, user).await;
     create_user(port_b, user).await;
@@ -1270,20 +1275,19 @@ async fn test_mysql_new_connection_observer_across_servers() {
     let mut ids_on_a = reports.ids();
     ids_on_a.sort_unstable();
 
-    // Bring B up to each id A gave that B has not passed, and open a connection to B. The
-    // server's health check can take the id between the two; the next of A's ids is then the
-    // next try.
+    // Bring B up to each id A gave, and open a connection to B, which takes that id: nothing
+    // else connects to B.
     proxy.switch_to(port_b);
     for id in &ids_on_a {
-        if b_next > *id {
-            continue;
-        }
+        assert!(b_next <= *id, "B is already past {id}: {ids_on_a:?}");
         advance_connection_ids(port_b, b_next, *id).await;
         let connection = pool
             .connect_direct()
             .await
             .expect("connection to B to open");
-        b_next = u64::from(connection.conn.lock().await.id()) + 1;
+        let b_id = u64::from(connection.conn.lock().await.id());
+        assert_eq!(b_id, *id, "B's connection did not take the id A gave");
+        b_next = b_id + 1;
         held.push(connection);
     }
     drop(held);
