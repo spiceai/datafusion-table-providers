@@ -157,39 +157,44 @@ impl NewConnectionObserver {
     }
 }
 
-/// `ER_UNKNOWN_SYSTEM_VARIABLE`: the server has no variable of that name.
-const ER_UNKNOWN_SYSTEM_VARIABLE: u16 = 1193;
-
-/// Whether the pool's servers have `aurora_server_id`, learned from the first connection
-/// asked.
+/// What the pool's servers answer, learned from the first connection asked.
 const SERVER_KIND_UNKNOWN: u8 = 0;
+/// `@@aurora_server_id` is readable: Aurora MySQL.
 const SERVER_KIND_AURORA: u8 = 1;
+/// `@@hostname` and `@@port` are readable, `@@aurora_server_id` is not: MySQL, MariaDB, TiDB,
+/// Vitess and the other MySQL-compatible servers.
 const SERVER_KIND_MYSQL: u8 = 2;
+/// Neither query is accepted, as by a proxy that rejects system variables: stop asking.
+const SERVER_KIND_UNANSWERED: u8 = 3;
+
+const WITH_AURORA: &str = "SELECT @@hostname, @@port, @@aurora_server_id";
+const WITHOUT_AURORA: &str = "SELECT @@hostname, @@port";
 
 /// Asks the server which server it is, in one query. `@@aurora_server_id` exists only on
-/// Aurora MySQL, and elsewhere the query fails with `ER_UNKNOWN_SYSTEM_VARIABLE`, so the
-/// first connection learns which form the pool's servers take and later ones ask only that.
-/// Returns `None` when the server gives a value that is NULL or does not decode.
+/// Aurora MySQL; MySQL 5.7, 8.0 and 9.7, MariaDB, TiDB and Vitess reject it with
+/// `ER_UNKNOWN_SYSTEM_VARIABLE` (1193). The first connection learns which form the pool's
+/// servers answer, from any server error rather than only that code, and later connections
+/// ask only that form, or nothing when neither is answered.
+/// Returns `None` when the server answers neither form, or with a value that is NULL or does
+/// not decode.
 async fn server_identity(
     conn: &mut Conn,
     server_kind: &AtomicU8,
 ) -> mysql_async::Result<Option<MySQLServerIdentity>> {
-    const WITH_AURORA: &str = "SELECT @@hostname, @@port, @@aurora_server_id";
-    const WITHOUT_AURORA: &str = "SELECT @@hostname, @@port";
-    let row: Option<Row> = if server_kind.load(Ordering::Relaxed) == SERVER_KIND_MYSQL {
-        conn.query_first(WITHOUT_AURORA).await?
-    } else {
-        match conn.query_first(WITH_AURORA).await {
+    let row: Option<Row> = match server_kind.load(Ordering::Relaxed) {
+        SERVER_KIND_UNANSWERED => return Ok(None),
+        SERVER_KIND_MYSQL => without_aurora(conn, server_kind).await?,
+        _ => match conn.query_first(WITH_AURORA).await {
             Ok(row) => {
                 server_kind.store(SERVER_KIND_AURORA, Ordering::Relaxed);
                 row
             }
-            Err(mysql_async::Error::Server(error)) if error.code == ER_UNKNOWN_SYSTEM_VARIABLE => {
+            Err(mysql_async::Error::Server(_)) => {
                 server_kind.store(SERVER_KIND_MYSQL, Ordering::Relaxed);
-                conn.query_first(WITHOUT_AURORA).await?
+                without_aurora(conn, server_kind).await?
             }
             Err(error) => return Err(error),
-        }
+        },
     };
     let Some(mut row) = row else {
         return Ok(None);
@@ -213,6 +218,22 @@ async fn server_identity(
             port,
             aurora_server_id,
         }))
+}
+
+/// Asks `@@hostname` and `@@port`. A server error means the pool's servers do not answer it,
+/// and the pool stops asking.
+async fn without_aurora(
+    conn: &mut Conn,
+    server_kind: &AtomicU8,
+) -> mysql_async::Result<Option<Row>> {
+    match conn.query_first(WITHOUT_AURORA).await {
+        Ok(row) => Ok(row),
+        Err(mysql_async::Error::Server(_)) => {
+            server_kind.store(SERVER_KIND_UNANSWERED, Ordering::Relaxed);
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[allow(dead_code)]
