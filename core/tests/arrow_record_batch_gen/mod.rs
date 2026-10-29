@@ -603,6 +603,7 @@ pub(crate) fn get_arrow_list_record_batch() -> (RecordBatch, SchemaRef) {
 }
 
 // List(Utf8) - List of strings
+#[cfg(feature = "sqlite")]
 pub(crate) fn get_arrow_list_utf8_record_batch() -> (RecordBatch, SchemaRef) {
     let mut list_builder = ListBuilder::new(StringBuilder::new());
     list_builder.append_value([Some("foo"), Some("bar"), Some("baz")]);
