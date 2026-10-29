@@ -1,9 +1,14 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use mysql_async::{
     prelude::{Queryable, ToValue},
-    DriverError, Metrics, Opts, Params, PoolConstraints, PoolOpts, Row, SslOpts,
+    Conn, DriverError, Metrics, Opts, Params, PoolConstraints, PoolOpts, Row, SslOpts,
     DEFAULT_POOL_CONSTRAINTS,
 };
 use secrecy::{ExposeSecret, SecretBox, SecretString};
@@ -59,6 +64,89 @@ pub struct MySQLConnectionPool {
     pool: Arc<mysql_async::Pool>,
     join_push_down: JoinPushDown,
     zero_date_behavior: MysqlZeroDateBehavior,
+    /// The host and port the pool connects to, as configured.
+    host: String,
+    port: u16,
+    max_connections: usize,
+    new_connection_observer: Option<NewConnectionObserver>,
+}
+
+/// The server a connection reached, as the server reports itself. A load-balanced
+/// hostname (a cluster reader endpoint, a proxy, DNS round-robin) can reach a different
+/// server on every connection, and this names which one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySQLServerIdentity {
+    /// The host the pool connects to, as configured.
+    pub configured_host: String,
+    /// The port the pool connects to, as configured.
+    pub configured_port: u16,
+    /// The connection's id on the server, as `CONNECTION_ID()` and the process list show it.
+    pub connection_id: u32,
+    /// The server's `@@hostname`.
+    pub hostname: String,
+    /// The server's `@@port`.
+    pub port: u16,
+    /// The DB instance identifier, on Aurora MySQL (`aurora_server_id`).
+    pub aurora_server_id: Option<String>,
+}
+
+/// Reports the server each connection reached, once per connection, before its first use.
+#[derive(Clone)]
+struct NewConnectionObserver {
+    observe: Arc<dyn Fn(&MySQLServerIdentity) + Send + Sync>,
+    /// Ids of the connections seen most recently, least recent first. A connection whose id
+    /// is not here is new. Bounded at several times the pool's maximum, so the id of a
+    /// connection still in the pool is not dropped while other connections come and go.
+    seen: Arc<Mutex<VecDeque<u32>>>,
+    capacity: usize,
+}
+
+impl fmt::Debug for NewConnectionObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NewConnectionObserver")
+            .field("capacity", &self.capacity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NewConnectionObserver {
+    /// Whether this is the first use of the connection with this id. Moves the id to the
+    /// most recent end.
+    fn first_use(&self, connection_id: u32) -> bool {
+        let mut seen = self
+            .seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(position) = seen.iter().position(|id| *id == connection_id) {
+            seen.remove(position);
+            seen.push_back(connection_id);
+            return false;
+        }
+        if seen.len() >= self.capacity {
+            seen.pop_front();
+        }
+        seen.push_back(connection_id);
+        true
+    }
+}
+
+/// Asks the server which server it is. `aurora_server_id` exists only on Aurora MySQL;
+/// `SHOW GLOBAL VARIABLES` returns no row for it elsewhere, and needs no privilege.
+async fn server_identity(conn: &mut Conn) -> mysql_async::Result<(String, u16, Option<String>)> {
+    let (hostname, port): (String, u16) = conn
+        .query_first("SELECT @@hostname, @@port")
+        .await?
+        .unwrap_or_default();
+    let aurora_server_id: Option<(String, String)> = conn
+        .query_first("SHOW GLOBAL VARIABLES LIKE 'aurora_server_id'")
+        .await?;
+    Ok((
+        hostname,
+        port,
+        aurora_server_id
+            .map(|(_, value)| value)
+            .filter(|value| !value.is_empty()),
+    ))
 }
 
 #[allow(dead_code)]
@@ -214,6 +302,9 @@ impl MySQLConnectionPool {
         verify_mysql_opts(&opts).await?;
 
         let join_push_down = get_join_context(&opts);
+        let host = opts.ip_or_hostname().to_string();
+        let port = opts.tcp_port();
+        let max_connections = opts.pool_opts().constraints().max();
 
         let pool = mysql_async::Pool::new(opts);
 
@@ -249,7 +340,55 @@ impl MySQLConnectionPool {
             pool: Arc::new(pool),
             join_push_down,
             zero_date_behavior: MysqlZeroDateBehavior::default(),
+            host,
+            port,
+            max_connections,
+            new_connection_observer: None,
         })
+    }
+
+    /// Calls `observe` with the server each connection from this pool reached, once per
+    /// connection, before the connection is first used. Finding the server costs two
+    /// queries on each new connection and none on a connection the pool reuses.
+    ///
+    /// A connection is told apart by its id on the server. Two servers behind one hostname
+    /// can give connections the same id, and a connection whose id another server already
+    /// gave to a connection still in use is not reported.
+    #[must_use]
+    pub fn with_new_connection_observer(
+        mut self,
+        observe: impl Fn(&MySQLServerIdentity) + Send + Sync + 'static,
+    ) -> Self {
+        self.new_connection_observer = Some(NewConnectionObserver {
+            observe: Arc::new(observe),
+            seen: Arc::new(Mutex::new(VecDeque::new())),
+            capacity: self.max_connections.saturating_mul(4).max(64),
+        });
+        self
+    }
+
+    /// Reports `conn` to the observer if this is its first use.
+    async fn observe_new_connection(&self, conn: &mut Conn) {
+        let Some(observer) = &self.new_connection_observer else {
+            return;
+        };
+        let connection_id = conn.id();
+        if !observer.first_use(connection_id) {
+            return;
+        }
+        match server_identity(conn).await {
+            Ok((hostname, port, aurora_server_id)) => (observer.observe)(&MySQLServerIdentity {
+                configured_host: self.host.clone(),
+                configured_port: self.port,
+                connection_id,
+                hostname,
+                port,
+                aurora_server_id,
+            }),
+            Err(error) => tracing::debug!(
+                "Could not ask MySQL connection {connection_id} which server it reached: {error}"
+            ),
+        }
     }
 
     /// Override the [`MysqlZeroDateBehavior`] used by connections created from this pool.
@@ -274,7 +413,8 @@ impl MySQLConnectionPool {
     /// Returns an error if there is a problem creating the connection pool.
     pub async fn connect_direct(&self) -> super::Result<MySQLConnection> {
         let pool = Arc::clone(&self.pool);
-        let conn = pool.get_conn().await.context(MySQLConnectionSnafu)?;
+        let mut conn = pool.get_conn().await.context(MySQLConnectionSnafu)?;
+        self.observe_new_connection(&mut conn).await;
 
         Ok(MySQLConnection::new(conn).with_zero_date_behavior(self.zero_date_behavior))
     }
@@ -338,7 +478,8 @@ impl DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)> for MySQ
     ) -> super::Result<Box<dyn DbConnection<mysql_async::Conn, &'static (dyn ToValue + Sync)>>>
     {
         let pool = Arc::clone(&self.pool);
-        let conn = pool.get_conn().await.context(MySQLConnectionSnafu)?;
+        let mut conn = pool.get_conn().await.context(MySQLConnectionSnafu)?;
+        self.observe_new_connection(&mut conn).await;
 
         Ok(Box::new(
             MySQLConnection::new(conn).with_zero_date_behavior(self.zero_date_behavior),
