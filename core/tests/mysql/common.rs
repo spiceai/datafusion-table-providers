@@ -93,6 +93,23 @@ pub async fn start_mysql_docker_container(port: usize) -> Result<RunningContaine
     Ok(running_container)
 }
 
+/// Connection parameters that give the server as a `connection_string` URL rather than as
+/// individual parameters.
+pub(super) fn get_mysql_connection_string_params(port: usize) -> HashMap<String, SecretString> {
+    let mut params = HashMap::new();
+    params.insert(
+        "mysql_connection_string".to_string(),
+        SecretString::from(format!(
+            "mysql://root:{MYSQL_ROOT_PASSWORD}@localhost:{port}/mysqldb"
+        )),
+    );
+    params.insert(
+        "mysql_sslmode".to_string(),
+        SecretString::from("disabled".to_string()),
+    );
+    params
+}
+
 #[instrument]
 pub(super) async fn get_mysql_connection_pool(
     port: usize,
