@@ -1,9 +1,17 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc, Mutex,
+    },
+};
 
 use async_trait::async_trait;
 use mysql_async::{
     prelude::{Queryable, ToValue},
-    DriverError, Metrics, Opts, Params, PoolConstraints, PoolOpts, Row, SslOpts,
+    Conn, DriverError, Metrics, Opts, Params, PoolConstraints, PoolOpts, Row, SslOpts,
     DEFAULT_POOL_CONSTRAINTS,
 };
 use secrecy::{ExposeSecret, SecretBox, SecretString};
@@ -55,6 +63,173 @@ pub enum Error {
 pub struct MySQLConnectionPool {
     pool: Arc<mysql_async::Pool>,
     join_push_down: JoinPushDown,
+    new_connection_observer: Option<NewConnectionObserver>,
+}
+
+/// The server a connection reached, as the server reports itself. A load-balanced
+/// hostname (a cluster reader endpoint, a proxy, DNS round-robin) can reach a different
+/// server on every connection, and this names which one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySQLServerIdentity {
+    /// The host the pool connects to, as configured.
+    pub configured_host: String,
+    /// The port the pool connects to, as configured.
+    pub configured_port: u16,
+    /// The connection's id on the server, as `CONNECTION_ID()` and the process list show it.
+    pub connection_id: u32,
+    /// The server's `@@hostname`.
+    pub hostname: String,
+    /// The server's `@@port`.
+    pub port: u16,
+    /// The DB instance identifier, on Aurora MySQL (`aurora_server_id`).
+    pub aurora_server_id: Option<String>,
+}
+
+/// Reports the server each connection reached, once per connection, before its first use.
+#[derive(Clone)]
+struct NewConnectionObserver {
+    observe: Arc<dyn Fn(&MySQLServerIdentity) + Send + Sync>,
+    seen: Arc<Mutex<SeenConnections>>,
+    server_kind: Arc<AtomicU8>,
+}
+
+/// The ids of the connections seen, each with when it was last used. A connection whose id is
+/// not here is new.
+///
+/// The ids of closed connections are never told apart from live ones, so the list is bounded,
+/// and at the bound the least recently used id is dropped. The bound is large next to the pool
+/// (see [`SeenConnections::capacity`]): a connection held while that many others are opened
+/// and closed around it is the only live one whose id can be dropped, and it is then reported
+/// a second time.
+#[derive(Debug, Default)]
+struct SeenConnections {
+    last_used: HashMap<u32, u64>,
+    uses: u64,
+}
+
+impl SeenConnections {
+    /// The most ids kept for a pool of at most `max_connections` connections.
+    fn capacity(max_connections: usize) -> usize {
+        max_connections.saturating_mul(16).max(1024)
+    }
+
+    /// Whether this is the first use of the connection with this id, recording the use.
+    fn first_use(&mut self, connection_id: u32, capacity: usize) -> bool {
+        self.uses += 1;
+        if let Some(last_used) = self.last_used.get_mut(&connection_id) {
+            *last_used = self.uses;
+            return false;
+        }
+        if self.last_used.len() >= capacity {
+            if let Some(least_recent) = self
+                .last_used
+                .iter()
+                .min_by_key(|(_, last_used)| **last_used)
+                .map(|(id, _)| *id)
+            {
+                self.last_used.remove(&least_recent);
+            }
+        }
+        self.last_used.insert(connection_id, self.uses);
+        true
+    }
+}
+
+impl fmt::Debug for NewConnectionObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NewConnectionObserver")
+            .finish_non_exhaustive()
+    }
+}
+
+impl NewConnectionObserver {
+    /// Whether this is the first use of `conn`.
+    fn first_use(&self, conn: &Conn) -> bool {
+        let capacity = SeenConnections::capacity(conn.opts().pool_opts().constraints().max());
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .first_use(conn.id(), capacity)
+    }
+}
+
+/// What the pool's servers answer, learned from the first connection asked.
+const SERVER_KIND_UNKNOWN: u8 = 0;
+/// `@@aurora_server_id` is readable: Aurora MySQL.
+const SERVER_KIND_AURORA: u8 = 1;
+/// `@@hostname` and `@@port` are readable, `@@aurora_server_id` is not: MySQL, MariaDB, TiDB,
+/// Vitess and the other MySQL-compatible servers.
+const SERVER_KIND_MYSQL: u8 = 2;
+/// Neither query is accepted, as by a proxy that rejects system variables: stop asking.
+const SERVER_KIND_UNANSWERED: u8 = 3;
+
+const WITH_AURORA: &str = "SELECT @@hostname, @@port, @@aurora_server_id";
+const WITHOUT_AURORA: &str = "SELECT @@hostname, @@port";
+
+/// Asks the server which server it is, in one query. `@@aurora_server_id` exists only on
+/// Aurora MySQL; MySQL 5.7, 8.0 and 9.7, MariaDB, TiDB and Vitess reject it with
+/// `ER_UNKNOWN_SYSTEM_VARIABLE` (1193). The first connection learns which form the pool's
+/// servers answer, from any server error rather than only that code, and later connections
+/// ask only that form, or nothing when neither is answered.
+/// Returns `None` when the server answers neither form, or with a value that is NULL or does
+/// not decode.
+async fn server_identity(
+    conn: &mut Conn,
+    server_kind: &AtomicU8,
+) -> mysql_async::Result<Option<MySQLServerIdentity>> {
+    let row: Option<Row> = match server_kind.load(Ordering::Relaxed) {
+        SERVER_KIND_UNANSWERED => return Ok(None),
+        SERVER_KIND_MYSQL => without_aurora(conn, server_kind).await?,
+        _ => match conn.query_first(WITH_AURORA).await {
+            Ok(row) => {
+                server_kind.store(SERVER_KIND_AURORA, Ordering::Relaxed);
+                row
+            }
+            Err(mysql_async::Error::Server(_)) => {
+                server_kind.store(SERVER_KIND_MYSQL, Ordering::Relaxed);
+                without_aurora(conn, server_kind).await?
+            }
+            Err(error) => return Err(error),
+        },
+    };
+    let Some(mut row) = row else {
+        return Ok(None);
+    };
+    // `take_opt` reports a value that does not decode instead of panicking, as decoding the
+    // row into a tuple would.
+    let hostname = row.take_opt::<String, _>(0).and_then(Result::ok);
+    let port = row.take_opt::<u16, _>(1).and_then(Result::ok);
+    let aurora_server_id = row
+        .take_opt::<Option<String>, _>(2)
+        .and_then(Result::ok)
+        .flatten()
+        .filter(|value| !value.is_empty());
+    Ok(hostname
+        .zip(port)
+        .map(|(hostname, port)| MySQLServerIdentity {
+            configured_host: conn.opts().ip_or_hostname().to_string(),
+            configured_port: conn.opts().tcp_port(),
+            connection_id: conn.id(),
+            hostname,
+            port,
+            aurora_server_id,
+        }))
+}
+
+/// Asks `@@hostname` and `@@port`. A server error means the pool's servers do not answer it,
+/// and the pool stops asking.
+async fn without_aurora(
+    conn: &mut Conn,
+    server_kind: &AtomicU8,
+) -> mysql_async::Result<Option<Row>> {
+    match conn.query_first(WITHOUT_AURORA).await {
+        Ok(row) => Ok(row),
+        Err(mysql_async::Error::Server(_)) => {
+            server_kind.store(SERVER_KIND_UNANSWERED, Ordering::Relaxed);
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[allow(dead_code)]
@@ -97,7 +272,6 @@ impl MySQLConnectionPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    #[allow(clippy::unused_async)]
     pub async fn new(params: HashMap<String, SecretString>) -> Result<Self> {
         Self::new_with_pool_opts(params, |pool_opts| pool_opts).await
     }
@@ -244,7 +418,51 @@ impl MySQLConnectionPool {
         Ok(Self {
             pool: Arc::new(pool),
             join_push_down,
+            new_connection_observer: None,
         })
+    }
+
+    /// Calls `observe` with the server each connection from this pool reached, once per
+    /// connection, before the connection is first used. Finding the server costs one query
+    /// on each new connection (two on the pool's first) and none on a connection the pool
+    /// reuses.
+    ///
+    /// A connection is told apart by its id on the server. Two servers behind one hostname
+    /// can give connections the same id, and a connection whose id another server already
+    /// gave to a connection still in use is not reported. A connection held while more than
+    /// `max(16 × pool maximum, 1024)` others are opened around it is reported again (see
+    /// [`SeenConnections`]).
+    #[must_use]
+    pub fn with_new_connection_observer(
+        mut self,
+        observe: impl Fn(&MySQLServerIdentity) + Send + Sync + 'static,
+    ) -> Self {
+        self.new_connection_observer = Some(NewConnectionObserver {
+            observe: Arc::new(observe),
+            seen: Arc::new(Mutex::new(SeenConnections::default())),
+            server_kind: Arc::new(AtomicU8::new(SERVER_KIND_UNKNOWN)),
+        });
+        self
+    }
+
+    /// Reports `conn` to the observer if this is its first use.
+    async fn observe_new_connection(&self, conn: &mut Conn) {
+        let Some(observer) = &self.new_connection_observer else {
+            return;
+        };
+        if !observer.first_use(conn) {
+            return;
+        }
+        let connection_id = conn.id();
+        match server_identity(conn, &observer.server_kind).await {
+            Ok(Some(identity)) => (observer.observe)(&identity),
+            Ok(None) => tracing::debug!(
+                "MySQL connection {connection_id} gave no usable server hostname and port"
+            ),
+            Err(error) => tracing::debug!(
+                "Could not ask MySQL connection {connection_id} which server it reached: {error}"
+            ),
+        }
     }
 
     /// Returns a direct connection to the underlying database.
@@ -254,7 +472,8 @@ impl MySQLConnectionPool {
     /// Returns an error if there is a problem creating the connection pool.
     pub async fn connect_direct(&self) -> super::Result<MySQLConnection> {
         let pool = Arc::clone(&self.pool);
-        let conn = pool.get_conn().await.context(MySQLConnectionSnafu)?;
+        let mut conn = pool.get_conn().await.context(MySQLConnectionSnafu)?;
+        self.observe_new_connection(&mut conn).await;
 
         Ok(MySQLConnection::new(conn))
     }
@@ -318,12 +537,61 @@ impl DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)> for MySQ
     ) -> super::Result<Box<dyn DbConnection<mysql_async::Conn, &'static (dyn ToValue + Sync)>>>
     {
         let pool = Arc::clone(&self.pool);
-        let conn = pool.get_conn().await.context(MySQLConnectionSnafu)?;
+        let mut conn = pool.get_conn().await.context(MySQLConnectionSnafu)?;
+        self.observe_new_connection(&mut conn).await;
 
         Ok(Box::new(MySQLConnection::new(conn)))
     }
 
     fn join_push_down(&self) -> JoinPushDown {
         self.join_push_down.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SeenConnections;
+
+    #[test]
+    fn a_connection_is_new_once() {
+        let mut seen = SeenConnections::default();
+        let capacity = SeenConnections::capacity(2);
+        assert!(seen.first_use(7, capacity));
+        assert!(!seen.first_use(7, capacity));
+        assert!(seen.first_use(8, capacity));
+        assert!(!seen.first_use(7, capacity));
+    }
+
+    /// A connection held while the rest of the pool churns keeps its id: with a pool of two,
+    /// the other slot can reconnect up to the capacity's worth of times.
+    #[test]
+    fn a_held_connection_survives_churn_up_to_the_capacity() {
+        let capacity = SeenConnections::capacity(2);
+        assert_eq!(capacity, 1024);
+        let mut seen = SeenConnections::default();
+        assert!(seen.first_use(1, capacity));
+        for id in 2..=1024 {
+            assert!(seen.first_use(id, capacity));
+        }
+        assert!(
+            !seen.first_use(1, capacity),
+            "held connection reported again"
+        );
+
+        // One new connection more than the bound drops the least recently used id, the held
+        // one, which is then reported again: the documented limit.
+        let mut seen = SeenConnections::default();
+        assert!(seen.first_use(1, capacity));
+        for id in 2..=1025 {
+            assert!(seen.first_use(id, capacity));
+        }
+        assert!(seen.first_use(1, capacity));
+    }
+
+    #[test]
+    fn the_capacity_grows_with_the_pool() {
+        assert_eq!(SeenConnections::capacity(1), 1024);
+        assert_eq!(SeenConnections::capacity(100), 1600);
+        assert_eq!(SeenConnections::capacity(usize::MAX), usize::MAX);
     }
 }
