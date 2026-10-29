@@ -1,10 +1,10 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     fmt,
     path::PathBuf,
     sync::{
         atomic::{AtomicU8, AtomicUsize, Ordering},
-        Arc, Mutex, PoisonError,
+        Arc,
     },
     time::{Duration, Instant},
 };
@@ -105,66 +105,6 @@ struct NewConnectionObserver {
     server_kind: Arc<AtomicU8>,
     /// Whether the pool is configured to connect over a Unix socket.
     configured_socket: bool,
-    /// The socket replacements reported once, whose second callback is still due (see
-    /// [`NewConnectionObserver::is_second_callback`]).
-    socket_replacements: Arc<Mutex<PendingSocketReplacements>>,
-}
-
-/// The socket replacements reported on their first `after_connect` callback, whose second is
-/// still due, oldest first.
-///
-/// A replacement is known by its socket path and by the server it reached as the server
-/// reports itself, connection id included. A server's live connections have distinct ids, so
-/// that names one connection even when one socket leads to several servers, as a socket proxy
-/// does, and two of them give replacements the same id at the same time.
-///
-/// A replacement that fails after its first callback never has a second, so the entries are
-/// bounded (see [`PendingSocketReplacements::capacity`]), the oldest dropped first.
-#[derive(Debug)]
-struct PendingSocketReplacements {
-    pending: VecDeque<(String, MySQLServerIdentity)>,
-    capacity: usize,
-}
-
-impl PendingSocketReplacements {
-    fn new(max_connections: usize) -> Self {
-        Self {
-            pending: VecDeque::new(),
-            capacity: Self::capacity(max_connections),
-        }
-    }
-
-    /// The most entries kept for a pool of at most `max_connections` connections. A
-    /// replacement's two callbacks come within one connection attempt, and a pool makes at
-    /// most `max_connections` attempts at once, so an entry still waiting for its second
-    /// callback is dropped only after this many replacements that failed after their first.
-    /// That connection is then reported a second time, never not at all.
-    fn capacity(max_connections: usize) -> usize {
-        max_connections.saturating_mul(2).max(16)
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.pending.len()
-    }
-
-    /// Whether this is the second callback of the replacement over `socket` that reached
-    /// `server`, recording a first one.
-    fn second_callback(&mut self, socket: &str, server: &MySQLServerIdentity) -> bool {
-        if let Some(index) = self
-            .pending
-            .iter()
-            .position(|(pending_socket, pending)| pending == server && pending_socket == socket)
-        {
-            self.pending.remove(index);
-            return true;
-        }
-        if self.pending.len() >= self.capacity {
-            self.pending.pop_front();
-        }
-        self.pending.push_back((socket.to_string(), server.clone()));
-        false
-    }
 }
 
 impl fmt::Debug for NewConnectionObserver {
@@ -175,27 +115,23 @@ impl fmt::Debug for NewConnectionObserver {
 }
 
 impl NewConnectionObserver {
-    fn new(observe: ObserveFn, opts: &Opts, pool_opts: &PoolOpts) -> Self {
+    fn new(observe: ObserveFn, opts: &Opts) -> Self {
         Self {
             observe,
             server_kind: Arc::new(AtomicU8::new(SERVER_KIND_UNKNOWN)),
             configured_socket: opts.socket().is_some(),
-            socket_replacements: Arc::new(Mutex::new(PendingSocketReplacements::new(
-                pool_opts.constraints().max(),
-            ))),
         }
     }
 
     /// Reports the server `conn` reached. It never fails: a connection whose server does not
     /// answer is still used, and is only missing from the reports.
     async fn observe(&self, conn: &mut Conn) {
+        if self.is_socket_replacement(conn) && already_reported(conn).await {
+            return;
+        }
         let connection_id = conn.id();
         match server_identity(conn, &self.server_kind).await {
-            Ok(Some(identity)) => {
-                if !self.is_second_callback(conn, &identity) {
-                    (self.observe)(&identity);
-                }
-            }
+            Ok(Some(identity)) => (self.observe)(&identity),
             Ok(None) => tracing::debug!(
                 "MySQL connection {connection_id} gave no usable server hostname and port"
             ),
@@ -205,24 +141,40 @@ impl NewConnectionObserver {
         }
     }
 
-    /// Whether `conn` was already reported. With `prefer_socket`, on by default outside
-    /// Windows, `mysql_async` replaces a TCP connection to a server whose Unix socket the client
-    /// can open with a connection over that socket, and runs `after_connect` on the replacement
+    /// Whether `conn` replaced a TCP connection with one over the server's Unix socket. With
+    /// `prefer_socket`, on by default outside Windows, `mysql_async` reads `@@socket` on a new
+    /// TCP connection and, when the client can open that socket, opens a connection over it
+    /// and puts it in the TCP connection's place. It runs `after_connect` on the replacement
     /// twice: as it opens it, and again where the TCP connection would have run it. A
-    /// connection over a socket the pool was not configured with is such a replacement; the
-    /// first callback reports it and records it, and the second asks the server again, finds
-    /// it and removes it (see [`PendingSocketReplacements`]).
-    fn is_second_callback(&self, conn: &Conn, server: &MySQLServerIdentity) -> bool {
-        let Some(socket) = conn.opts().socket() else {
-            return false;
-        };
-        if self.configured_socket {
-            return false;
+    /// connection over a socket the pool was not configured with is such a replacement.
+    fn is_socket_replacement(&self, conn: &Conn) -> bool {
+        !self.configured_socket && conn.opts().socket().is_some()
+    }
+}
+
+/// The user variable that marks a session as reported.
+const REPORTED_MARK: &str = "@datafusion_table_providers_reported";
+
+/// Whether this session was already reported, marking it reported if not. A user variable
+/// lives in one session, which is one physical connection, so the second `after_connect` on a
+/// socket replacement finds the mark and a new connection never does, whatever server it
+/// reached and whatever its id. The mark stays in the session until the pool next resets it.
+/// A server that rejects user variables reports a replacement twice rather than not at all.
+async fn already_reported(conn: &mut Conn) -> bool {
+    match conn
+        .query_first::<Option<u8>, _>(format!("SELECT {REPORTED_MARK}"))
+        .await
+    {
+        Ok(Some(Some(_))) => true,
+        _ => {
+            if let Err(error) = conn.query_drop(format!("SET {REPORTED_MARK} = 1")).await {
+                tracing::debug!(
+                    "Could not mark MySQL connection {} as reported: {error}",
+                    conn.id()
+                );
+            }
+            false
         }
-        self.socket_replacements
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .second_callback(socket, server)
     }
 }
 
@@ -479,9 +431,9 @@ impl MySQLConnectionPool {
 
         let opts = mysql_async::Opts::from(connection_string);
         let pool_opts = configure_pool(opts.pool_opts().clone());
-        let mut opts_builder = OptsBuilder::from_opts(opts.clone()).pool_opts(pool_opts.clone());
+        let mut opts_builder = OptsBuilder::from_opts(opts.clone()).pool_opts(pool_opts);
         if let Some(observe) = observe {
-            let observer = NewConnectionObserver::new(observe, &opts, &pool_opts);
+            let observer = NewConnectionObserver::new(observe, &opts);
             opts_builder = opts_builder.after_connect(move |conn| {
                 let observer = observer.clone();
                 Box::pin(async move {
@@ -662,126 +614,5 @@ impl DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)> for MySQ
 
     fn join_push_down(&self) -> JoinPushDown {
         self.join_push_down.clone()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{MySQLServerIdentity, PendingSocketReplacements};
-
-    const SOCKET_A: &str = "/tmp/a.sock";
-    const SOCKET_B: &str = "/tmp/b.sock";
-
-    fn server(hostname: &str, connection_id: u32) -> MySQLServerIdentity {
-        MySQLServerIdentity {
-            configured_host: "localhost".to_string(),
-            configured_port: 3306,
-            connection_id,
-            hostname: hostname.to_string(),
-            port: 3306,
-            aurora_server_id: None,
-        }
-    }
-
-    /// Whether each callback, in order, reports its connection.
-    fn reported(
-        pending: &mut PendingSocketReplacements,
-        callbacks: &[(&str, MySQLServerIdentity)],
-    ) -> Vec<bool> {
-        callbacks
-            .iter()
-            .map(|(socket, server)| !pending.second_callback(socket, server))
-            .collect()
-    }
-
-    #[test]
-    fn a_replacement_is_reported_on_its_first_callback_only() {
-        let mut pending = PendingSocketReplacements::new(10);
-        let a = server("a", 7);
-        assert_eq!(
-            reported(
-                &mut pending,
-                &[(SOCKET_A, a.clone()), (SOCKET_A, a.clone()), (SOCKET_A, a)]
-            ),
-            // The third is a later connection given the same id again.
-            vec![true, false, true]
-        );
-    }
-
-    /// Two servers on two sockets can give replacements the same id at once. Their callbacks
-    /// interleave as A1, B1, A2, B2, and each is reported once.
-    #[test]
-    fn overlapping_replacements_with_one_id_on_two_sockets_are_each_reported_once() {
-        let mut pending = PendingSocketReplacements::new(10);
-        let (a, b) = (server("a", 7), server("b", 7));
-        assert_eq!(
-            reported(
-                &mut pending,
-                &[
-                    (SOCKET_A, a.clone()),
-                    (SOCKET_B, b.clone()),
-                    (SOCKET_A, a),
-                    (SOCKET_B, b)
-                ]
-            ),
-            vec![true, true, false, false]
-        );
-    }
-
-    /// One socket can lead to several servers, as a socket proxy does. Two of them can give
-    /// replacements the same id at once, and each is reported once.
-    #[test]
-    fn overlapping_replacements_with_one_id_through_one_socket_are_each_reported_once() {
-        let mut pending = PendingSocketReplacements::new(10);
-        let (a, b) = (server("a", 7), server("b", 7));
-        assert_eq!(
-            reported(
-                &mut pending,
-                &[
-                    (SOCKET_A, a.clone()),
-                    (SOCKET_A, b.clone()),
-                    (SOCKET_A, a),
-                    (SOCKET_A, b)
-                ]
-            ),
-            vec![true, true, false, false]
-        );
-    }
-
-    /// A replacement that fails after its first callback never has a second, and its entry
-    /// does not stay forever: the entries are bounded, the oldest dropped first.
-    #[test]
-    fn replacements_that_fail_after_their_first_callback_do_not_accumulate() {
-        let mut pending = PendingSocketReplacements::new(10);
-        let capacity = PendingSocketReplacements::capacity(10);
-        for id in 0..10_000 {
-            assert!(!pending.second_callback(SOCKET_A, &server("a", id)));
-        }
-        assert_eq!(pending.len(), capacity);
-        // The newest entries are kept: their second callbacks still find them.
-        assert!(pending.second_callback(SOCKET_A, &server("a", 9_999)));
-        // The oldest were dropped: a second callback after that many failed replacements
-        // reports the connection again rather than not at all.
-        assert!(!pending.second_callback(SOCKET_A, &server("a", 0)));
-    }
-
-    /// A pool opens at most its maximum connections at once, so as many first callbacks as
-    /// the bound leave every pending entry in place.
-    #[test]
-    fn the_bound_holds_every_replacement_a_full_pool_has_in_flight() {
-        for max in [1, 10, 100] {
-            let mut pending = PendingSocketReplacements::new(max);
-            let in_flight = u32::try_from(PendingSocketReplacements::capacity(max)).expect("fits");
-            for id in 0..in_flight {
-                assert!(!pending.second_callback(SOCKET_A, &server("a", id)));
-            }
-            for id in 0..in_flight {
-                assert!(
-                    pending.second_callback(SOCKET_A, &server("a", id)),
-                    "max {max}: id {id}"
-                );
-            }
-            assert_eq!(pending.len(), 0);
-        }
     }
 }
