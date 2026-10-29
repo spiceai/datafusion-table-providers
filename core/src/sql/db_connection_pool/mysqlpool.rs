@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, VecDeque},
     fmt,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use async_trait::async_trait;
@@ -99,6 +102,7 @@ struct NewConnectionObserver {
     /// connection still in the pool is not dropped while other connections come and go.
     seen: Arc<Mutex<VecDeque<u32>>>,
     capacity: usize,
+    server_kind: Arc<AtomicU8>,
 }
 
 impl fmt::Debug for NewConnectionObserver {
@@ -130,23 +134,55 @@ impl NewConnectionObserver {
     }
 }
 
-/// Asks the server which server it is. `aurora_server_id` exists only on Aurora MySQL;
-/// `SHOW GLOBAL VARIABLES` returns no row for it elsewhere, and needs no privilege.
-async fn server_identity(conn: &mut Conn) -> mysql_async::Result<(String, u16, Option<String>)> {
-    let (hostname, port): (String, u16) = conn
-        .query_first("SELECT @@hostname, @@port")
-        .await?
-        .unwrap_or_default();
-    let aurora_server_id: Option<(String, String)> = conn
-        .query_first("SHOW GLOBAL VARIABLES LIKE 'aurora_server_id'")
-        .await?;
-    Ok((
-        hostname,
-        port,
-        aurora_server_id
-            .map(|(_, value)| value)
-            .filter(|value| !value.is_empty()),
-    ))
+/// `ER_UNKNOWN_SYSTEM_VARIABLE`: the server has no variable of that name.
+const ER_UNKNOWN_SYSTEM_VARIABLE: u16 = 1193;
+
+/// Whether the pool's servers have `aurora_server_id`, learned from the first connection
+/// asked.
+const SERVER_KIND_UNKNOWN: u8 = 0;
+const SERVER_KIND_AURORA: u8 = 1;
+const SERVER_KIND_MYSQL: u8 = 2;
+
+/// Asks the server which server it is, in one query. `@@aurora_server_id` exists only on
+/// Aurora MySQL, and elsewhere the query fails with `ER_UNKNOWN_SYSTEM_VARIABLE`, so the
+/// first connection learns which form the pool's servers take and later ones ask only that.
+/// Returns `None` when the server gives a value that is NULL or does not decode.
+async fn server_identity(
+    conn: &mut Conn,
+    server_kind: &AtomicU8,
+) -> mysql_async::Result<Option<(String, u16, Option<String>)>> {
+    const WITH_AURORA: &str = "SELECT @@hostname, @@port, @@aurora_server_id";
+    const WITHOUT_AURORA: &str = "SELECT @@hostname, @@port";
+    let row: Option<Row> = if server_kind.load(Ordering::Relaxed) == SERVER_KIND_MYSQL {
+        conn.query_first(WITHOUT_AURORA).await?
+    } else {
+        match conn.query_first(WITH_AURORA).await {
+            Ok(row) => {
+                server_kind.store(SERVER_KIND_AURORA, Ordering::Relaxed);
+                row
+            }
+            Err(mysql_async::Error::Server(error)) if error.code == ER_UNKNOWN_SYSTEM_VARIABLE => {
+                server_kind.store(SERVER_KIND_MYSQL, Ordering::Relaxed);
+                conn.query_first(WITHOUT_AURORA).await?
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let Some(mut row) = row else {
+        return Ok(None);
+    };
+    // `take_opt` reports a value that does not decode instead of panicking, as decoding the
+    // row into a tuple would.
+    let hostname = row.take_opt::<String, _>(0).and_then(Result::ok);
+    let port = row.take_opt::<u16, _>(1).and_then(Result::ok);
+    let aurora_server_id = row
+        .take_opt::<Option<String>, _>(2)
+        .and_then(Result::ok)
+        .flatten()
+        .filter(|value| !value.is_empty());
+    Ok(hostname
+        .zip(port)
+        .map(|(hostname, port)| (hostname, port, aurora_server_id)))
 }
 
 #[allow(dead_code)]
@@ -348,8 +384,9 @@ impl MySQLConnectionPool {
     }
 
     /// Calls `observe` with the server each connection from this pool reached, once per
-    /// connection, before the connection is first used. Finding the server costs two
-    /// queries on each new connection and none on a connection the pool reuses.
+    /// connection, before the connection is first used. Finding the server costs one query
+    /// on each new connection (two on the pool's first) and none on a connection the pool
+    /// reuses.
     ///
     /// A connection is told apart by its id on the server. Two servers behind one hostname
     /// can give connections the same id, and a connection whose id another server already
@@ -363,6 +400,7 @@ impl MySQLConnectionPool {
             observe: Arc::new(observe),
             seen: Arc::new(Mutex::new(VecDeque::new())),
             capacity: self.max_connections.saturating_mul(4).max(64),
+            server_kind: Arc::new(AtomicU8::new(SERVER_KIND_UNKNOWN)),
         });
         self
     }
@@ -376,15 +414,20 @@ impl MySQLConnectionPool {
         if !observer.first_use(connection_id) {
             return;
         }
-        match server_identity(conn).await {
-            Ok((hostname, port, aurora_server_id)) => (observer.observe)(&MySQLServerIdentity {
-                configured_host: self.host.clone(),
-                configured_port: self.port,
-                connection_id,
-                hostname,
-                port,
-                aurora_server_id,
-            }),
+        match server_identity(conn, &observer.server_kind).await {
+            Ok(Some((hostname, port, aurora_server_id))) => {
+                (observer.observe)(&MySQLServerIdentity {
+                    configured_host: self.host.clone(),
+                    configured_port: self.port,
+                    connection_id,
+                    hostname,
+                    port,
+                    aurora_server_id,
+                });
+            }
+            Ok(None) => tracing::debug!(
+                "MySQL connection {connection_id} gave no usable server hostname and port"
+            ),
             Err(error) => tracing::debug!(
                 "Could not ask MySQL connection {connection_id} which server it reached: {error}"
             ),
