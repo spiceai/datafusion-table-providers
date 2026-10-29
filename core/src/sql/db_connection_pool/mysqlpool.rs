@@ -67,10 +67,6 @@ pub struct MySQLConnectionPool {
     pool: Arc<mysql_async::Pool>,
     join_push_down: JoinPushDown,
     zero_date_behavior: MysqlZeroDateBehavior,
-    /// The host and port the pool connects to, as configured.
-    host: String,
-    port: u16,
-    max_connections: usize,
     new_connection_observer: Option<NewConnectionObserver>,
 }
 
@@ -101,32 +97,37 @@ struct NewConnectionObserver {
     /// is not here is new. Bounded at several times the pool's maximum, so the id of a
     /// connection still in the pool is not dropped while other connections come and go.
     seen: Arc<Mutex<VecDeque<u32>>>,
-    capacity: usize,
     server_kind: Arc<AtomicU8>,
 }
 
 impl fmt::Debug for NewConnectionObserver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NewConnectionObserver")
-            .field("capacity", &self.capacity)
             .finish_non_exhaustive()
     }
 }
 
 impl NewConnectionObserver {
-    /// Whether this is the first use of the connection with this id. Moves the id to the
-    /// most recent end.
-    fn first_use(&self, connection_id: u32) -> bool {
+    /// Whether this is the first use of `conn`. Moves its id to the most recent end.
+    fn first_use(&self, conn: &Conn) -> bool {
+        let connection_id = conn.id();
+        let capacity = conn
+            .opts()
+            .pool_opts()
+            .constraints()
+            .max()
+            .saturating_mul(4)
+            .max(64);
         let mut seen = self
             .seen
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(position) = seen.iter().position(|id| *id == connection_id) {
+        if let Some(position) = seen.iter().rposition(|id| *id == connection_id) {
             seen.remove(position);
             seen.push_back(connection_id);
             return false;
         }
-        if seen.len() >= self.capacity {
+        if seen.len() >= capacity {
             seen.pop_front();
         }
         seen.push_back(connection_id);
@@ -150,7 +151,7 @@ const SERVER_KIND_MYSQL: u8 = 2;
 async fn server_identity(
     conn: &mut Conn,
     server_kind: &AtomicU8,
-) -> mysql_async::Result<Option<(String, u16, Option<String>)>> {
+) -> mysql_async::Result<Option<MySQLServerIdentity>> {
     const WITH_AURORA: &str = "SELECT @@hostname, @@port, @@aurora_server_id";
     const WITHOUT_AURORA: &str = "SELECT @@hostname, @@port";
     let row: Option<Row> = if server_kind.load(Ordering::Relaxed) == SERVER_KIND_MYSQL {
@@ -182,7 +183,14 @@ async fn server_identity(
         .filter(|value| !value.is_empty());
     Ok(hostname
         .zip(port)
-        .map(|(hostname, port)| (hostname, port, aurora_server_id)))
+        .map(|(hostname, port)| MySQLServerIdentity {
+            configured_host: conn.opts().ip_or_hostname().to_string(),
+            configured_port: conn.opts().tcp_port(),
+            connection_id: conn.id(),
+            hostname,
+            port,
+            aurora_server_id,
+        }))
 }
 
 #[allow(dead_code)]
@@ -225,7 +233,6 @@ impl MySQLConnectionPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    #[allow(clippy::unused_async)]
     pub async fn new(params: HashMap<String, SecretString>) -> Result<Self> {
         Self::new_with_pool_opts(params, |pool_opts| pool_opts).await
     }
@@ -338,9 +345,6 @@ impl MySQLConnectionPool {
         verify_mysql_opts(&opts).await?;
 
         let join_push_down = get_join_context(&opts);
-        let host = opts.ip_or_hostname().to_string();
-        let port = opts.tcp_port();
-        let max_connections = opts.pool_opts().constraints().max();
 
         let pool = mysql_async::Pool::new(opts);
 
@@ -376,9 +380,6 @@ impl MySQLConnectionPool {
             pool: Arc::new(pool),
             join_push_down,
             zero_date_behavior: MysqlZeroDateBehavior::default(),
-            host,
-            port,
-            max_connections,
             new_connection_observer: None,
         })
     }
@@ -399,7 +400,6 @@ impl MySQLConnectionPool {
         self.new_connection_observer = Some(NewConnectionObserver {
             observe: Arc::new(observe),
             seen: Arc::new(Mutex::new(VecDeque::new())),
-            capacity: self.max_connections.saturating_mul(4).max(64),
             server_kind: Arc::new(AtomicU8::new(SERVER_KIND_UNKNOWN)),
         });
         self
@@ -410,21 +410,12 @@ impl MySQLConnectionPool {
         let Some(observer) = &self.new_connection_observer else {
             return;
         };
-        let connection_id = conn.id();
-        if !observer.first_use(connection_id) {
+        if !observer.first_use(conn) {
             return;
         }
+        let connection_id = conn.id();
         match server_identity(conn, &observer.server_kind).await {
-            Ok(Some((hostname, port, aurora_server_id))) => {
-                (observer.observe)(&MySQLServerIdentity {
-                    configured_host: self.host.clone(),
-                    configured_port: self.port,
-                    connection_id,
-                    hostname,
-                    port,
-                    aurora_server_id,
-                });
-            }
+            Ok(Some(identity)) => (observer.observe)(&identity),
             Ok(None) => tracing::debug!(
                 "MySQL connection {connection_id} gave no usable server hostname and port"
             ),
