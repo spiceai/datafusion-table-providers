@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, VecDeque},
     fmt,
     path::PathBuf,
     sync::{
@@ -105,9 +105,65 @@ struct NewConnectionObserver {
     server_kind: Arc<AtomicU8>,
     /// Whether the pool is configured to connect over a Unix socket.
     configured_socket: bool,
-    /// The ids of the socket replacements reported once, whose second callback is still due
-    /// (see [`NewConnectionObserver::is_second_callback`]).
-    socket_replacements: Arc<Mutex<HashSet<u32>>>,
+    /// The socket replacements reported once, whose second callback is still due (see
+    /// [`NewConnectionObserver::is_second_callback`]).
+    socket_replacements: Arc<Mutex<PendingSocketReplacements>>,
+}
+
+/// The socket replacements reported on their first `after_connect` callback, whose second is
+/// still due, oldest first.
+///
+/// A replacement is known by its socket path and its connection id. A Unix socket belongs to
+/// one server, so the two together name one connection, even when two servers behind the
+/// pool's address give replacements the same id at the same time.
+///
+/// A replacement that fails after its first callback never has a second, so the entries are
+/// bounded (see [`PendingSocketReplacements::capacity`]), the oldest dropped first.
+#[derive(Debug)]
+struct PendingSocketReplacements {
+    pending: VecDeque<(String, u32)>,
+    capacity: usize,
+}
+
+impl PendingSocketReplacements {
+    fn new(max_connections: usize) -> Self {
+        Self {
+            pending: VecDeque::new(),
+            capacity: Self::capacity(max_connections),
+        }
+    }
+
+    /// The most entries kept for a pool of at most `max_connections` connections. A
+    /// replacement's two callbacks come within one connection attempt, and a pool makes at
+    /// most `max_connections` attempts at once, so an entry still waiting for its second
+    /// callback is dropped only after this many replacements that failed after their first.
+    /// That connection is then reported a second time, never not at all.
+    fn capacity(max_connections: usize) -> usize {
+        max_connections.saturating_mul(2).max(16)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Whether this is the second callback of the replacement over `socket` with this id,
+    /// recording a first one.
+    fn second_callback(&mut self, socket: &str, connection_id: u32) -> bool {
+        if let Some(index) = self
+            .pending
+            .iter()
+            .position(|(pending_socket, id)| *id == connection_id && pending_socket == socket)
+        {
+            self.pending.remove(index);
+            return true;
+        }
+        if self.pending.len() >= self.capacity {
+            self.pending.pop_front();
+        }
+        self.pending.push_back((socket.to_string(), connection_id));
+        false
+    }
 }
 
 impl fmt::Debug for NewConnectionObserver {
@@ -118,12 +174,14 @@ impl fmt::Debug for NewConnectionObserver {
 }
 
 impl NewConnectionObserver {
-    fn new(observe: ObserveFn, opts: &Opts) -> Self {
+    fn new(observe: ObserveFn, opts: &Opts, pool_opts: &PoolOpts) -> Self {
         Self {
             observe,
             server_kind: Arc::new(AtomicU8::new(SERVER_KIND_UNKNOWN)),
             configured_socket: opts.socket().is_some(),
-            socket_replacements: Arc::new(Mutex::new(HashSet::new())),
+            socket_replacements: Arc::new(Mutex::new(PendingSocketReplacements::new(
+                pool_opts.constraints().max(),
+            ))),
         }
     }
 
@@ -150,24 +208,19 @@ impl NewConnectionObserver {
     /// can open with a connection over that socket, and runs `after_connect` on the replacement
     /// twice: as it opens it, and again where the TCP connection would have run it. A
     /// connection over a socket the pool was not configured with is such a replacement; the
-    /// first callback reports it and records its id, and the second finds the id and removes
-    /// it. A replacement that fails after its first callback, so has no second, leaves its id
-    /// behind, and the next replacement given the same id is reported on its second callback
-    /// instead: still once.
+    /// first callback reports it and records it, and the second finds it and removes it (see
+    /// [`PendingSocketReplacements`]).
     fn is_second_callback(&self, conn: &Conn) -> bool {
-        if self.configured_socket || conn.opts().socket().is_none() {
+        let Some(socket) = conn.opts().socket() else {
+            return false;
+        };
+        if self.configured_socket {
             return false;
         }
-        let mut reported = self
-            .socket_replacements
+        self.socket_replacements
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if reported.remove(&conn.id()) {
-            true
-        } else {
-            reported.insert(conn.id());
-            false
-        }
+            .unwrap_or_else(PoisonError::into_inner)
+            .second_callback(socket, conn.id())
     }
 }
 
@@ -424,9 +477,9 @@ impl MySQLConnectionPool {
 
         let opts = mysql_async::Opts::from(connection_string);
         let pool_opts = configure_pool(opts.pool_opts().clone());
-        let mut opts_builder = OptsBuilder::from_opts(opts.clone()).pool_opts(pool_opts);
+        let mut opts_builder = OptsBuilder::from_opts(opts.clone()).pool_opts(pool_opts.clone());
         if let Some(observe) = observe {
-            let observer = NewConnectionObserver::new(observe, &opts);
+            let observer = NewConnectionObserver::new(observe, &opts, &pool_opts);
             opts_builder = opts_builder.after_connect(move |conn| {
                 let observer = observer.clone();
                 Box::pin(async move {
@@ -609,5 +662,68 @@ impl DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)> for MySQ
 
     fn join_push_down(&self) -> JoinPushDown {
         self.join_push_down.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PendingSocketReplacements;
+
+    const SOCKET_A: &str = "/tmp/a.sock";
+    const SOCKET_B: &str = "/tmp/b.sock";
+
+    #[test]
+    fn a_replacement_is_reported_on_its_first_callback_only() {
+        let mut pending = PendingSocketReplacements::new(10);
+        assert!(!pending.second_callback(SOCKET_A, 7));
+        assert!(pending.second_callback(SOCKET_A, 7));
+        // The id is free again for a later connection.
+        assert!(!pending.second_callback(SOCKET_A, 7));
+    }
+
+    /// Two servers on two sockets can give replacements the same id at the same time. Their
+    /// callbacks interleave as A1, B1, A2, B2, and each is reported once.
+    #[test]
+    fn overlapping_replacements_with_one_id_on_two_sockets_are_each_reported_once() {
+        let mut pending = PendingSocketReplacements::new(10);
+        let reported: Vec<bool> = [(SOCKET_A, 7), (SOCKET_B, 7), (SOCKET_A, 7), (SOCKET_B, 7)]
+            .into_iter()
+            .map(|(socket, id)| !pending.second_callback(socket, id))
+            .collect();
+        assert_eq!(reported, vec![true, true, false, false]);
+    }
+
+    /// A replacement that fails after its first callback never has a second, and its entry
+    /// does not stay forever: the entries are bounded, the oldest dropped first.
+    #[test]
+    fn replacements_that_fail_after_their_first_callback_do_not_accumulate() {
+        let mut pending = PendingSocketReplacements::new(10);
+        let capacity = PendingSocketReplacements::capacity(10);
+        for id in 0..10_000 {
+            assert!(!pending.second_callback(SOCKET_A, id));
+        }
+        assert_eq!(pending.len(), capacity);
+        // The newest entries are kept: their second callbacks still find them.
+        assert!(pending.second_callback(SOCKET_A, 9_999));
+        // The oldest were dropped: a second callback after that many failed replacements
+        // reports the connection again rather than not at all.
+        assert!(!pending.second_callback(SOCKET_A, 0));
+    }
+
+    /// A pool opens at most its maximum connections at once, so as many first callbacks as
+    /// that leave every pending entry in place.
+    #[test]
+    fn the_bound_holds_every_replacement_a_full_pool_has_in_flight() {
+        for max in [1, 10, 100] {
+            let mut pending = PendingSocketReplacements::new(max);
+            let in_flight = u32::try_from(PendingSocketReplacements::capacity(max)).expect("fits");
+            for id in 0..in_flight {
+                assert!(!pending.second_callback(SOCKET_A, id));
+            }
+            for id in 0..in_flight {
+                assert!(pending.second_callback(SOCKET_A, id), "max {max}: id {id}");
+            }
+            assert_eq!(pending.len(), 0);
+        }
     }
 }
