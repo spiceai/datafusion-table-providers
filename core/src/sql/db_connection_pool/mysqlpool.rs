@@ -103,6 +103,24 @@ impl MySQLConnectionPool {
     /// Returns an error if there is a problem creating the connection pool.
     #[allow(clippy::unused_async)]
     pub async fn new(params: HashMap<String, SecretString>) -> Result<Self> {
+        Self::new_with_pool_opts(params, |pool_opts| pool_opts).await
+    }
+
+    /// Creates a new instance of `MySQLConnectionPool`, passing the pool options through
+    /// `configure_pool` before the pool is built.
+    ///
+    /// `configure_pool` receives the pool options read from `params`: from the
+    /// `connection_string` URL when one is given, otherwise from `pool_min` and `pool_max`.
+    /// What it returns is what the pool uses on both paths, so a caller can apply pool size
+    /// limits or a connection lifetime whether or not the connection is given as a URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is a problem creating the connection pool.
+    pub async fn new_with_pool_opts(
+        params: HashMap<String, SecretString>,
+        configure_pool: impl FnOnce(PoolOpts) -> PoolOpts + Send,
+    ) -> Result<Self> {
         // Remove the "mysql_" prefix from the keys to keep backward compatibility
         let params = util::remove_prefix_from_hashmap_keys(params, "mysql_");
 
@@ -189,6 +207,9 @@ impl MySQLConnectionPool {
         ));
 
         let opts = mysql_async::Opts::from(connection_string);
+        let pool_opts = configure_pool(opts.pool_opts().clone());
+        let opts =
+            mysql_async::Opts::from(mysql_async::OptsBuilder::from_opts(opts).pool_opts(pool_opts));
 
         verify_mysql_opts(&opts).await?;
 
