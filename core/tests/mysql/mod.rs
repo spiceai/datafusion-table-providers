@@ -1079,6 +1079,20 @@ async fn connections_opened(port: usize, user: &str) -> u64 {
     opened.unwrap_or(0)
 }
 
+/// How many prepared statements the server holds, across every session.
+async fn prepared_statements(port: usize) -> u64 {
+    let mut admin = mysql_async::Conn::new(common::root_opts(port))
+        .await
+        .expect("admin connection to open");
+    // The text protocol, so that this read prepares nothing itself.
+    let count: Option<(String, u64)> = admin
+        .query_first("SHOW GLOBAL STATUS LIKE 'Prepared_stmt_count'")
+        .await
+        .expect("Prepared_stmt_count to be read");
+    admin.disconnect().await.expect("admin connection to close");
+    count.expect("Prepared_stmt_count to return a row").1
+}
+
 /// The server's `@@hostname`.
 async fn server_hostname(port: usize) -> String {
     let mut admin = mysql_async::Conn::new(common::root_opts(port))
@@ -1236,7 +1250,7 @@ async fn test_mysql_new_connection_observer_across_servers() {
         common::user_params(proxy.port, user),
         |pool_opts| {
             pool_opts
-                .with_constraints(PoolConstraints::new(0, 10).expect("0..=10 is a valid pool size"))
+                .with_constraints(PoolConstraints::new(0, 32).expect("0..=32 is a valid pool size"))
         },
         reports.observer(),
     )
@@ -1244,7 +1258,7 @@ async fn test_mysql_new_connection_observer_across_servers() {
     .expect("pool to be created");
     // Connections held open, so that each checkout opens a new one.
     let mut held = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..8 {
         held.push(
             pool.connect_direct()
                 .await
@@ -1254,6 +1268,8 @@ async fn test_mysql_new_connection_observer_across_servers() {
     let mut ids_on_a = reports.ids();
     ids_on_a.sort_unstable();
 
+    // Bring B up to each id A gave and open a connection to B. The server's health check can
+    // take the id between the two; the next of A's ids is then the next try.
     proxy.switch_to(port_b);
     for id in &ids_on_a {
         advance_connection_ids(port_b, *id).await;
@@ -1324,6 +1340,9 @@ async fn test_mysql_first_checkout_reuses_the_test_connection() {
     .expect("pool to be created");
     let test_connection = reports.ids();
     assert_eq!(test_connection.len(), 1, "{test_connection:?}");
+    // The idle test connection, returned to the pool without a reset, holds no prepared
+    // statement.
+    assert_eq!(prepared_statements(port).await, 0);
 
     assert_eq!(mysql_connection_id(&pool).await, test_connection[0]);
     assert_eq!(reports.ids(), test_connection);
