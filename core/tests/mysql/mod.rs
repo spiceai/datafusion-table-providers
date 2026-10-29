@@ -982,7 +982,10 @@ async fn mysql_connection_id(pool: &MySQLConnectionPool) -> u64 {
 
 /// The pool options passed to `new_with_pool_opts` apply when the server is given as a
 /// `connection_string` URL, where `pool_min` and `pool_max` parameters are not read.
-async fn test_mysql_pool_opts_apply_to_connection_string(port: usize) {
+#[test_log::test(tokio::test)]
+async fn test_mysql_pool_opts_apply_to_connection_string() {
+    let port = crate::get_random_port();
+    let mysql_container = start_mysql_container(port).await;
     let pool = MySQLConnectionPool::new_with_pool_opts(
         common::get_mysql_connection_string_params(port),
         |pool_opts| {
@@ -1016,6 +1019,8 @@ async fn test_mysql_pool_opts_apply_to_connection_string(port: usize) {
         first_id, replaced_id,
         "the connection outlived its 3s lifetime"
     );
+
+    mysql_container.remove().await.expect("container to stop");
 }
 
 #[rstest]
@@ -1035,7 +1040,6 @@ async fn test_mysql_arrow_oneway() {
     test_mysql_decimal_types_to_decimal256(port).await;
     test_mysql_zero_date_type(port).await;
     test_mysql_nullability_constraints(port).await;
-    test_mysql_pool_opts_apply_to_connection_string(port).await;
 
     mysql_container.remove().await.expect("container to stop");
 }
