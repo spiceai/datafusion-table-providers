@@ -1025,55 +1025,174 @@ async fn test_mysql_pool_opts_apply_to_connection_string() {
     mysql_container.remove().await.expect("container to stop");
 }
 
-/// The observer hears of each connection once, before its first use, with the server it
-/// reached, and not again when the pool hands the same connection out again.
+/// Collects what a pool's new-connection observer reports.
+#[derive(Clone, Default)]
+struct Reports(Arc<std::sync::Mutex<Vec<MySQLServerIdentity>>>);
+
+impl Reports {
+    fn observer(&self) -> impl Fn(&MySQLServerIdentity) + Send + Sync + 'static {
+        let reports = Arc::clone(&self.0);
+        move |identity| reports.lock().expect("lock").push(identity.clone())
+    }
+
+    fn all(&self) -> Vec<MySQLServerIdentity> {
+        self.0.lock().expect("lock").clone()
+    }
+
+    fn ids(&self) -> Vec<u64> {
+        self.all()
+            .iter()
+            .map(|identity| u64::from(identity.connection_id))
+            .collect()
+    }
+}
+
+/// Creates `user`, password `pw`, with read access to `mysqldb`.
+async fn create_user(port: usize, user: &str) {
+    let mut admin = mysql_async::Conn::new(common::root_opts(port))
+        .await
+        .expect("admin connection to open");
+    admin
+        .query_drop(format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'pw'"))
+        .await
+        .expect("user to be created");
+    admin
+        .query_drop(format!("GRANT SELECT ON mysqldb.* TO '{user}'@'%'"))
+        .await
+        .expect("user to be granted read access");
+    admin.disconnect().await.expect("admin connection to close");
+}
+
+/// How many connections `user` has opened to the server on `port`, as the server counts them.
+async fn connections_opened(port: usize, user: &str) -> u64 {
+    let mut admin = mysql_async::Conn::new(common::root_opts(port))
+        .await
+        .expect("admin connection to open");
+    let opened: Option<u64> = admin
+        .exec_first(
+            "SELECT TOTAL_CONNECTIONS FROM performance_schema.users WHERE USER = ?",
+            (user,),
+        )
+        .await
+        .expect("connection totals to be read");
+    admin.disconnect().await.expect("admin connection to close");
+    opened.unwrap_or(0)
+}
+
+/// The server's `@@hostname`.
+async fn server_hostname(port: usize) -> String {
+    let mut admin = mysql_async::Conn::new(common::root_opts(port))
+        .await
+        .expect("admin connection to open");
+    let hostname: Option<String> = admin
+        .query_first("SELECT @@hostname")
+        .await
+        .expect("@@hostname to be read");
+    admin.disconnect().await.expect("admin connection to close");
+    hostname.expect("@@hostname to return a row")
+}
+
+/// Opens and closes connections to the server on `port` until the next one it opens is given
+/// an id of at least `next_id`.
+async fn advance_connection_ids(port: usize, next_id: u64) {
+    loop {
+        let conn = mysql_async::Conn::new(common::root_opts(port))
+            .await
+            .expect("connection to open");
+        let id = u64::from(conn.id());
+        conn.disconnect().await.expect("connection to close");
+        if id + 1 >= next_id {
+            return;
+        }
+    }
+}
+
+/// A TCP proxy on a local port whose upstream port can be switched while it runs. Each
+/// connection it accepts goes to the upstream set when it is accepted, so connections already
+/// open stay on their server, as behind a load-balanced hostname.
+struct SwitchingProxy {
+    port: u16,
+    upstream: Arc<std::sync::atomic::AtomicU16>,
+    accept: tokio::task::JoinHandle<()>,
+}
+
+impl SwitchingProxy {
+    async fn start(upstream: usize) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("proxy to bind");
+        let port = listener.local_addr().expect("proxy address").port();
+        let upstream = Arc::new(std::sync::atomic::AtomicU16::new(
+            u16::try_from(upstream).expect("port fits"),
+        ));
+        let accept = tokio::spawn({
+            let upstream = Arc::clone(&upstream);
+            async move {
+                while let Ok((mut client, _)) = listener.accept().await {
+                    let to = upstream.load(std::sync::atomic::Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        if let Ok(mut server) =
+                            tokio::net::TcpStream::connect(("127.0.0.1", to)).await
+                        {
+                            let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                        }
+                    });
+                }
+            }
+        });
+        Self {
+            port,
+            upstream,
+            accept,
+        }
+    }
+
+    fn switch_to(&self, upstream: usize) {
+        self.upstream.store(
+            u16::try_from(upstream).expect("port fits"),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+}
+
+impl Drop for SwitchingProxy {
+    fn drop(&mut self) {
+        self.accept.abort();
+    }
+}
+
+/// The observer hears of each connection once, as the pool opens it, with the server it
+/// reached: the connection the pool opens to test the server, and the one that replaces it
+/// once its lifetime passes. It does not hear again of a connection the pool hands out again.
 #[test_log::test(tokio::test)]
 async fn test_mysql_new_connection_observer() {
     let port = crate::get_random_port();
     let mysql_container = start_mysql_container(port).await;
-    let reported = Arc::new(std::sync::Mutex::new(Vec::<MySQLServerIdentity>::new()));
-    let pool = MySQLConnectionPool::new_with_pool_opts(
+    let reports = Reports::default();
+    let pool = MySQLConnectionPool::new_with_pool_opts_and_observer(
         common::get_mysql_connection_string_params(port),
         |pool_opts| {
             pool_opts
                 .with_constraints(PoolConstraints::new(1, 1).expect("1..=1 is a valid pool size"))
                 .with_abs_conn_ttl(Some(Duration::from_secs(3)))
         },
+        reports.observer(),
     )
     .await
-    .expect("pool to be created")
-    .with_new_connection_observer({
-        let reported = Arc::clone(&reported);
-        move |identity| reported.lock().expect("lock").push(identity.clone())
-    });
+    .expect("pool to be created");
+    // The test connection is reported as the pool opens it, before any checkout.
+    assert_eq!(reports.all().len(), 1, "{:?}", reports.all());
 
     let first_id = mysql_connection_id(&pool).await;
     assert_eq!(first_id, mysql_connection_id(&pool).await);
+    // The sleep is the lifetime under test.
     tokio::time::sleep(Duration::from_millis(3_500)).await;
     let replaced_id = mysql_connection_id(&pool).await;
     assert_ne!(first_id, replaced_id);
 
-    let server_hostname: String = {
-        let connection = pool.connect_direct().await.expect("connection to open");
-        let mut conn = connection.conn.lock().await;
-        conn.query_first("SELECT @@hostname")
-            .await
-            .expect("@@hostname to be read")
-            .expect("@@hostname to return a row")
-    };
-    let reported = reported.lock().expect("lock").clone();
-    let ids: Vec<u32> = reported
-        .iter()
-        .map(|identity| identity.connection_id)
-        .collect();
-    assert_eq!(
-        ids,
-        vec![
-            u32::try_from(first_id).expect("id fits"),
-            u32::try_from(replaced_id).expect("id fits")
-        ]
-    );
-    for identity in &reported {
+    let server_hostname = server_hostname(port).await;
+    assert_eq!(reports.ids(), vec![first_id, replaced_id]);
+    for identity in &reports.all() {
         assert_eq!(identity.configured_host, "localhost");
         assert_eq!(
             identity.configured_port,
@@ -1085,6 +1204,205 @@ async fn test_mysql_new_connection_observer() {
         assert_eq!(identity.aurora_server_id, None);
     }
 
+    mysql_container.remove().await.expect("container to stop");
+}
+
+/// Behind one hostname, a pool's connections move to another server, whose connections can
+/// take ids that the first server gave the pool's connections still open. Each connection is
+/// still reported once, whatever its id: each server's own count of the pool user's
+/// connections is the oracle.
+#[test_log::test(tokio::test)]
+async fn test_mysql_new_connection_observer_across_servers() {
+    let (port_a, port_b) = (crate::get_random_port(), crate::get_random_port());
+    let server_a = start_mysql_container(port_a).await;
+    let server_b = start_mysql_container(port_b).await;
+    let user = "observed";
+    create_user(port_a, user).await;
+    create_user(port_b, user).await;
+    // Server A's ids start above B's, so B can be brought up to each id A gives the pool.
+    let admin_b = mysql_async::Conn::new(common::root_opts(port_b))
+        .await
+        .expect("admin connection to open");
+    let b_id = u64::from(admin_b.id());
+    admin_b
+        .disconnect()
+        .await
+        .expect("admin connection to close");
+    advance_connection_ids(port_a, b_id + 20).await;
+
+    let proxy = SwitchingProxy::start(port_a).await;
+    let reports = Reports::default();
+    let pool = MySQLConnectionPool::new_with_pool_opts_and_observer(
+        common::user_params(proxy.port, user),
+        |pool_opts| {
+            pool_opts
+                .with_constraints(PoolConstraints::new(0, 10).expect("0..=10 is a valid pool size"))
+        },
+        reports.observer(),
+    )
+    .await
+    .expect("pool to be created");
+    // Connections held open, so that each checkout opens a new one.
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        held.push(
+            pool.connect_direct()
+                .await
+                .expect("connection to A to open"),
+        );
+    }
+    let mut ids_on_a = reports.ids();
+    ids_on_a.sort_unstable();
+
+    proxy.switch_to(port_b);
+    for id in &ids_on_a {
+        advance_connection_ids(port_b, *id).await;
+        held.push(
+            pool.connect_direct()
+                .await
+                .expect("connection to B to open"),
+        );
+    }
+    drop(held);
+    drop(pool);
+
+    let reports = reports.all();
+    let mut ids_by_server = Vec::new();
+    for port in [port_a, port_b] {
+        let hostname = server_hostname(port).await;
+        let mut ids: Vec<u64> = reports
+            .iter()
+            .filter(|identity| identity.hostname == hostname)
+            .map(|identity| u64::from(identity.connection_id))
+            .collect();
+        let reported = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(
+            reported,
+            ids.len(),
+            "a connection was reported twice: {reports:?}"
+        );
+        let opened = connections_opened(port, user).await;
+        assert_eq!(
+            u64::try_from(reported).expect("count fits"),
+            opened,
+            "the server on port {port} saw {opened} connections from '{user}', and {reported} were reported: {reports:?}"
+        );
+        ids_by_server.push(ids);
+    }
+    // Non-vacuous: server B gave the pool an id that A had given a connection still open.
+    assert!(
+        ids_by_server[1]
+            .iter()
+            .any(|id| ids_by_server[0].contains(id)),
+        "no connection to B took an id A had given, so this test did not exercise reused ids: {ids_by_server:?}"
+    );
+
+    server_a.remove().await.expect("container to stop");
+    server_b.remove().await.expect("container to stop");
+}
+
+/// The pool's first checkout gets the connection the pool opened to test the server, however
+/// soon after the pool is created it starts: a new pool opens one connection, not two.
+#[test_log::test(tokio::test)]
+async fn test_mysql_first_checkout_reuses_the_test_connection() {
+    let port = crate::get_random_port();
+    let mysql_container = start_mysql_container(port).await;
+    let user = "first_checkout";
+    create_user(port, user).await;
+    let reports = Reports::default();
+    let pool = MySQLConnectionPool::new_with_pool_opts_and_observer(
+        common::user_params(u16::try_from(port).expect("port fits"), user),
+        |pool_opts| {
+            pool_opts
+                .with_constraints(PoolConstraints::new(1, 5).expect("1..=5 is a valid pool size"))
+        },
+        reports.observer(),
+    )
+    .await
+    .expect("pool to be created");
+    let test_connection = reports.ids();
+    assert_eq!(test_connection.len(), 1, "{test_connection:?}");
+
+    assert_eq!(mysql_connection_id(&pool).await, test_connection[0]);
+    assert_eq!(reports.ids(), test_connection);
+    assert_eq!(connections_opened(port, user).await, 1);
+
+    mysql_container.remove().await.expect("container to stop");
+}
+
+/// With `prefer_socket`, on by default, `mysql_async` replaces a TCP connection with one over
+/// the Unix socket the server reports, and runs `after_connect` on the replacement twice. The
+/// replacement is reported once. The server reports a socket path under `/tmp`, and this test
+/// listens on the same path on the host and forwards it to the server's TCP port, so the
+/// replacement is opened.
+#[cfg(unix)]
+#[test_log::test(tokio::test)]
+async fn test_mysql_socket_replacement_reported_once() {
+    let port = crate::get_random_port();
+    let socket_path = format!("/tmp/dftp-mysql-{port}.sock");
+    let mysql_container =
+        common::start_mysql_docker_container_with_args(port, &[&format!("--socket={socket_path}")])
+            .await
+            .expect("MySQL container to start");
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("socket to bind");
+    let forwarded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let forward = tokio::spawn({
+        let forwarded = Arc::clone(&forwarded);
+        async move {
+            while let Ok((mut client, _)) = listener.accept().await {
+                forwarded.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    if let Ok(mut server) = tokio::net::TcpStream::connect((
+                        "127.0.0.1",
+                        u16::try_from(port).expect("port fits"),
+                    ))
+                    .await
+                    {
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                    }
+                });
+            }
+        }
+    });
+
+    let reports = Reports::default();
+    let pool = MySQLConnectionPool::new_with_pool_opts_and_observer(
+        common::get_mysql_connection_string_params(port),
+        |pool_opts| {
+            pool_opts
+                .with_constraints(PoolConstraints::new(1, 1).expect("1..=1 is a valid pool size"))
+        },
+        reports.observer(),
+    )
+    .await
+    .expect("pool to be created");
+    let id = mysql_connection_id(&pool).await;
+
+    // Non-vacuous: the pool's connections were replaced by connections over the socket, and
+    // each replacement is reported once.
+    let forwarded = forwarded.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        forwarded >= 1,
+        "no connection was replaced by one over the socket"
+    );
+    let ids = reports.ids();
+    assert_eq!(ids.len(), forwarded, "{ids:?}");
+    assert!(ids.contains(&id), "{ids:?} does not include {id}");
+    let mut unique = ids.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        ids.len(),
+        "a connection was reported twice: {ids:?}"
+    );
+
+    drop(pool);
+    forward.abort();
+    let _ = std::fs::remove_file(&socket_path);
     mysql_container.remove().await.expect("container to stop");
 }
 

@@ -1,17 +1,18 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU8, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicU8, AtomicUsize, Ordering},
+        Arc, Mutex, PoisonError,
     },
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use mysql_async::{
     prelude::{Queryable, ToValue},
-    Conn, DriverError, Metrics, Opts, Params, PoolConstraints, PoolOpts, Row, SslOpts,
+    Conn, DriverError, Metrics, Opts, OptsBuilder, Params, PoolConstraints, PoolOpts, Row, SslOpts,
     DEFAULT_POOL_CONSTRAINTS,
 };
 use secrecy::{ExposeSecret, SecretBox, SecretString};
@@ -67,7 +68,6 @@ pub struct MySQLConnectionPool {
     pool: Arc<mysql_async::Pool>,
     join_push_down: JoinPushDown,
     zero_date_behavior: MysqlZeroDateBehavior,
-    new_connection_observer: Option<NewConnectionObserver>,
 }
 
 /// The server a connection reached, as the server reports itself. A load-balanced
@@ -89,54 +89,25 @@ pub struct MySQLServerIdentity {
     pub aurora_server_id: Option<String>,
 }
 
-/// Reports the server each connection reached, once per connection, before its first use.
+/// Called with the server a new connection reached.
+type ObserveFn = Arc<dyn Fn(&MySQLServerIdentity) + Send + Sync>;
+
+/// Reports the server each new connection reached, once per connection, as it is opened.
+///
+/// It runs as the connection's `after_connect` callback, which `mysql_async` calls once on
+/// each connection it opens, before the connection's setup statements, and not again when the
+/// pool resets the connection (`COM_RESET_CONNECTION` or `COM_CHANGE_USER`) to hand it out
+/// again. A connection is therefore reported whatever its id, including one whose id a
+/// connection to another server behind the same hostname had before it.
 #[derive(Clone)]
 struct NewConnectionObserver {
-    observe: Arc<dyn Fn(&MySQLServerIdentity) + Send + Sync>,
-    seen: Arc<Mutex<SeenConnections>>,
+    observe: ObserveFn,
     server_kind: Arc<AtomicU8>,
-}
-
-/// The ids of the connections seen, each with when it was last used. A connection whose id is
-/// not here is new.
-///
-/// The ids of closed connections are never told apart from live ones, so the list is bounded,
-/// and at the bound the least recently used id is dropped. The bound is large next to the pool
-/// (see [`SeenConnections::capacity`]): a connection held while that many others are opened
-/// and closed around it is the only live one whose id can be dropped, and it is then reported
-/// a second time.
-#[derive(Debug, Default)]
-struct SeenConnections {
-    last_used: HashMap<u32, u64>,
-    uses: u64,
-}
-
-impl SeenConnections {
-    /// The most ids kept for a pool of at most `max_connections` connections.
-    fn capacity(max_connections: usize) -> usize {
-        max_connections.saturating_mul(16).max(1024)
-    }
-
-    /// Whether this is the first use of the connection with this id, recording the use.
-    fn first_use(&mut self, connection_id: u32, capacity: usize) -> bool {
-        self.uses += 1;
-        if let Some(last_used) = self.last_used.get_mut(&connection_id) {
-            *last_used = self.uses;
-            return false;
-        }
-        if self.last_used.len() >= capacity {
-            if let Some(least_recent) = self
-                .last_used
-                .iter()
-                .min_by_key(|(_, last_used)| **last_used)
-                .map(|(id, _)| *id)
-            {
-                self.last_used.remove(&least_recent);
-            }
-        }
-        self.last_used.insert(connection_id, self.uses);
-        true
-    }
+    /// Whether the pool is configured to connect over a Unix socket.
+    configured_socket: bool,
+    /// The ids of the socket replacements reported once, whose second callback is still due
+    /// (see [`NewConnectionObserver::is_second_callback`]).
+    socket_replacements: Arc<Mutex<HashSet<u32>>>,
 }
 
 impl fmt::Debug for NewConnectionObserver {
@@ -147,13 +118,56 @@ impl fmt::Debug for NewConnectionObserver {
 }
 
 impl NewConnectionObserver {
-    /// Whether this is the first use of `conn`.
-    fn first_use(&self, conn: &Conn) -> bool {
-        let capacity = SeenConnections::capacity(conn.opts().pool_opts().constraints().max());
-        self.seen
+    fn new(observe: ObserveFn, opts: &Opts) -> Self {
+        Self {
+            observe,
+            server_kind: Arc::new(AtomicU8::new(SERVER_KIND_UNKNOWN)),
+            configured_socket: opts.socket().is_some(),
+            socket_replacements: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// Reports the server `conn` reached. It never fails: a connection whose server does not
+    /// answer is still used, and is only missing from the reports.
+    async fn observe(&self, conn: &mut Conn) {
+        if self.is_second_callback(conn) {
+            return;
+        }
+        let connection_id = conn.id();
+        match server_identity(conn, &self.server_kind).await {
+            Ok(Some(identity)) => (self.observe)(&identity),
+            Ok(None) => tracing::debug!(
+                "MySQL connection {connection_id} gave no usable server hostname and port"
+            ),
+            Err(error) => tracing::debug!(
+                "Could not ask MySQL connection {connection_id} which server it reached: {error}"
+            ),
+        }
+    }
+
+    /// Whether `conn` was already reported. With `prefer_socket`, on by default outside
+    /// Windows, `mysql_async` replaces a TCP connection to a server whose Unix socket the client
+    /// can open with a connection over that socket, and runs `after_connect` on the replacement
+    /// twice: as it opens it, and again where the TCP connection would have run it. A
+    /// connection over a socket the pool was not configured with is such a replacement; the
+    /// first callback reports it and records its id, and the second finds the id and removes
+    /// it. A replacement that fails after its first callback, so has no second, leaves its id
+    /// behind, and the next replacement given the same id is reported on its second callback
+    /// instead: still once.
+    fn is_second_callback(&self, conn: &Conn) -> bool {
+        if self.configured_socket || conn.opts().socket().is_none() {
+            return false;
+        }
+        let mut reported = self
+            .socket_replacements
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .first_use(conn.id(), capacity)
+            .unwrap_or_else(PoisonError::into_inner);
+        if reported.remove(&conn.id()) {
+            true
+        } else {
+            reported.insert(conn.id());
+            false
+        }
     }
 }
 
@@ -295,6 +309,34 @@ impl MySQLConnectionPool {
         params: HashMap<String, SecretString>,
         configure_pool: impl FnOnce(PoolOpts) -> PoolOpts + Send,
     ) -> Result<Self> {
+        Self::build(params, configure_pool, None).await
+    }
+
+    /// Creates a new instance of `MySQLConnectionPool` as [`Self::new_with_pool_opts`] does,
+    /// and calls `observe` with the server each connection the pool opens reached.
+    ///
+    /// `observe` is called once for every connection the pool opens, the pool's own test
+    /// connection included, as the connection is opened and before its first use. Finding the
+    /// server costs one query on each new connection (two on the pool's first) and none on a
+    /// connection the pool reuses. A connection whose server does not answer is opened and
+    /// used as any other, and is not reported.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is a problem creating the connection pool.
+    pub async fn new_with_pool_opts_and_observer(
+        params: HashMap<String, SecretString>,
+        configure_pool: impl FnOnce(PoolOpts) -> PoolOpts + Send,
+        observe: impl Fn(&MySQLServerIdentity) + Send + Sync + 'static,
+    ) -> Result<Self> {
+        Self::build(params, configure_pool, Some(Arc::new(observe))).await
+    }
+
+    async fn build(
+        params: HashMap<String, SecretString>,
+        configure_pool: impl FnOnce(PoolOpts) -> PoolOpts + Send,
+        observe: Option<ObserveFn>,
+    ) -> Result<Self> {
         // Remove the "mysql_" prefix from the keys to keep backward compatibility
         let params = util::remove_prefix_from_hashmap_keys(params, "mysql_");
 
@@ -382,8 +424,18 @@ impl MySQLConnectionPool {
 
         let opts = mysql_async::Opts::from(connection_string);
         let pool_opts = configure_pool(opts.pool_opts().clone());
-        let opts =
-            mysql_async::Opts::from(mysql_async::OptsBuilder::from_opts(opts).pool_opts(pool_opts));
+        let mut opts_builder = OptsBuilder::from_opts(opts.clone()).pool_opts(pool_opts);
+        if let Some(observe) = observe {
+            let observer = NewConnectionObserver::new(observe, &opts);
+            opts_builder = opts_builder.after_connect(move |conn| {
+                let observer = observer.clone();
+                Box::pin(async move {
+                    observer.observe(conn).await;
+                    Ok(())
+                })
+            });
+        }
+        let opts = mysql_async::Opts::from(opts_builder);
 
         verify_mysql_opts(&opts).await?;
 
@@ -419,55 +471,22 @@ impl MySQLConnectionPool {
             .await
             .context(MySQLConnectionSnafu)?;
 
+        // Hand the test connection to the pool's first checkout rather than open another.
+        // `SELECT 1` changes no session state, so the connection skips the reset `mysql_async`
+        // gives a returned connection; its prepared `SELECT 1` stays in the connection's
+        // statement cache, as statements do on a pool that does not reset connections. The
+        // pool takes a returned connection back on a background task, and a checkout that
+        // started before then would open a second connection. Waiting for that task keeps the
+        // connection in the pool's accounting and under its lifetime and idle limits.
+        conn.reset_connection(false);
+        drop(conn);
+        wait_for_returned_connection(&pool.metrics()).await;
+
         Ok(Self {
             pool: Arc::new(pool),
             join_push_down,
             zero_date_behavior: MysqlZeroDateBehavior::default(),
-            new_connection_observer: None,
         })
-    }
-
-    /// Calls `observe` with the server each connection from this pool reached, once per
-    /// connection, before the connection is first used. Finding the server costs one query
-    /// on each new connection (two on the pool's first) and none on a connection the pool
-    /// reuses.
-    ///
-    /// A connection is told apart by its id on the server. Two servers behind one hostname
-    /// can give connections the same id, and a connection whose id another server already
-    /// gave to a connection still in use is not reported. A connection held while more than
-    /// `max(16 × pool maximum, 1024)` others are opened around it is reported again (see
-    /// [`SeenConnections`]).
-    #[must_use]
-    pub fn with_new_connection_observer(
-        mut self,
-        observe: impl Fn(&MySQLServerIdentity) + Send + Sync + 'static,
-    ) -> Self {
-        self.new_connection_observer = Some(NewConnectionObserver {
-            observe: Arc::new(observe),
-            seen: Arc::new(Mutex::new(SeenConnections::default())),
-            server_kind: Arc::new(AtomicU8::new(SERVER_KIND_UNKNOWN)),
-        });
-        self
-    }
-
-    /// Reports `conn` to the observer if this is its first use.
-    async fn observe_new_connection(&self, conn: &mut Conn) {
-        let Some(observer) = &self.new_connection_observer else {
-            return;
-        };
-        if !observer.first_use(conn) {
-            return;
-        }
-        let connection_id = conn.id();
-        match server_identity(conn, &observer.server_kind).await {
-            Ok(Some(identity)) => (observer.observe)(&identity),
-            Ok(None) => tracing::debug!(
-                "MySQL connection {connection_id} gave no usable server hostname and port"
-            ),
-            Err(error) => tracing::debug!(
-                "Could not ask MySQL connection {connection_id} which server it reached: {error}"
-            ),
-        }
     }
 
     /// Override the [`MysqlZeroDateBehavior`] used by connections created from this pool.
@@ -492,14 +511,38 @@ impl MySQLConnectionPool {
     /// Returns an error if there is a problem creating the connection pool.
     pub async fn connect_direct(&self) -> super::Result<MySQLConnection> {
         let pool = Arc::clone(&self.pool);
-        let mut conn = pool.get_conn().await.context(MySQLConnectionSnafu)?;
-        self.observe_new_connection(&mut conn).await;
+        let conn = pool.get_conn().await.context(MySQLConnectionSnafu)?;
 
         Ok(MySQLConnection::new(conn).with_zero_date_behavior(self.zero_date_behavior))
     }
 
     pub fn metrics(&self) -> Arc<Metrics> {
         self.pool.metrics()
+    }
+}
+
+/// The longest pool creation waits for its test connection to be back in the pool.
+const RETURNED_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Waits until the pool has finished with the one connection returned to it: put it among its
+/// idle connections, or closed it, as a pool whose limits keep no idle connection does. Gives
+/// up after [`RETURNED_CONNECTION_TIMEOUT`], when the next checkout opens a new connection.
+async fn wait_for_returned_connection(metrics: &Metrics) {
+    let recycled = |metrics: &Metrics| {
+        [
+            &metrics.connection_returned_to_pool,
+            &metrics.discarded_superfluous_connection,
+            &metrics.discarded_unestablished_connection,
+            &metrics.discarded_expired_connection,
+            &metrics.discarded_error_during_cleanup,
+        ]
+        .into_iter()
+        .map(|counter: &AtomicUsize| counter.load(Ordering::Acquire))
+        .sum::<usize>()
+    };
+    let deadline = Instant::now() + RETURNED_CONNECTION_TIMEOUT;
+    while recycled(metrics) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -557,8 +600,7 @@ impl DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)> for MySQ
     ) -> super::Result<Box<dyn DbConnection<mysql_async::Conn, &'static (dyn ToValue + Sync)>>>
     {
         let pool = Arc::clone(&self.pool);
-        let mut conn = pool.get_conn().await.context(MySQLConnectionSnafu)?;
-        self.observe_new_connection(&mut conn).await;
+        let conn = pool.get_conn().await.context(MySQLConnectionSnafu)?;
 
         Ok(Box::new(
             MySQLConnection::new(conn).with_zero_date_behavior(self.zero_date_behavior),
@@ -567,53 +609,5 @@ impl DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)> for MySQ
 
     fn join_push_down(&self) -> JoinPushDown {
         self.join_push_down.clone()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::SeenConnections;
-
-    #[test]
-    fn a_connection_is_new_once() {
-        let mut seen = SeenConnections::default();
-        let capacity = SeenConnections::capacity(2);
-        assert!(seen.first_use(7, capacity));
-        assert!(!seen.first_use(7, capacity));
-        assert!(seen.first_use(8, capacity));
-        assert!(!seen.first_use(7, capacity));
-    }
-
-    /// A connection held while the rest of the pool churns keeps its id: with a pool of two,
-    /// the other slot can reconnect up to the capacity's worth of times.
-    #[test]
-    fn a_held_connection_survives_churn_up_to_the_capacity() {
-        let capacity = SeenConnections::capacity(2);
-        assert_eq!(capacity, 1024);
-        let mut seen = SeenConnections::default();
-        assert!(seen.first_use(1, capacity));
-        for id in 2..=1024 {
-            assert!(seen.first_use(id, capacity));
-        }
-        assert!(
-            !seen.first_use(1, capacity),
-            "held connection reported again"
-        );
-
-        // One new connection more than the bound drops the least recently used id, the held
-        // one, which is then reported again: the documented limit.
-        let mut seen = SeenConnections::default();
-        assert!(seen.first_use(1, capacity));
-        for id in 2..=1025 {
-            assert!(seen.first_use(id, capacity));
-        }
-        assert!(seen.first_use(1, capacity));
-    }
-
-    #[test]
-    fn the_capacity_grows_with_the_pool() {
-        assert_eq!(SeenConnections::capacity(1), 1024);
-        assert_eq!(SeenConnections::capacity(100), 1600);
-        assert_eq!(SeenConnections::capacity(usize::MAX), usize::MAX);
     }
 }
