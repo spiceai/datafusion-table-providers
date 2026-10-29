@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     fmt,
     path::PathBuf,
     sync::{
@@ -93,11 +93,50 @@ pub struct MySQLServerIdentity {
 #[derive(Clone)]
 struct NewConnectionObserver {
     observe: Arc<dyn Fn(&MySQLServerIdentity) + Send + Sync>,
-    /// Ids of the connections seen most recently, least recent first. A connection whose id
-    /// is not here is new. Bounded at several times the pool's maximum, so the id of a
-    /// connection still in the pool is not dropped while other connections come and go.
-    seen: Arc<Mutex<VecDeque<u32>>>,
+    seen: Arc<Mutex<SeenConnections>>,
     server_kind: Arc<AtomicU8>,
+}
+
+/// The ids of the connections seen, each with when it was last used. A connection whose id is
+/// not here is new.
+///
+/// The ids of closed connections are never told apart from live ones, so the list is bounded,
+/// and at the bound the least recently used id is dropped. The bound is large next to the pool
+/// (see [`SeenConnections::capacity`]): a connection held while that many others are opened
+/// and closed around it is the only live one whose id can be dropped, and it is then reported
+/// a second time.
+#[derive(Debug, Default)]
+struct SeenConnections {
+    last_used: HashMap<u32, u64>,
+    uses: u64,
+}
+
+impl SeenConnections {
+    /// The most ids kept for a pool of at most `max_connections` connections.
+    fn capacity(max_connections: usize) -> usize {
+        max_connections.saturating_mul(16).max(1024)
+    }
+
+    /// Whether this is the first use of the connection with this id, recording the use.
+    fn first_use(&mut self, connection_id: u32, capacity: usize) -> bool {
+        self.uses += 1;
+        if let Some(last_used) = self.last_used.get_mut(&connection_id) {
+            *last_used = self.uses;
+            return false;
+        }
+        if self.last_used.len() >= capacity {
+            if let Some(least_recent) = self
+                .last_used
+                .iter()
+                .min_by_key(|(_, last_used)| **last_used)
+                .map(|(id, _)| *id)
+            {
+                self.last_used.remove(&least_recent);
+            }
+        }
+        self.last_used.insert(connection_id, self.uses);
+        true
+    }
 }
 
 impl fmt::Debug for NewConnectionObserver {
@@ -108,30 +147,13 @@ impl fmt::Debug for NewConnectionObserver {
 }
 
 impl NewConnectionObserver {
-    /// Whether this is the first use of `conn`. Moves its id to the most recent end.
+    /// Whether this is the first use of `conn`.
     fn first_use(&self, conn: &Conn) -> bool {
-        let connection_id = conn.id();
-        let capacity = conn
-            .opts()
-            .pool_opts()
-            .constraints()
-            .max()
-            .saturating_mul(4)
-            .max(64);
-        let mut seen = self
-            .seen
+        let capacity = SeenConnections::capacity(conn.opts().pool_opts().constraints().max());
+        self.seen
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(position) = seen.iter().rposition(|id| *id == connection_id) {
-            seen.remove(position);
-            seen.push_back(connection_id);
-            return false;
-        }
-        if seen.len() >= capacity {
-            seen.pop_front();
-        }
-        seen.push_back(connection_id);
-        true
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .first_use(conn.id(), capacity)
     }
 }
 
@@ -391,7 +413,9 @@ impl MySQLConnectionPool {
     ///
     /// A connection is told apart by its id on the server. Two servers behind one hostname
     /// can give connections the same id, and a connection whose id another server already
-    /// gave to a connection still in use is not reported.
+    /// gave to a connection still in use is not reported. A connection held while more than
+    /// `max(16 × pool maximum, 1024)` others are opened around it is reported again (see
+    /// [`SeenConnections`]).
     #[must_use]
     pub fn with_new_connection_observer(
         mut self,
@@ -399,7 +423,7 @@ impl MySQLConnectionPool {
     ) -> Self {
         self.new_connection_observer = Some(NewConnectionObserver {
             observe: Arc::new(observe),
-            seen: Arc::new(Mutex::new(VecDeque::new())),
+            seen: Arc::new(Mutex::new(SeenConnections::default())),
             server_kind: Arc::new(AtomicU8::new(SERVER_KIND_UNKNOWN)),
         });
         self
@@ -522,5 +546,53 @@ impl DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)> for MySQ
 
     fn join_push_down(&self) -> JoinPushDown {
         self.join_push_down.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SeenConnections;
+
+    #[test]
+    fn a_connection_is_new_once() {
+        let mut seen = SeenConnections::default();
+        let capacity = SeenConnections::capacity(2);
+        assert!(seen.first_use(7, capacity));
+        assert!(!seen.first_use(7, capacity));
+        assert!(seen.first_use(8, capacity));
+        assert!(!seen.first_use(7, capacity));
+    }
+
+    /// A connection held while the rest of the pool churns keeps its id: with a pool of two,
+    /// the other slot can reconnect up to the capacity's worth of times.
+    #[test]
+    fn a_held_connection_survives_churn_up_to_the_capacity() {
+        let capacity = SeenConnections::capacity(2);
+        assert_eq!(capacity, 1024);
+        let mut seen = SeenConnections::default();
+        assert!(seen.first_use(1, capacity));
+        for id in 2..=1024 {
+            assert!(seen.first_use(id, capacity));
+        }
+        assert!(
+            !seen.first_use(1, capacity),
+            "held connection reported again"
+        );
+
+        // One new connection more than the bound drops the least recently used id, the held
+        // one, which is then reported again: the documented limit.
+        let mut seen = SeenConnections::default();
+        assert!(seen.first_use(1, capacity));
+        for id in 2..=1025 {
+            assert!(seen.first_use(id, capacity));
+        }
+        assert!(seen.first_use(1, capacity));
+    }
+
+    #[test]
+    fn the_capacity_grows_with_the_pool() {
+        assert_eq!(SeenConnections::capacity(1), 1024);
+        assert_eq!(SeenConnections::capacity(100), 1600);
+        assert_eq!(SeenConnections::capacity(usize::MAX), usize::MAX);
     }
 }
