@@ -984,7 +984,10 @@ async fn mysql_connection_id(pool: &MySQLConnectionPool) -> u64 {
 
 /// The pool options passed to `new_with_pool_opts` apply when the server is given as a
 /// `connection_string` URL, where `pool_min` and `pool_max` parameters are not read.
-async fn test_mysql_pool_opts_apply_to_connection_string(port: usize) {
+#[test_log::test(tokio::test)]
+async fn test_mysql_pool_opts_apply_to_connection_string() {
+    let port = crate::get_random_port();
+    let mysql_container = start_mysql_container(port).await;
     let pool = MySQLConnectionPool::new_with_pool_opts(
         common::get_mysql_connection_string_params(port),
         |pool_opts| {
@@ -1018,11 +1021,16 @@ async fn test_mysql_pool_opts_apply_to_connection_string(port: usize) {
         first_id, replaced_id,
         "the connection outlived its 3s lifetime"
     );
+
+    mysql_container.remove().await.expect("container to stop");
 }
 
 /// The observer hears of each connection once, before its first use, with the server it
 /// reached, and not again when the pool hands the same connection out again.
-async fn test_mysql_new_connection_observer(port: usize) {
+#[test_log::test(tokio::test)]
+async fn test_mysql_new_connection_observer() {
+    let port = crate::get_random_port();
+    let mysql_container = start_mysql_container(port).await;
     let reported = Arc::new(std::sync::Mutex::new(Vec::<MySQLServerIdentity>::new()));
     let pool = MySQLConnectionPool::new_with_pool_opts(
         common::get_mysql_connection_string_params(port),
@@ -1045,6 +1053,14 @@ async fn test_mysql_new_connection_observer(port: usize) {
     let replaced_id = mysql_connection_id(&pool).await;
     assert_ne!(first_id, replaced_id);
 
+    let server_hostname: String = {
+        let connection = pool.connect_direct().await.expect("connection to open");
+        let mut conn = connection.conn.lock().await;
+        conn.query_first("SELECT @@hostname")
+            .await
+            .expect("@@hostname to be read")
+            .expect("@@hostname to return a row")
+    };
     let reported = reported.lock().expect("lock").clone();
     let ids: Vec<u32> = reported
         .iter()
@@ -1065,9 +1081,11 @@ async fn test_mysql_new_connection_observer(port: usize) {
         );
         // Inside the container the server listens on 3306, whatever the host port.
         assert_eq!(identity.port, 3306);
-        assert!(!identity.hostname.is_empty(), "{identity:?}");
+        assert_eq!(identity.hostname, server_hostname);
         assert_eq!(identity.aurora_server_id, None);
     }
+
+    mysql_container.remove().await.expect("container to stop");
 }
 
 #[rstest]
@@ -1087,8 +1105,6 @@ async fn test_mysql_arrow_oneway() {
     test_mysql_decimal_types_to_decimal256(port).await;
     test_mysql_zero_date_type(port).await;
     test_mysql_nullability_constraints(port).await;
-    test_mysql_pool_opts_apply_to_connection_string(port).await;
-    test_mysql_new_connection_observer(port).await;
 
     mysql_container.remove().await.expect("container to stop");
 }
