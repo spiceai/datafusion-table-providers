@@ -3,15 +3,17 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, FieldRef};
-use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
+use datafusion::logical_expr::simplify::SimplifyContext;
 use datafusion::logical_expr::{
     BinaryExpr, ColumnarValue, Expr as LogicalExpr, ExprSchemable, LogicalPlan, Operator,
     ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
+use datafusion::optimizer::simplify_expressions::ExprSimplifier;
 use datafusion::sql::sqlparser::ast::{
     self, BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArgumentList, Ident,
     ObjectNamePart, VisitorMut,
@@ -99,6 +101,10 @@ pub fn mark_date_operands(plan: LogicalPlan) -> Result<LogicalPlan, DataFusionEr
     // `with_subqueries`: an `EXISTS`, `IN` or scalar subquery is a plan of its own
     // inside an expression, which a plain `transform_up` never reaches, and a
     // federated statement keeps its same-source subqueries.
+    // One instant for everything this plan sends to SQLite. Each federated subtree is
+    // rewritten separately, so two SQLite subtrees of one query may see instants a few
+    // microseconds apart.
+    let simplifier = ExprSimplifier::new(SimplifyContext::builder().with_current_time().build());
     plan.transform_up_with_subqueries(|node| {
         // The expressions of a node are evaluated against its inputs, or against its
         // own schema when it has none (a scan's pushed-down filters).
@@ -126,11 +132,47 @@ pub fn mark_date_operands(plan: LogicalPlan) -> Result<LogicalPlan, DataFusionEr
         let name_preserver = NamePreserver::new(&node);
         node.map_expressions(|expr| {
             let name = name_preserver.save(&expr);
-            expr.transform_up(|expr| mark_date_operand(expr, &schema))
+            expr.transform_down(|expr| fold_current_time(expr, &simplifier))?
+                .transform_data(|expr| expr.transform_up(|expr| mark_date_operand(expr, &schema)))
                 .map(|marked| marked.update_data(|expr| name.restore(expr)))
         })
     })
     .data()
+}
+
+/// The functions that read the time the statement started. SQLite has none of them
+/// as a function call, so a statement that reaches SQLite still calling one fails
+/// with `no such function`.
+const CURRENT_TIME_FUNCTIONS: [&str; 3] = ["now", "current_date", "current_time"];
+
+/// Folds a column-free expression that reads the current time, such as
+/// `now() - INTERVAL '24 hours'`, to the literal it evaluates to, the same literal a
+/// statement that spells the instant out renders as. `simplifier` carries the one
+/// instant every such expression of the statement folds to.
+fn fold_current_time(
+    expr: LogicalExpr,
+    simplifier: &ExprSimplifier,
+) -> Result<Transformed<LogicalExpr>, DataFusionError> {
+    if !reads_current_time(&expr) || !expr.column_refs().is_empty() || expr.is_volatile() {
+        return Ok(Transformed::no(expr));
+    }
+    let folded = simplifier.simplify(expr)?;
+    if reads_current_time(&folded) {
+        // Not foldable as a whole (an outer reference, say): fold what is inside it.
+        return Ok(Transformed::no(folded));
+    }
+    Ok(Transformed::new(folded, true, TreeNodeRecursion::Jump))
+}
+
+fn reads_current_time(expr: &LogicalExpr) -> bool {
+    expr.exists(|expr| {
+        Ok(matches!(
+            expr,
+            LogicalExpr::ScalarFunction(ScalarFunction { func, .. })
+                if CURRENT_TIME_FUNCTIONS.contains(&func.name())
+        ))
+    })
+    .unwrap_or(false)
 }
 
 /// [`mark_date_operands`] for the plan the federation analyzer hands the executor's
@@ -1317,6 +1359,48 @@ mod test {
                  +----+---------------------+",
             )
             .await;
+        }
+
+        /// A filter on the current time federated to SQLite, which has no `now()`,
+        /// sends the instant it folds to and keeps the rows that instant selects.
+        #[tokio::test]
+        async fn a_filter_on_the_current_time_folds_to_its_instant() {
+            let now = chrono::Utc::now().timestamp_micros();
+            let hour = 3_600_000_000;
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 2, 3])),
+                    Arc::new(TimestampMicrosecondArray::from(vec![
+                        now - hour / 2,
+                        now - 72 * hour,
+                        now + 72 * hour,
+                    ])),
+                ],
+            )
+            .expect("batch");
+            let ctx = federated_session("recent", batch).await;
+            for (sql, expected) in [
+                (
+                    "SELECT id FROM recent WHERE ts > now() - INTERVAL '1 day' ORDER BY id",
+                    "+----+\n| id |\n+----+\n| 1  |\n| 3  |\n+----+",
+                ),
+                (
+                    "SELECT id FROM recent WHERE ts < now() - INTERVAL '2 days' ORDER BY id",
+                    "+----+\n| id |\n+----+\n| 2  |\n+----+",
+                ),
+            ] {
+                let (rows, display) = run(&ctx, sql).await;
+                assert!(
+                    !display.to_lowercase().contains("now("),
+                    "{sql}: SQLite has no now(), so it must not be sent:\n{display}"
+                );
+                assert_eq!(rows, expected, "{sql}");
+            }
         }
     }
 }
