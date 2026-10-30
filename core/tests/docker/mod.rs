@@ -52,6 +52,7 @@ pub struct ContainerRunnerBuilder<'a> {
     port_bindings: Vec<(u16, u16)>,
     env_vars: Vec<(String, String)>,
     healthcheck: Option<HealthConfig>,
+    cmd: Vec<String>,
 }
 
 impl<'a> ContainerRunnerBuilder<'a> {
@@ -62,6 +63,7 @@ impl<'a> ContainerRunnerBuilder<'a> {
             port_bindings: Vec::new(),
             env_vars: Vec::new(),
             healthcheck: None,
+            cmd: Vec::new(),
         }
     }
 
@@ -85,6 +87,13 @@ impl<'a> ContainerRunnerBuilder<'a> {
         self
     }
 
+    /// Appends an argument to the container's command, which replaces the image's default
+    /// command; the image's entrypoint still runs.
+    pub fn add_cmd_arg(mut self, arg: &str) -> Self {
+        self.cmd.push(arg.to_string());
+        self
+    }
+
     pub fn build(self) -> Result<ContainerRunner<'a>, anyhow::Error> {
         let image = self
             .image
@@ -96,6 +105,7 @@ impl<'a> ContainerRunnerBuilder<'a> {
             port_bindings: self.port_bindings,
             env_vars: self.env_vars,
             healthcheck: self.healthcheck,
+            cmd: self.cmd,
         })
     }
 }
@@ -107,6 +117,7 @@ pub struct ContainerRunner<'a> {
     port_bindings: Vec<(u16, u16)>,
     env_vars: Vec<(String, String)>,
     healthcheck: Option<HealthConfig>,
+    cmd: Vec<String>,
 }
 
 impl ContainerRunner<'_> {
@@ -156,6 +167,7 @@ impl ContainerRunner<'_> {
             env: Some(env_vars),
             host_config,
             healthcheck: self.healthcheck,
+            cmd: (!self.cmd.is_empty()).then_some(self.cmd),
             ..Default::default()
         };
 

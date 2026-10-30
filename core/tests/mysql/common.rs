@@ -60,6 +60,35 @@ pub(super) fn get_mysql_params(
 
 #[instrument]
 pub async fn start_mysql_docker_container(port: usize) -> Result<RunningContainer, anyhow::Error> {
+    start_mysql_docker_container_with_args(port, &[]).await
+}
+
+/// Starts a MySQL container whose server takes `mysqld_args`, such as `--socket=…`. The
+/// image's entrypoint passes a command that starts with `-` to `mysqld`.
+#[instrument]
+pub async fn start_mysql_docker_container_with_args(
+    port: usize,
+    mysqld_args: &[&str],
+) -> Result<RunningContainer, anyhow::Error> {
+    start_container(port, mysqld_args, false).await
+}
+
+/// Starts a MySQL container whose health check stops once the server is healthy. Each check
+/// opens a connection, which takes a connection id, so a test that arranges which ids its own
+/// connections get needs the checks to stop. Needs Docker 25 or later for `start_interval`.
+#[instrument]
+pub async fn start_quiet_mysql_docker_container(
+    port: usize,
+    mysqld_args: &[&str],
+) -> Result<RunningContainer, anyhow::Error> {
+    start_container(port, mysqld_args, true).await
+}
+
+async fn start_container(
+    port: usize,
+    mysqld_args: &[&str],
+    quiet_once_healthy: bool,
+) -> Result<RunningContainer, anyhow::Error> {
     let container_name = format!("{MYSQL_DOCKER_CONTAINER}-{port}");
 
     let port = port.try_into().unwrap_or(15432);
@@ -67,7 +96,7 @@ pub async fn start_mysql_docker_container(port: usize) -> Result<RunningContaine
     let mysql_docker_image = std::env::var("MYSQL_DOCKER_IMAGE")
         .unwrap_or_else(|_| format!("{}mysql:latest", container_registry()));
 
-    let running_container = ContainerRunnerBuilder::new(container_name)
+    let mut builder = ContainerRunnerBuilder::new(container_name)
         .image(mysql_docker_image)
         .add_port_binding(3306, port)
         .add_env_var("MYSQL_ROOT_PASSWORD", MYSQL_ROOT_PASSWORD)
@@ -84,10 +113,27 @@ pub async fn start_mysql_docker_container(port: usize) -> Result<RunningContaine
             retries: Some(5),
             start_period: Some(500_000_000), // 100ms
             start_interval: None,
-        })
-        .build()?
-        .run()
-        .await?;
+        });
+    if quiet_once_healthy {
+        // Checks every 500ms until the first passes within the start period, then hourly.
+        builder = builder.healthcheck(HealthConfig {
+            test: Some(vec![
+                "CMD-SHELL".to_string(),
+                format!(
+                    "mysqladmin ping --host=127.0.0.1 --port=3306 --password={MYSQL_ROOT_PASSWORD}"
+                ),
+            ]),
+            interval: Some(3_600_000_000_000),
+            timeout: Some(1_000_000_000),
+            retries: Some(5),
+            start_period: Some(120_000_000_000),
+            start_interval: Some(500_000_000),
+        });
+    }
+    for arg in mysqld_args {
+        builder = builder.add_cmd_arg(arg);
+    }
+    let running_container = builder.build()?.run().await?;
 
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     Ok(running_container)
@@ -108,6 +154,34 @@ pub(super) fn get_mysql_connection_string_params(port: usize) -> HashMap<String,
         SecretString::from("disabled".to_string()),
     );
     params
+}
+
+/// Options for an administrative connection as `root`, over TCP only.
+pub(super) fn root_opts(port: usize) -> mysql_async::Opts {
+    mysql_async::OptsBuilder::default()
+        .ip_or_hostname("127.0.0.1")
+        .tcp_port(u16::try_from(port).expect("port fits"))
+        .user(Some("root"))
+        .pass(Some(MYSQL_ROOT_PASSWORD))
+        .db_name(Some("mysqldb"))
+        .prefer_socket(false)
+        .into()
+}
+
+/// Connection parameters for `user` (password `pw`) on `host_port`, which can be a proxy in
+/// front of the server.
+pub(super) fn user_params(host_port: u16, user: &str) -> HashMap<String, SecretString> {
+    [
+        ("mysql_host", "127.0.0.1".to_string()),
+        ("mysql_tcp_port", host_port.to_string()),
+        ("mysql_user", user.to_string()),
+        ("mysql_pass", "pw".to_string()),
+        ("mysql_db", "mysqldb".to_string()),
+        ("mysql_sslmode", "disabled".to_string()),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), SecretString::from(value)))
+    .collect()
 }
 
 #[instrument]
