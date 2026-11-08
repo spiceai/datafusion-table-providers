@@ -383,19 +383,37 @@ fn reachable_rows(reach: Option<&[Range<usize>]>, len: usize) -> impl Iterator<I
 }
 
 /// `ranges` as sorted, disjoint ranges, with empty ones dropped.
+///
+/// Ranges are coalesced as they arrive. Most callers produce them in order, so
+/// this holds one range per run of reachable slots rather than one per row; a
+/// list view's or a dictionary's may arrive out of order and are sorted at the end.
 fn merged(ranges: impl Iterator<Item = Range<usize>>) -> Vec<Range<usize>> {
-    let mut ranges: Vec<Range<usize>> = ranges.filter(|range| !range.is_empty()).collect();
-    if !ranges.is_sorted_by_key(|range| range.start) {
-        ranges.sort_unstable_by_key(|range| range.start);
-    }
-    let mut disjoint: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
-    for range in ranges {
+    let mut disjoint: Vec<Range<usize>> = Vec::new();
+    let mut in_order = true;
+    for range in ranges.filter(|range| !range.is_empty()) {
         match disjoint.last_mut() {
-            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            Some(last) if range.start >= last.start && range.start <= last.end => {
+                last.end = last.end.max(range.end);
+            }
+            Some(last) if range.start < last.start => {
+                in_order = false;
+                disjoint.push(range);
+            }
             _ => disjoint.push(range),
         }
     }
-    disjoint
+    if in_order {
+        return disjoint;
+    }
+    disjoint.sort_unstable_by_key(|range| range.start);
+    let mut sorted: Vec<Range<usize>> = Vec::new();
+    for range in disjoint {
+        match sorted.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => sorted.push(range),
+        }
+    }
+    sorted
 }
 
 /// An Arrow offset or size, which a valid array never makes negative.
@@ -788,6 +806,20 @@ mod tests {
         );
         let batch = batch(vec![("l", Arc::new(list) as ArrayRef)]);
         assert_eq!(find_decimal_overflow(&batch), None);
+    }
+
+    #[test]
+    fn adjacent_reachable_slots_coalesce_as_they_arrive() {
+        // A nullable struct's reachable rows arrive one at a time. The walk holds
+        // one range per run of them, not one per row.
+        let ranges = merged((0..1_000_000).map(|row| row..row + 1));
+        assert_eq!(ranges, vec![0..1_000_000]);
+        assert!(ranges.capacity() < 1_000, "capacity {}", ranges.capacity());
+        // A list view's or a dictionary's slots can arrive out of order.
+        assert_eq!(
+            merged([5..6, 0..2, 1..3, 4..4].into_iter()),
+            vec![0..3, 5..6]
+        );
     }
 
     #[test]
