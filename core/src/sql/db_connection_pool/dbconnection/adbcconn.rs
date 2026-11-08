@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::Sender;
 
 use crate::sql::db_connection_pool::runtime::run_sync_with_tokio;
+use crate::util::decimal::{find_decimal_overflow, DecimalOverflow};
 
 use super::DbConnection;
 use super::Result;
@@ -45,6 +46,9 @@ pub enum Error {
         "An unexpected error occurred.\n{message}\nVerify the configuration and try again"
     ))]
     ChannelError { message: String },
+
+    #[snafu(display("{source}. Cast the column to VARCHAR at the source to read the value. DuckDB exports its HUGEINT type, which holds up to 39 digits, as Decimal128(38, 0)"))]
+    DecimalOverflow { source: DecimalOverflow },
 }
 
 pub struct AdbcDbConnection<D>
@@ -455,6 +459,11 @@ where
                         }
                         for batch in results {
                             let b = batch.boxed().context(super::UnableToQueryArrowSnafu)?;
+                            // The driver hands over Arrow that nothing has checked, and
+                            // a decimal past its precision would be read back wrong.
+                            if let Some(source) = find_decimal_overflow(&b) {
+                                return Err(Error::DecimalOverflow { source }.into());
+                            }
                             blocking_channel_send(&batch_tx, b)?;
                         }
                         Ok(())

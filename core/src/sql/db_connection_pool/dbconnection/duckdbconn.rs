@@ -22,6 +22,7 @@ use snafu::{prelude::*, ResultExt};
 use tokio::sync::mpsc::Sender;
 
 use crate::sql::db_connection_pool::runtime::run_sync_with_tokio;
+use crate::util::decimal::{find_decimal_overflow, DecimalOverflow};
 use crate::util::schema::SchemaValidator;
 use crate::UnsupportedTypeAction;
 
@@ -49,6 +50,8 @@ pub enum Error {
         path: Arc<str>,
         source: std::io::Error,
     },
+    #[snafu(display("{source}. Cast the column to VARCHAR at the source to read the value. DuckDB exports its HUGEINT type, which holds up to 39 digits, as Decimal128(38, 0)"))]
+    DecimalOverflow { source: DecimalOverflow },
 }
 
 pub trait DuckDBSyncParameter: ToSql + Sync + Send + DynClone {
@@ -729,6 +732,11 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
                     let mut stmt = conn.prepare(&sql)?;
                     // Cloned per attempt: recovery may call this twice.
                     for batch in stmt.stream_arrow(params, Arc::clone(&query_schema))? {
+                        // DuckDB exports a HUGEINT as Decimal128(38, 0), so a 39-digit
+                        // value arrives past its type's precision and would read back wrong.
+                        if let Some(source) = find_decimal_overflow(&batch) {
+                            return Ok(Err(Error::DecimalOverflow { source }.into()));
+                        }
                         if let Err(e) = blocking_channel_send(&batch_tx, batch) {
                             return Ok(Err(e));
                         }
@@ -1259,6 +1267,68 @@ mod tests {
             assert_eq!(
                 ts_col.data_type(),
                 &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+            );
+        });
+    }
+
+    /// DuckDB exports a `HUGEINT`, which holds up to 39 digits, as `Decimal128(38, 0)`.
+    /// Read through that type, a 39-digit value prints with its last digit missing, so
+    /// the query must fail instead; a value that fits 38 digits must come back exactly.
+    #[test]
+    fn a_hugeint_past_38_digits_fails_the_query_instead_of_losing_a_digit() {
+        use arrow::array::{Array, AsArray};
+        use arrow::datatypes::Decimal128Type;
+        use futures::StreamExt;
+
+        use crate::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+        use crate::sql::db_connection_pool::DbConnectionPool;
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let pool = DuckDbConnectionPool::new_memory().expect("pool created");
+            let conn = pool.connect().await.expect("connection");
+            let conn = conn.as_sync().expect("sync connection");
+            conn.execute(
+                "CREATE TABLE wide AS SELECT * FROM (VALUES \
+                 (1, 99999999999999999999999999999999999999::HUGEINT), \
+                 (2, 170141183460469231731687303715884105727::HUGEINT), \
+                 (3, NULL::HUGEINT)) v(id, h)",
+                &[],
+            )
+            .expect("table created");
+
+            let read = |sql: &'static str| {
+                let stream = conn.query_arrow(sql, &[], None).expect("query starts");
+                async move { stream.collect::<Vec<_>>().await }
+            };
+
+            let fits = read("SELECT h FROM wide WHERE id IN (1, 3) ORDER BY id").await;
+            let batch = fits
+                .into_iter()
+                .next()
+                .expect("one batch")
+                .expect("values that fit 38 digits are returned");
+            let h = batch.column(0).as_primitive::<Decimal128Type>();
+            assert_eq!(h.data_type(), &DataType::Decimal128(38, 0));
+            assert_eq!(
+                h.iter().collect::<Vec<_>>(),
+                vec![
+                    Some(99_999_999_999_999_999_999_999_999_999_999_999_999),
+                    None
+                ]
+            );
+
+            let too_wide = read("SELECT h FROM wide ORDER BY id").await;
+            let error = too_wide
+                .into_iter()
+                .find_map(Result::err)
+                .expect("the 39-digit value fails the query");
+            assert!(
+                error.to_string().contains(
+                    "column 'h' holds the value 170141183460469231731687303715884105727, \
+                     which has more digits than its type Decimal128(38, 0) allows"
+                ),
+                "unexpected error: {error}"
             );
         });
     }
