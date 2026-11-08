@@ -187,6 +187,10 @@ fn find_in_array(array: &dyn Array, scope: Scope<'_>) -> Option<DecimalOverflow>
         }
         DataType::Dictionary(..) => {
             let array = array.as_any_dictionary();
+            // No values, no decimal; and Arrow's `normalized_keys` asserts there are some.
+            if array.values().is_empty() {
+                return None;
+            }
             let keys = match scope {
                 Scope::AllSlots => Vec::new(),
                 Scope::Reachable(_) => array.normalized_keys(),
@@ -655,6 +659,35 @@ mod tests {
             find_decimal_overflow(&batch).map(|o| o.column),
             Some("d".to_string())
         );
+    }
+
+    #[test]
+    fn an_empty_dictionary_beside_a_flagged_null_slot_is_walked_without_panicking() {
+        // The NULL decimal's bytes are out of range, so the struct is walked row by
+        // row, and the walk reaches a dictionary with no values at all.
+        let empty_values = hugeint(vec![]);
+        let keys = Int32Array::from(vec![None::<i32>, None]);
+        let dictionary: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(keys, empty_values).expect("valid dictionary"),
+        );
+        let decimal: ArrayRef = Arc::new(
+            Decimal128Array::new(
+                ScalarBuffer::from(vec![i128::MIN, 1]),
+                Some(NullBuffer::from(vec![false, true])),
+            )
+            .with_precision_and_scale(38, 0)
+            .expect("valid type"),
+        );
+        let array = StructArray::new(
+            Fields::from(vec![
+                Field::new("d", dictionary.data_type().clone(), true),
+                Field::new("h", decimal.data_type().clone(), true),
+            ]),
+            vec![dictionary, decimal],
+            None,
+        );
+        let batch = batch(vec![("s", Arc::new(array) as ArrayRef)]);
+        assert_eq!(find_decimal_overflow(&batch), None);
     }
 
     #[test]
