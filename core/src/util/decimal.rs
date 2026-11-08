@@ -8,6 +8,15 @@
 //! side failing. A connection that receives Arrow from a driver checks each
 //! batch with [`find_decimal_overflow`] and refuses one that fails, because a
 //! wrong number is worse than an error.
+//!
+//! Only a decimal declared at its width's maximum precision is checked:
+//! `Decimal32(9, _)`, `Decimal64(18, _)`, `Decimal128(38, _)` or
+//! `Decimal256(76, _)`. A source exceeds a precision when it maps a type wider
+//! than Arrow can hold onto the widest one this width offers, as DuckDB does
+//! with `HUGEINT` and with a `SUM` it computes as one. A column a source
+//! declares narrower, such as `DECIMAL(15, 2)`, holds what it says unless the
+//! source sends invalid Arrow, and skipping it keeps the check off ordinary
+//! decimal columns.
 
 use std::fmt;
 use std::ops::Range;
@@ -239,6 +248,10 @@ fn find_in_decimals<T: DecimalType>(
 where
     T::Native: Magnitude,
 {
+    // Only the widest precision can be the target of a lossy mapping (module docs).
+    if array.precision() < T::MAX_PRECISION {
+        return None;
+    }
     // Arrow refuses a type whose precision is past the maximum, so the bound exists.
     let max = *T::MAX_FOR_EACH_PRECISION.get(usize::from(array.precision()))?;
     let values = array.values();
@@ -474,57 +487,77 @@ mod tests {
 
     #[test]
     fn the_scale_is_kept_in_the_reported_value() {
-        let array = Decimal128Array::from(vec![123_456_i128])
-            .with_precision_and_scale(5, 2)
+        let array = Decimal128Array::from(vec![10_i128.pow(38)])
+            .with_precision_and_scale(38, 2)
             .expect("valid type");
         let batch = batch(vec![("d", Arc::new(array) as ArrayRef)]);
         let overflow = find_decimal_overflow(&batch).expect("an overflow");
-        assert_eq!(overflow.value, "1234.56");
-        assert_eq!(overflow.data_type, DataType::Decimal128(5, 2));
+        assert_eq!(overflow.value, format!("1{}.00", "0".repeat(36)));
+        assert_eq!(overflow.data_type, DataType::Decimal128(38, 2));
+    }
+
+    #[test]
+    fn a_column_declared_below_its_widths_maximum_precision_is_not_checked() {
+        // Only a source mapping a wider type onto the widest precision exceeds it;
+        // a narrower declared precision is the source's own promise.
+        let d128 = Decimal128Array::from(vec![123_456_i128])
+            .with_precision_and_scale(5, 2)
+            .expect("valid type");
+        let d32 = Decimal32Array::from(vec![1_000])
+            .with_precision_and_scale(3, 0)
+            .expect("valid type");
+        let batch = batch(vec![
+            ("d128", Arc::new(d128) as ArrayRef),
+            ("d32", Arc::new(d32) as ArrayRef),
+        ]);
+        assert_eq!(find_decimal_overflow(&batch), None);
     }
 
     #[test]
     fn every_decimal_width_is_checked() {
-        let columns: Vec<(&str, ArrayRef)> = vec![
+        let ten_to_the_76 = i256::from_i128(10).pow_wrapping(76);
+        let columns: Vec<(&str, ArrayRef, String)> = vec![
             (
                 "d32",
                 Arc::new(
-                    Decimal32Array::from(vec![1_000])
-                        .with_precision_and_scale(3, 0)
+                    Decimal32Array::from(vec![1_000_000_000])
+                        .with_precision_and_scale(9, 0)
                         .expect("valid type"),
                 ),
+                format!("1{}", "0".repeat(9)),
             ),
             (
                 "d64",
                 Arc::new(
-                    Decimal64Array::from(vec![1_000])
-                        .with_precision_and_scale(3, 0)
+                    Decimal64Array::from(vec![1_000_000_000_000_000_000])
+                        .with_precision_and_scale(18, 0)
                         .expect("valid type"),
                 ),
+                format!("1{}", "0".repeat(18)),
             ),
             (
                 "d256",
                 Arc::new(
-                    Decimal256Array::from(vec![i256::from_i128(-1_000)])
-                        .with_precision_and_scale(3, 0)
+                    Decimal256Array::from(vec![ten_to_the_76.neg_wrapping()])
+                        .with_precision_and_scale(76, 0)
                         .expect("valid type"),
                 ),
+                format!("-1{}", "0".repeat(76)),
             ),
         ];
-        for (name, array) in columns {
+        for (name, array, expected) in columns {
             let found = find_decimal_overflow(&batch(vec![(name, array)]));
-            let expected = if name == "d256" { "-1000" } else { "1000" };
             assert_eq!(
                 found.map(|o| (o.column, o.value)),
-                Some((name.to_string(), expected.to_string()))
+                Some((name.to_string(), expected))
             );
         }
         // The message names HUGEINT only for the type DuckDB exports it as.
         let d32 = find_decimal_overflow(&batch(vec![(
             "d32",
             Arc::new(
-                Decimal32Array::from(vec![1_000])
-                    .with_precision_and_scale(3, 0)
+                Decimal32Array::from(vec![1_000_000_000])
+                    .with_precision_and_scale(9, 0)
                     .expect("valid type"),
             ) as ArrayRef,
         )]))
