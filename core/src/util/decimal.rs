@@ -13,7 +13,7 @@ use std::fmt;
 use std::ops::Range;
 
 use datafusion::arrow::array::{Array, AsArray, PrimitiveArray, RecordBatch, RunArray};
-use datafusion::arrow::buffer::{BooleanBuffer, NullBuffer};
+use datafusion::arrow::buffer::NullBuffer;
 use datafusion::arrow::datatypes::{
     i256, ArrowNativeTypeOp, DataType, Decimal128Type, Decimal256Type, Decimal32Type,
     Decimal64Type, DecimalType, Int16Type, Int32Type, Int64Type, RunEndIndexType,
@@ -66,7 +66,9 @@ impl DecimalOverflow {
 ///
 /// Only values a reader can reach count: a NULL slot, a child under a NULL
 /// parent, a list element outside every list, an unused dictionary entry, and
-/// an inactive union member are never reported, whatever bytes they hold.
+/// an inactive union member are never reported, whatever bytes they hold. The
+/// search costs what the batch stores: a run-end-encoded array is walked by its
+/// runs, never by the logical length it claims.
 #[must_use]
 pub fn find_decimal_overflow(batch: &RecordBatch) -> Option<DecimalOverflow> {
     batch
@@ -88,9 +90,9 @@ pub fn find_decimal_overflow(batch: &RecordBatch) -> Option<DecimalOverflow> {
 enum Scope<'a> {
     /// Every slot, NULL or unreachable included: a cheap superset of the answer.
     AllSlots,
-    /// Only the values a reader can reach: the slots set in the mask (every slot
-    /// when there is no mask) that the array itself does not mark NULL.
-    Reachable(Option<&'a BooleanBuffer>),
+    /// Only the values a reader can reach: the slots in these sorted, disjoint
+    /// ranges (every slot when `None`) that the array itself does not mark NULL.
+    Reachable(Option<&'a [Range<usize>]>),
 }
 
 fn find_in_array(array: &dyn Array, scope: Scope<'_>) -> Option<DecimalOverflow> {
@@ -101,9 +103,7 @@ fn find_in_array(array: &dyn Array, scope: Scope<'_>) -> Option<DecimalOverflow>
         DataType::Decimal256(..) => find_in_decimals(array.as_primitive::<Decimal256Type>(), scope),
         DataType::Struct(_) => {
             let array = array.as_struct();
-            let mask = child_scope(scope, array.len(), array.len(), array.nulls(), |row| {
-                row..row + 1
-            });
+            let mask = child_scope(scope, array.len(), array.nulls(), |row| row..row + 1);
             array
                 .fields()
                 .iter()
@@ -116,73 +116,49 @@ fn find_in_array(array: &dyn Array, scope: Scope<'_>) -> Option<DecimalOverflow>
         DataType::List(_) => {
             let array = array.as_list::<i32>();
             let offsets = array.value_offsets();
-            let mask = child_scope(
-                scope,
-                array.len(),
-                array.values().len(),
-                array.nulls(),
-                |row| as_index(offsets[row])..as_index(offsets[row + 1]),
-            );
+            let mask = child_scope(scope, array.len(), array.nulls(), |row| {
+                as_index(offsets[row])..as_index(offsets[row + 1])
+            });
             find_in_array(array.values().as_ref(), mask.scope())
         }
         DataType::LargeList(_) => {
             let array = array.as_list::<i64>();
             let offsets = array.value_offsets();
-            let mask = child_scope(
-                scope,
-                array.len(),
-                array.values().len(),
-                array.nulls(),
-                |row| as_index(offsets[row])..as_index(offsets[row + 1]),
-            );
+            let mask = child_scope(scope, array.len(), array.nulls(), |row| {
+                as_index(offsets[row])..as_index(offsets[row + 1])
+            });
             find_in_array(array.values().as_ref(), mask.scope())
         }
         DataType::ListView(_) => {
             let array = array.as_list_view::<i32>();
             let (offsets, sizes) = (array.offsets(), array.sizes());
-            let mask = child_scope(
-                scope,
-                array.len(),
-                array.values().len(),
-                array.nulls(),
-                |row| as_index(offsets[row])..as_index(offsets[row]) + as_index(sizes[row]),
-            );
+            let mask = child_scope(scope, array.len(), array.nulls(), |row| {
+                as_index(offsets[row])..as_index(offsets[row]).saturating_add(as_index(sizes[row]))
+            });
             find_in_array(array.values().as_ref(), mask.scope())
         }
         DataType::LargeListView(_) => {
             let array = array.as_list_view::<i64>();
             let (offsets, sizes) = (array.offsets(), array.sizes());
-            let mask = child_scope(
-                scope,
-                array.len(),
-                array.values().len(),
-                array.nulls(),
-                |row| as_index(offsets[row])..as_index(offsets[row]) + as_index(sizes[row]),
-            );
+            let mask = child_scope(scope, array.len(), array.nulls(), |row| {
+                as_index(offsets[row])..as_index(offsets[row]).saturating_add(as_index(sizes[row]))
+            });
             find_in_array(array.values().as_ref(), mask.scope())
         }
         DataType::FixedSizeList(_, size) => {
             let array = array.as_fixed_size_list();
             let size = as_index(*size);
-            let mask = child_scope(
-                scope,
-                array.len(),
-                array.values().len(),
-                array.nulls(),
-                |row| row * size..(row + 1) * size,
-            );
+            let mask = child_scope(scope, array.len(), array.nulls(), |row| {
+                row * size..(row + 1) * size
+            });
             find_in_array(array.values().as_ref(), mask.scope())
         }
         DataType::Map(..) => {
             let array = array.as_map();
             let offsets = array.value_offsets();
-            let mask = child_scope(
-                scope,
-                array.len(),
-                array.entries().len(),
-                array.nulls(),
-                |row| as_index(offsets[row])..as_index(offsets[row + 1]),
-            );
+            let mask = child_scope(scope, array.len(), array.nulls(), |row| {
+                as_index(offsets[row])..as_index(offsets[row + 1])
+            });
             find_in_array(array.entries(), mask.scope())
         }
         DataType::Dictionary(..) => {
@@ -195,13 +171,9 @@ fn find_in_array(array: &dyn Array, scope: Scope<'_>) -> Option<DecimalOverflow>
                 Scope::AllSlots => Vec::new(),
                 Scope::Reachable(_) => array.normalized_keys(),
             };
-            let mask = child_scope(
-                scope,
-                array.len(),
-                array.values().len(),
-                array.nulls(),
-                |row| keys[row]..keys[row] + 1,
-            );
+            let mask = child_scope(scope, array.len(), array.nulls(), |row| {
+                keys[row]..keys[row] + 1
+            });
             find_in_array(array.values().as_ref(), mask.scope())
         }
         DataType::Union(fields, _) => {
@@ -209,7 +181,7 @@ fn find_in_array(array: &dyn Array, scope: Scope<'_>) -> Option<DecimalOverflow>
             fields.iter().find_map(|(type_id, field)| {
                 let child = array.child(type_id);
                 // A row reaches the member its type id names, and no other.
-                let mask = child_scope(scope, array.len(), child.len(), None, |row| {
+                let mask = child_scope(scope, array.len(), None, |row| {
                     if array.type_id(row) != type_id {
                         return 0..0;
                     }
@@ -237,10 +209,26 @@ fn find_in_runs<R: RunEndIndexType>(
     array: &RunArray<R>,
     scope: Scope<'_>,
 ) -> Option<DecimalOverflow> {
-    let mask = child_scope(scope, array.len(), array.values().len(), None, |row| {
-        let run = array.get_physical_index(row);
-        run..run + 1
-    });
+    let mask = match scope {
+        Scope::AllSlots => ChildScope::AllSlots,
+        // A range of rows reads the runs from the one holding its first row to the
+        // one holding its last; a binary search finds each, so no row is visited.
+        Scope::Reachable(reach) => {
+            let len = array.len();
+            let every_row = 0..len;
+            ChildScope::Reachable(merged(
+                reach
+                    .unwrap_or(std::slice::from_ref(&every_row))
+                    .iter()
+                    .map(|rows| rows.start.min(len)..rows.end.min(len))
+                    .filter(|rows| !rows.is_empty())
+                    .map(|rows| {
+                        array.get_physical_index(rows.start)
+                            ..array.get_physical_index(rows.end - 1) + 1
+                    }),
+            ))
+        }
+    };
     find_in_array(array.values().as_ref(), mask.scope())
 }
 
@@ -265,8 +253,8 @@ where
             }
             values.iter().position(|value| value.exceeds(max))?
         }
-        Scope::Reachable(visible) => (0..array.len())
-            .find(|&row| reaches(visible, array.nulls(), row) && values[row].exceeds(max))?,
+        Scope::Reachable(reach) => reachable_rows(reach, array.len())
+            .find(|&row| array.is_valid(row) && values[row].exceeds(max))?,
     };
     Some(DecimalOverflow {
         column: String::new(),
@@ -303,58 +291,69 @@ impl Magnitude for i256 {
     }
 }
 
-/// The scope a child array is searched in, owning the mask it may need.
+/// The scope a child array is searched in, owning the ranges it may need.
 enum ChildScope {
     AllSlots,
-    Reachable(Option<BooleanBuffer>),
+    Reachable(Vec<Range<usize>>),
 }
 
 impl ChildScope {
     fn scope(&self) -> Scope<'_> {
         match self {
             Self::AllSlots => Scope::AllSlots,
-            Self::Reachable(mask) => Scope::Reachable(mask.as_ref()),
+            Self::Reachable(ranges) => Scope::Reachable(Some(ranges)),
         }
     }
 }
 
-/// The scope for a child of `child_len` slots under a parent of `parent_len`
-/// rows with `parent_nulls`: each parent row a reader reaches makes the child
-/// slots in `slots(row)` reachable. The mask costs a pass over the parent, so it
-/// is built only for a reachable search, which runs only after the cheap scan
-/// flagged the column.
+/// The scope for a child of a parent of `parent_len` rows with `parent_nulls`:
+/// each parent row a reader reaches makes the child slots in `slots(row)`
+/// reachable. Only a reachable search, which runs after the cheap scan flagged
+/// the column, visits the parent's rows, and only the reachable ones.
 fn child_scope(
     scope: Scope<'_>,
     parent_len: usize,
-    child_len: usize,
     parent_nulls: Option<&NullBuffer>,
     slots: impl Fn(usize) -> Range<usize>,
 ) -> ChildScope {
     match scope {
         Scope::AllSlots => ChildScope::AllSlots,
-        Scope::Reachable(visible) => ChildScope::Reachable(Some(mask_of(
-            child_len,
-            (0..parent_len)
-                .filter(|&row| reaches(visible, parent_nulls, row))
+        Scope::Reachable(reach) => ChildScope::Reachable(merged(
+            reachable_rows(reach, parent_len)
+                .filter(|&row| parent_nulls.is_none_or(|nulls| nulls.is_valid(row)))
                 .map(slots),
-        ))),
+        )),
     }
 }
 
-/// A mask of `len` slots with every slot in `ranges` set.
-fn mask_of(len: usize, ranges: impl Iterator<Item = Range<usize>>) -> BooleanBuffer {
-    let mut bits = vec![false; len];
+/// The rows of an array of `len` rows that `reach` covers, in order.
+fn reachable_rows(reach: Option<&[Range<usize>]>, len: usize) -> impl Iterator<Item = usize> + '_ {
+    let every_row = reach.is_none().then_some(0..len);
+    every_row
+        .into_iter()
+        .chain(
+            reach
+                .unwrap_or_default()
+                .iter()
+                .map(move |rows| rows.start.min(len)..rows.end.min(len)),
+        )
+        .flatten()
+}
+
+/// `ranges` as sorted, disjoint ranges, with empty ones dropped.
+fn merged(ranges: impl Iterator<Item = Range<usize>>) -> Vec<Range<usize>> {
+    let mut ranges: Vec<Range<usize>> = ranges.filter(|range| !range.is_empty()).collect();
+    if !ranges.is_sorted_by_key(|range| range.start) {
+        ranges.sort_unstable_by_key(|range| range.start);
+    }
+    let mut disjoint: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
     for range in ranges {
-        if let Some(slots) = bits.get_mut(range) {
-            slots.fill(true);
+        match disjoint.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => disjoint.push(range),
         }
     }
-    BooleanBuffer::from(bits)
-}
-
-fn reaches(visible: Option<&BooleanBuffer>, nulls: Option<&NullBuffer>, row: usize) -> bool {
-    visible.is_none_or(|visible| visible.value(row))
-        && nulls.is_none_or(|nulls| nulls.is_valid(row))
+    disjoint
 }
 
 /// An Arrow offset or size, which a valid array never makes negative.
@@ -367,11 +366,13 @@ mod tests {
 
     use datafusion::arrow::array::{
         ArrayRef, Decimal128Array, Decimal256Array, Decimal32Array, Decimal64Array,
-        DictionaryArray, FixedSizeListArray, Int32Array, LargeListArray, ListArray, ListViewArray,
-        MapArray, StringArray, StructArray, UnionArray,
+        DictionaryArray, FixedSizeListArray, Int32Array, Int64Array, LargeListArray, ListArray,
+        ListViewArray, MapArray, StringArray, StructArray, UnionArray,
     };
     use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
-    use datafusion::arrow::datatypes::{i256, Field, Fields, Int32Type, Schema, UnionFields};
+    use datafusion::arrow::datatypes::{
+        i256, Field, Fields, Int32Type, Int64Type, Schema, UnionFields,
+    };
 
     use super::*;
 
@@ -646,6 +647,31 @@ mod tests {
         // Rows 0 and 1 are both in the first run, so the second value is unreachable.
         let batch2 = batch(vec![("r", Arc::new(runs.slice(0, 2)) as ArrayRef)]);
         assert_eq!(find_decimal_overflow(&batch2), None);
+    }
+
+    #[test]
+    fn an_encoded_child_is_walked_by_its_storage_not_its_logical_length() {
+        // One empty list over a run-end-encoded child of 10^12 NULL decimals stored
+        // as one run. The NULL slot's bytes are out of range, so the list is walked
+        // exactly; that walk must cost what the batch stores, not 10^12 rows.
+        let value = Decimal128Array::new(
+            ScalarBuffer::from(vec![HUGEINT_MAX]),
+            Some(NullBuffer::from(vec![false])),
+        )
+        .with_precision_and_scale(38, 0)
+        .expect("valid type");
+        let runs =
+            RunArray::<Int64Type>::try_new(&Int64Array::from(vec![1_000_000_000_000_i64]), &value)
+                .expect("valid run array");
+        let field = Arc::new(Field::new("item", runs.data_type().clone(), true));
+        let list = LargeListArray::new(
+            field,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0_i64, 0])),
+            Arc::new(runs),
+            None,
+        );
+        let batch = batch(vec![("l", Arc::new(list) as ArrayRef)]);
+        assert_eq!(find_decimal_overflow(&batch), None);
     }
 
     #[test]
