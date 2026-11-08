@@ -112,13 +112,19 @@ fn find_in_array(array: &dyn Array, scope: Scope<'_>) -> Option<DecimalOverflow>
         DataType::Decimal256(..) => find_in_decimals(array.as_primitive::<Decimal256Type>(), scope),
         DataType::Struct(_) => {
             let array = array.as_struct();
-            let mask = child_scope(scope, array.len(), array.nulls(), |row| row..row + 1);
+            // A struct row maps to the same row of each child. Without a validity
+            // bitmap the struct stores nothing per row, so its reach passes through
+            // unchanged rather than being walked row by row.
+            let mask = array
+                .nulls()
+                .map(|nulls| child_scope(scope, array.len(), Some(nulls), |row| row..row + 1));
+            let child_scope = mask.as_ref().map_or(scope, ChildScope::scope);
             array
                 .fields()
                 .iter()
                 .zip(array.columns())
                 .find_map(|(field, child)| {
-                    find_in_array(child.as_ref(), mask.scope())
+                    find_in_array(child.as_ref(), child_scope)
                         .map(|overflow| overflow.under(field.name()))
                 })
         }
@@ -157,9 +163,27 @@ fn find_in_array(array: &dyn Array, scope: Scope<'_>) -> Option<DecimalOverflow>
         DataType::FixedSizeList(_, size) => {
             let array = array.as_fixed_size_list();
             let size = as_index(*size);
-            let mask = child_scope(scope, array.len(), array.nulls(), |row| {
-                row * size..(row + 1) * size
-            });
+            let mask = match (scope, array.nulls()) {
+                // Row `r` holds child slots `r * size..(r + 1) * size`. Without a
+                // validity bitmap the list stores nothing per row, so each range of
+                // rows maps to its range of slots without visiting a row.
+                (Scope::Reachable(reach), None) => {
+                    let len = array.len();
+                    let every_row = 0..len;
+                    ChildScope::Reachable(merged(
+                        reach
+                            .unwrap_or(std::slice::from_ref(&every_row))
+                            .iter()
+                            .map(|rows| {
+                                rows.start.min(len).saturating_mul(size)
+                                    ..rows.end.min(len).saturating_mul(size)
+                            }),
+                    ))
+                }
+                (scope, nulls) => child_scope(scope, array.len(), nulls, |row| {
+                    row * size..(row + 1) * size
+                }),
+            };
             find_in_array(array.values().as_ref(), mask.scope())
         }
         DataType::Map(..) => {
@@ -319,6 +343,11 @@ impl ChildScope {
     }
 }
 
+/// Every caller's parent stores something per row (offsets, sizes, keys, type
+/// ids, or a validity bitmap), so walking its reachable rows costs what the
+/// batch stores. A struct or fixed-size list with no bitmap stores nothing per
+/// row and passes ranges through instead of calling this.
+///
 /// The scope for a child of a parent of `parent_len` rows with `parent_nulls`:
 /// each parent row a reader reaches makes the child slots in `slots(row)`
 /// reachable. Only a reachable search, which runs after the cheap scan flagged
@@ -701,6 +730,60 @@ mod tests {
             field,
             OffsetBuffer::new(ScalarBuffer::from(vec![0_i64, 0])),
             Arc::new(runs),
+            None,
+        );
+        let batch = batch(vec![("l", Arc::new(list) as ArrayRef)]);
+        assert_eq!(find_decimal_overflow(&batch), None);
+    }
+
+    /// 10^12 NULL decimals stored as one run whose unused payload is out of range,
+    /// so the cheap scan flags it and the exact walk must not visit 10^12 rows.
+    fn long_null_run() -> RunArray<Int64Type> {
+        let value = Decimal128Array::new(
+            ScalarBuffer::from(vec![HUGEINT_MAX]),
+            Some(NullBuffer::from(vec![false])),
+        )
+        .with_precision_and_scale(38, 0)
+        .expect("valid type");
+        RunArray::<Int64Type>::try_new(&Int64Array::from(vec![1_000_000_000_000_i64]), &value)
+            .expect("valid run array")
+    }
+
+    #[test]
+    fn a_struct_over_an_encoded_child_is_walked_by_its_storage() {
+        let runs: ArrayRef = Arc::new(long_null_run());
+        let inner = StructArray::new(
+            Fields::from(vec![Field::new("h", runs.data_type().clone(), true)]),
+            vec![runs],
+            None,
+        );
+        // One list entry spanning all 10^12 struct rows.
+        let field = Arc::new(Field::new("item", inner.data_type().clone(), true));
+        let list = LargeListArray::new(
+            field,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0_i64, 1_000_000_000_000])),
+            Arc::new(inner),
+            None,
+        );
+        let batch = batch(vec![("l", Arc::new(list) as ArrayRef)]);
+        assert_eq!(find_decimal_overflow(&batch), None);
+    }
+
+    #[test]
+    fn a_fixed_size_list_over_an_encoded_child_is_walked_by_its_storage() {
+        let runs: ArrayRef = Arc::new(long_null_run());
+        let field = Arc::new(Field::new("item", runs.data_type().clone(), true));
+        // `try_new` expands the child's NULLs into a 10^12-bit buffer to validate
+        // them, which is the very cost under test, so the parts are checked here.
+        // SAFETY: size 2 >= 0; values.len() == 5 * 10^11 * 2; no NULL buffer; the
+        // field's type is the values' type.
+        let fixed =
+            unsafe { FixedSizeListArray::new_unchecked(field, 2, runs, None, 500_000_000_000) };
+        let list_field = Arc::new(Field::new("item", fixed.data_type().clone(), true));
+        let list = LargeListArray::new(
+            list_field,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0_i64, 500_000_000_000])),
+            Arc::new(fixed),
             None,
         );
         let batch = batch(vec![("l", Arc::new(list) as ArrayRef)]);
