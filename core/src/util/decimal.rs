@@ -12,11 +12,11 @@
 use std::fmt;
 use std::ops::Range;
 
-use datafusion::arrow::array::{Array, AsArray, PrimitiveArray, RecordBatch};
+use datafusion::arrow::array::{Array, AsArray, PrimitiveArray, RecordBatch, RunArray};
 use datafusion::arrow::buffer::{BooleanBuffer, NullBuffer};
 use datafusion::arrow::datatypes::{
     i256, ArrowNativeTypeOp, DataType, Decimal128Type, Decimal256Type, Decimal32Type,
-    Decimal64Type, DecimalType,
+    Decimal64Type, DecimalType, Int16Type, Int32Type, Int64Type, RunEndIndexType,
 };
 
 /// A decimal value with more digits than its column's type allows.
@@ -34,7 +34,7 @@ impl fmt::Display for DecimalOverflow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "column '{}' holds the value {}, which has more digits than its type {} allows, so it cannot be returned exactly. Cast the column to VARCHAR at the source to read it",
+            "column '{}' holds the value {}, which has more digits than its type {} allows, so it cannot be returned exactly. Cast the value to VARCHAR at the source to read it",
             self.column, self.value, self.data_type
         )?;
         if self.data_type == DataType::Decimal128(38, 0) {
@@ -218,8 +218,26 @@ fn find_in_array(array: &dyn Array, scope: Scope<'_>) -> Option<DecimalOverflow>
                     .map(|overflow| overflow.under(field.name()))
             })
         }
+        DataType::RunEndEncoded(run_ends, _) => match run_ends.data_type() {
+            DataType::Int16 => find_in_runs(array.as_run::<Int16Type>(), scope),
+            DataType::Int32 => find_in_runs(array.as_run::<Int32Type>(), scope),
+            DataType::Int64 => find_in_runs(array.as_run::<Int64Type>(), scope),
+            _ => None,
+        },
         _ => None,
     }
+}
+
+/// Each row of a run-end-encoded array reads the value of the run it falls in.
+fn find_in_runs<R: RunEndIndexType>(
+    array: &RunArray<R>,
+    scope: Scope<'_>,
+) -> Option<DecimalOverflow> {
+    let mask = child_scope(scope, array.len(), array.values().len(), None, |row| {
+        let run = array.get_physical_index(row);
+        run..run + 1
+    });
+    find_in_array(array.values().as_ref(), mask.scope())
 }
 
 fn find_in_decimals<T: DecimalType>(
@@ -400,7 +418,7 @@ mod tests {
             overflow.to_string(),
             "column 'h' holds the value 170141183460469231731687303715884105727, which has more \
              digits than its type Decimal128(38, 0) allows, so it cannot be returned exactly. \
-             Cast the column to VARCHAR at the source to read it. DuckDB exports its HUGEINT \
+             Cast the value to VARCHAR at the source to read it. DuckDB exports its HUGEINT \
              type, which holds up to 39 digits, as Decimal128(38, 0)"
         );
     }
@@ -609,6 +627,21 @@ mod tests {
             find_decimal_overflow(&batch).map(|o| o.column),
             Some("m.value".to_string())
         );
+    }
+
+    #[test]
+    fn a_run_end_encoded_decimal_is_checked() {
+        let values = hugeint(vec![Some(1), Some(HUGEINT_MAX)]);
+        let runs = RunArray::<Int32Type>::try_new(&Int32Array::from(vec![2, 3]), &values)
+            .expect("valid run array");
+        let batch1 = batch(vec![("r", Arc::new(runs.clone()) as ArrayRef)]);
+        assert_eq!(
+            find_decimal_overflow(&batch1).map(|o| o.value),
+            Some("170141183460469231731687303715884105727".to_string())
+        );
+        // Rows 0 and 1 are both in the first run, so the second value is unreachable.
+        let batch2 = batch(vec![("r", Arc::new(runs.slice(0, 2)) as ArrayRef)]);
+        assert_eq!(find_decimal_overflow(&batch2), None);
     }
 
     #[test]
