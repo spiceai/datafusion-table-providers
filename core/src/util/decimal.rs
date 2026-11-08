@@ -5,16 +5,18 @@
 //! precision: a value with more digits is printed with its trailing digits cut
 //! off. DuckDB exports its `HUGEINT`, which holds up to 39 digits, as
 //! `Decimal128(38, 0)`, so a 39-digit value crosses the boundary without either
-//! side failing. A connector that receives Arrow from a driver checks each
+//! side failing. A connection that receives Arrow from a driver checks each
 //! batch with [`find_decimal_overflow`] and refuses one that fails, because a
 //! wrong number is worse than an error.
 
 use std::fmt;
+use std::ops::Range;
 
 use datafusion::arrow::array::{Array, AsArray, PrimitiveArray, RecordBatch};
+use datafusion::arrow::buffer::{BooleanBuffer, NullBuffer};
 use datafusion::arrow::datatypes::{
-    ArrowNativeTypeOp, DataType, Decimal128Type, Decimal256Type, Decimal32Type, Decimal64Type,
-    DecimalType,
+    i256, ArrowNativeTypeOp, DataType, Decimal128Type, Decimal256Type, Decimal32Type,
+    Decimal64Type, DecimalType,
 };
 
 /// A decimal value with more digits than its column's type allows.
@@ -24,7 +26,7 @@ pub struct DecimalOverflow {
     pub column: String,
     /// The value, with every digit.
     pub value: String,
-    /// The type the source declared for the column, such as `Decimal128(38, 0)`.
+    /// The type the source declared for the value, such as `Decimal128(38, 0)`.
     pub data_type: DataType,
 }
 
@@ -32,18 +34,39 @@ impl fmt::Display for DecimalOverflow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "column '{}' holds the value {}, which has more digits than its type {} allows, so it cannot be returned exactly",
+            "column '{}' holds the value {}, which has more digits than its type {} allows, so it cannot be returned exactly. Cast the column to VARCHAR at the source to read it",
             self.column, self.value, self.data_type
-        )
+        )?;
+        if self.data_type == DataType::Decimal128(38, 0) {
+            write!(
+                f,
+                ". DuckDB exports its HUGEINT type, which holds up to 39 digits, as Decimal128(38, 0)"
+            )?;
+        }
+        Ok(())
     }
 }
 
 impl std::error::Error for DecimalOverflow {}
 
-/// Returns the first decimal value in `batch` with more digits than its column's
-/// type allows, looking inside struct, list, map, and dictionary columns too.
+impl DecimalOverflow {
+    /// Names the field this value was found under, outermost last.
+    fn under(mut self, field: &str) -> Self {
+        self.column = if self.column.is_empty() {
+            field.to_string()
+        } else {
+            format!("{field}.{}", self.column)
+        };
+        self
+    }
+}
+
+/// Returns the first decimal value in `batch` with more digits than its type
+/// allows, looking inside struct, list, map, dictionary, and union columns too.
 ///
-/// A NULL slot is never reported, whatever bytes it holds.
+/// Only values a reader can reach count: a NULL slot, a child under a NULL
+/// parent, a list element outside every list, an unused dictionary entry, and
+/// an inactive union member are never reported, whatever bytes they hold.
 #[must_use]
 pub fn find_decimal_overflow(batch: &RecordBatch) -> Option<DecimalOverflow> {
     batch
@@ -51,109 +74,282 @@ pub fn find_decimal_overflow(batch: &RecordBatch) -> Option<DecimalOverflow> {
         .fields()
         .iter()
         .zip(batch.columns())
-        .find_map(|(field, column)| find_in_array(field.name(), column.as_ref()))
+        .find_map(|(field, column)| {
+            // A scan of every decimal buffer, reachable or not, is all a column of
+            // values that fit costs. Only a column it flags is walked row by row.
+            find_in_array(column.as_ref(), Scope::AllSlots)?;
+            find_in_array(column.as_ref(), Scope::Reachable(None))
+                .map(|overflow| overflow.under(field.name()))
+        })
 }
 
-fn find_in_array(name: &str, array: &dyn Array) -> Option<DecimalOverflow> {
+/// Which slots of an array the search reads.
+#[derive(Clone, Copy)]
+enum Scope<'a> {
+    /// Every slot, NULL or unreachable included: a cheap superset of the answer.
+    AllSlots,
+    /// Only the values a reader can reach: the slots set in the mask (every slot
+    /// when there is no mask) that the array itself does not mark NULL.
+    Reachable(Option<&'a BooleanBuffer>),
+}
+
+fn find_in_array(array: &dyn Array, scope: Scope<'_>) -> Option<DecimalOverflow> {
     match array.data_type() {
-        DataType::Decimal32(precision, scale) => find_in_decimals(
-            name,
-            array.as_primitive::<Decimal32Type>(),
-            *precision,
-            *scale,
-        ),
-        DataType::Decimal64(precision, scale) => find_in_decimals(
-            name,
-            array.as_primitive::<Decimal64Type>(),
-            *precision,
-            *scale,
-        ),
-        DataType::Decimal128(precision, scale) => find_in_decimals(
-            name,
-            array.as_primitive::<Decimal128Type>(),
-            *precision,
-            *scale,
-        ),
-        DataType::Decimal256(precision, scale) => find_in_decimals(
-            name,
-            array.as_primitive::<Decimal256Type>(),
-            *precision,
-            *scale,
-        ),
+        DataType::Decimal32(..) => find_in_decimals(array.as_primitive::<Decimal32Type>(), scope),
+        DataType::Decimal64(..) => find_in_decimals(array.as_primitive::<Decimal64Type>(), scope),
+        DataType::Decimal128(..) => find_in_decimals(array.as_primitive::<Decimal128Type>(), scope),
+        DataType::Decimal256(..) => find_in_decimals(array.as_primitive::<Decimal256Type>(), scope),
         DataType::Struct(_) => {
             let array = array.as_struct();
+            let mask = child_scope(scope, array.len(), array.len(), array.nulls(), |row| {
+                row..row + 1
+            });
             array
                 .fields()
                 .iter()
                 .zip(array.columns())
                 .find_map(|(field, child)| {
-                    find_in_array(&format!("{name}.{}", field.name()), child.as_ref())
+                    find_in_array(child.as_ref(), mask.scope())
+                        .map(|overflow| overflow.under(field.name()))
                 })
         }
-        DataType::List(_) => find_in_array(name, array.as_list::<i32>().values().as_ref()),
-        DataType::LargeList(_) => find_in_array(name, array.as_list::<i64>().values().as_ref()),
-        DataType::ListView(_) => find_in_array(name, array.as_list_view::<i32>().values().as_ref()),
-        DataType::LargeListView(_) => {
-            find_in_array(name, array.as_list_view::<i64>().values().as_ref())
+        DataType::List(_) => {
+            let array = array.as_list::<i32>();
+            let offsets = array.value_offsets();
+            let mask = child_scope(
+                scope,
+                array.len(),
+                array.values().len(),
+                array.nulls(),
+                |row| as_index(offsets[row])..as_index(offsets[row + 1]),
+            );
+            find_in_array(array.values().as_ref(), mask.scope())
         }
-        DataType::FixedSizeList(..) => {
-            find_in_array(name, array.as_fixed_size_list().values().as_ref())
+        DataType::LargeList(_) => {
+            let array = array.as_list::<i64>();
+            let offsets = array.value_offsets();
+            let mask = child_scope(
+                scope,
+                array.len(),
+                array.values().len(),
+                array.nulls(),
+                |row| as_index(offsets[row])..as_index(offsets[row + 1]),
+            );
+            find_in_array(array.values().as_ref(), mask.scope())
+        }
+        DataType::ListView(_) => {
+            let array = array.as_list_view::<i32>();
+            let (offsets, sizes) = (array.offsets(), array.sizes());
+            let mask = child_scope(
+                scope,
+                array.len(),
+                array.values().len(),
+                array.nulls(),
+                |row| as_index(offsets[row])..as_index(offsets[row]) + as_index(sizes[row]),
+            );
+            find_in_array(array.values().as_ref(), mask.scope())
+        }
+        DataType::LargeListView(_) => {
+            let array = array.as_list_view::<i64>();
+            let (offsets, sizes) = (array.offsets(), array.sizes());
+            let mask = child_scope(
+                scope,
+                array.len(),
+                array.values().len(),
+                array.nulls(),
+                |row| as_index(offsets[row])..as_index(offsets[row]) + as_index(sizes[row]),
+            );
+            find_in_array(array.values().as_ref(), mask.scope())
+        }
+        DataType::FixedSizeList(_, size) => {
+            let array = array.as_fixed_size_list();
+            let size = as_index(*size);
+            let mask = child_scope(
+                scope,
+                array.len(),
+                array.values().len(),
+                array.nulls(),
+                |row| row * size..(row + 1) * size,
+            );
+            find_in_array(array.values().as_ref(), mask.scope())
         }
         DataType::Map(..) => {
             let array = array.as_map();
-            find_in_array(&format!("{name}.key"), array.keys().as_ref())
-                .or_else(|| find_in_array(&format!("{name}.value"), array.values().as_ref()))
+            let offsets = array.value_offsets();
+            let mask = child_scope(
+                scope,
+                array.len(),
+                array.entries().len(),
+                array.nulls(),
+                |row| as_index(offsets[row])..as_index(offsets[row + 1]),
+            );
+            find_in_array(array.entries(), mask.scope())
         }
         DataType::Dictionary(..) => {
-            find_in_array(name, array.as_any_dictionary().values().as_ref())
+            let array = array.as_any_dictionary();
+            let keys = match scope {
+                Scope::AllSlots => Vec::new(),
+                Scope::Reachable(_) => array.normalized_keys(),
+            };
+            let mask = child_scope(
+                scope,
+                array.len(),
+                array.values().len(),
+                array.nulls(),
+                |row| keys[row]..keys[row] + 1,
+            );
+            find_in_array(array.values().as_ref(), mask.scope())
+        }
+        DataType::Union(fields, _) => {
+            let array = array.as_union();
+            fields.iter().find_map(|(type_id, field)| {
+                let child = array.child(type_id);
+                // A row reaches the member its type id names, and no other.
+                let mask = child_scope(scope, array.len(), child.len(), None, |row| {
+                    if array.type_id(row) != type_id {
+                        return 0..0;
+                    }
+                    let slot = array
+                        .offsets()
+                        .map_or(row, |offsets| as_index(offsets[row]));
+                    slot..slot + 1
+                });
+                find_in_array(child.as_ref(), mask.scope())
+                    .map(|overflow| overflow.under(field.name()))
+            })
         }
         _ => None,
     }
 }
 
 fn find_in_decimals<T: DecimalType>(
-    name: &str,
     array: &PrimitiveArray<T>,
-    precision: u8,
-    scale: i8,
-) -> Option<DecimalOverflow> {
+    scope: Scope<'_>,
+) -> Option<DecimalOverflow>
+where
+    T::Native: Magnitude,
+{
     // Arrow refuses a type whose precision is past the maximum, so the bound exists.
-    let max = *T::MAX_FOR_EACH_PRECISION.get(usize::from(precision))?;
-    let min = max.neg_wrapping();
-    let outside = |value: T::Native| value.is_gt(max) || value.is_lt(min);
-
-    // One pass over every slot, NULL or not, with no branch to break vectorization:
-    // almost every batch holds only values that fit, and this is all it costs.
-    let any_outside = array
-        .values()
-        .iter()
-        .fold(false, |any, value| any | outside(*value));
-    if !any_outside {
-        return None;
-    }
-
-    // Something is out of range, but it may sit in a NULL slot, which holds no value.
-    let value = array.iter().flatten().find(|value| outside(*value))?;
+    let max = *T::MAX_FOR_EACH_PRECISION.get(usize::from(array.precision()))?;
+    let values = array.values();
+    let index = match scope {
+        // One pass with no branch to break vectorization; almost every batch ends here.
+        Scope::AllSlots => {
+            if !values
+                .iter()
+                .fold(false, |any, value| any | value.exceeds(max))
+            {
+                return None;
+            }
+            values.iter().position(|value| value.exceeds(max))?
+        }
+        Scope::Reachable(visible) => (0..array.len())
+            .find(|&row| reaches(visible, array.nulls(), row) && values[row].exceeds(max))?,
+    };
     Some(DecimalOverflow {
-        column: name.to_string(),
+        column: String::new(),
         // Arrow's formatter keeps only as many digits as the precision it is
         // given, which is the very truncation being reported; `u8::MAX` keeps all.
-        value: T::format_decimal(value, u8::MAX, scale),
+        value: T::format_decimal(values[index], u8::MAX, array.scale()),
         data_type: array.data_type().clone(),
     })
 }
 
+/// Whether a value has more digits than the bound `max` of its precision allows.
+/// A decimal's bounds are `-max..=max`, so one unsigned comparison of the
+/// magnitude decides it where the integer type has one.
+trait Magnitude: ArrowNativeTypeOp {
+    fn exceeds(self, max: Self) -> bool;
+}
+
+macro_rules! magnitude_by_unsigned_abs {
+    ($($native:ty),*) => {$(
+        impl Magnitude for $native {
+            #[inline]
+            fn exceeds(self, max: Self) -> bool {
+                self.unsigned_abs() > max.unsigned_abs()
+            }
+        }
+    )*};
+}
+magnitude_by_unsigned_abs!(i32, i64, i128);
+
+impl Magnitude for i256 {
+    #[inline]
+    fn exceeds(self, max: Self) -> bool {
+        self.is_gt(max) || self.is_lt(max.neg_wrapping())
+    }
+}
+
+/// The scope a child array is searched in, owning the mask it may need.
+enum ChildScope {
+    AllSlots,
+    Reachable(Option<BooleanBuffer>),
+}
+
+impl ChildScope {
+    fn scope(&self) -> Scope<'_> {
+        match self {
+            Self::AllSlots => Scope::AllSlots,
+            Self::Reachable(mask) => Scope::Reachable(mask.as_ref()),
+        }
+    }
+}
+
+/// The scope for a child of `child_len` slots under a parent of `parent_len`
+/// rows with `parent_nulls`: each parent row a reader reaches makes the child
+/// slots in `slots(row)` reachable. The mask costs a pass over the parent, so it
+/// is built only for a reachable search, which runs only after the cheap scan
+/// flagged the column.
+fn child_scope(
+    scope: Scope<'_>,
+    parent_len: usize,
+    child_len: usize,
+    parent_nulls: Option<&NullBuffer>,
+    slots: impl Fn(usize) -> Range<usize>,
+) -> ChildScope {
+    match scope {
+        Scope::AllSlots => ChildScope::AllSlots,
+        Scope::Reachable(visible) => ChildScope::Reachable(Some(mask_of(
+            child_len,
+            (0..parent_len)
+                .filter(|&row| reaches(visible, parent_nulls, row))
+                .map(slots),
+        ))),
+    }
+}
+
+/// A mask of `len` slots with every slot in `ranges` set.
+fn mask_of(len: usize, ranges: impl Iterator<Item = Range<usize>>) -> BooleanBuffer {
+    let mut bits = vec![false; len];
+    for range in ranges {
+        if let Some(slots) = bits.get_mut(range) {
+            slots.fill(true);
+        }
+    }
+    BooleanBuffer::from(bits)
+}
+
+fn reaches(visible: Option<&BooleanBuffer>, nulls: Option<&NullBuffer>, row: usize) -> bool {
+    visible.is_none_or(|visible| visible.value(row))
+        && nulls.is_none_or(|nulls| nulls.is_valid(row))
+}
+
+/// An Arrow offset or size, which a valid array never makes negative.
+fn as_index<O: TryInto<usize>>(offset: O) -> usize {
+    offset.try_into().unwrap_or(0)
+}
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use datafusion::arrow::array::{
         ArrayRef, Decimal128Array, Decimal256Array, Decimal32Array, Decimal64Array,
-        DictionaryArray, FixedSizeListArray, Int32Array, ListArray, MapArray, StringArray,
-        StructArray,
+        DictionaryArray, FixedSizeListArray, Int32Array, LargeListArray, ListArray, ListViewArray,
+        MapArray, StringArray, StructArray, UnionArray,
     };
     use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
-    use datafusion::arrow::datatypes::{i256, Field, Fields, Int32Type, Schema};
+    use datafusion::arrow::datatypes::{i256, Field, Fields, Int32Type, Schema, UnionFields};
 
     use super::*;
 
@@ -203,7 +399,9 @@ mod tests {
         assert_eq!(
             overflow.to_string(),
             "column 'h' holds the value 170141183460469231731687303715884105727, which has more \
-             digits than its type Decimal128(38, 0) allows, so it cannot be returned exactly"
+             digits than its type Decimal128(38, 0) allows, so it cannot be returned exactly. \
+             Cast the column to VARCHAR at the source to read it. DuckDB exports its HUGEINT \
+             type, which holds up to 39 digits, as Decimal128(38, 0)"
         );
     }
 
@@ -264,21 +462,51 @@ mod tests {
 
     #[test]
     fn every_decimal_width_is_checked() {
-        let d32 = Decimal32Array::from(vec![1_000]).with_precision_and_scale(3, 0);
-        let d64 = Decimal64Array::from(vec![1_000]).with_precision_and_scale(3, 0);
-        let d256 =
-            Decimal256Array::from(vec![i256::from_i128(1_000)]).with_precision_and_scale(3, 0);
-        for (name, array) in [
-            ("d32", Arc::new(d32.expect("valid type")) as ArrayRef),
-            ("d64", Arc::new(d64.expect("valid type")) as ArrayRef),
-            ("d256", Arc::new(d256.expect("valid type")) as ArrayRef),
-        ] {
+        let columns: Vec<(&str, ArrayRef)> = vec![
+            (
+                "d32",
+                Arc::new(
+                    Decimal32Array::from(vec![1_000])
+                        .with_precision_and_scale(3, 0)
+                        .expect("valid type"),
+                ),
+            ),
+            (
+                "d64",
+                Arc::new(
+                    Decimal64Array::from(vec![1_000])
+                        .with_precision_and_scale(3, 0)
+                        .expect("valid type"),
+                ),
+            ),
+            (
+                "d256",
+                Arc::new(
+                    Decimal256Array::from(vec![i256::from_i128(-1_000)])
+                        .with_precision_and_scale(3, 0)
+                        .expect("valid type"),
+                ),
+            ),
+        ];
+        for (name, array) in columns {
             let found = find_decimal_overflow(&batch(vec![(name, array)]));
+            let expected = if name == "d256" { "-1000" } else { "1000" };
             assert_eq!(
                 found.map(|o| (o.column, o.value)),
-                Some((name.to_string(), "1000".to_string()))
+                Some((name.to_string(), expected.to_string()))
             );
         }
+        // The message names HUGEINT only for the type DuckDB exports it as.
+        let d32 = find_decimal_overflow(&batch(vec![(
+            "d32",
+            Arc::new(
+                Decimal32Array::from(vec![1_000])
+                    .with_precision_and_scale(3, 0)
+                    .expect("valid type"),
+            ) as ArrayRef,
+        )]))
+        .expect("an overflow");
+        assert!(!d32.to_string().contains("HUGEINT"), "{d32}");
     }
 
     #[test]
@@ -303,17 +531,58 @@ mod tests {
         let list = ListArray::new(
             Arc::clone(&field),
             OffsetBuffer::from_lengths([2]),
-            values.clone(),
+            Arc::clone(&values),
+            None,
+        );
+        let large = LargeListArray::new(
+            Arc::clone(&field),
+            OffsetBuffer::from_lengths([2]),
+            Arc::clone(&values),
+            None,
+        );
+        let view = ListViewArray::new(
+            Arc::clone(&field),
+            ScalarBuffer::from(vec![0]),
+            ScalarBuffer::from(vec![2]),
+            Arc::clone(&values),
             None,
         );
         let fixed = FixedSizeListArray::new(field, 2, values, None);
-        for array in [Arc::new(list) as ArrayRef, Arc::new(fixed) as ArrayRef] {
+        for array in [
+            Arc::new(list) as ArrayRef,
+            Arc::new(large),
+            Arc::new(view),
+            Arc::new(fixed),
+        ] {
             let batch = batch(vec![("l", array)]);
             assert_eq!(
                 find_decimal_overflow(&batch).map(|o| o.value),
                 Some("170141183460469231731687303715884105727".to_string())
             );
         }
+    }
+
+    #[test]
+    fn a_list_element_outside_every_list_is_not_read() {
+        // [[HUGEINT_MAX], [1]] sliced to its second list: the first list's element
+        // stays in the child buffer, but no row reaches it.
+        let values = hugeint(vec![Some(HUGEINT_MAX), Some(1)]);
+        let field = Arc::new(Field::new("item", values.data_type().clone(), true));
+        let list = ListArray::new(field, OffsetBuffer::from_lengths([1, 1]), values, None);
+        let batch = batch(vec![("l", Arc::new(list.slice(1, 1)) as ArrayRef)]);
+        assert_eq!(find_decimal_overflow(&batch), None);
+    }
+
+    #[test]
+    fn a_child_under_a_null_struct_is_not_read() {
+        let inner = hugeint(vec![Some(HUGEINT_MAX), Some(1)]);
+        let array = StructArray::new(
+            Fields::from(vec![Field::new("h", inner.data_type().clone(), true)]),
+            vec![inner],
+            Some(NullBuffer::from(vec![false, true])),
+        );
+        let batch = batch(vec![("s", Arc::new(array) as ArrayRef)]);
+        assert_eq!(find_decimal_overflow(&batch), None);
     }
 
     #[test]
@@ -353,5 +622,72 @@ mod tests {
             find_decimal_overflow(&batch).map(|o| o.column),
             Some("d".to_string())
         );
+    }
+
+    #[test]
+    fn an_unused_dictionary_entry_is_not_read() {
+        let values = hugeint(vec![Some(1), Some(HUGEINT_MAX)]);
+        let keys = Int32Array::from(vec![Some(0), None, Some(0)]);
+        let dictionary =
+            DictionaryArray::<Int32Type>::try_new(keys, values).expect("valid dictionary");
+        let batch = batch(vec![("d", Arc::new(dictionary) as ArrayRef)]);
+        assert_eq!(find_decimal_overflow(&batch), None);
+    }
+
+    fn union_fields(member: &ArrayRef) -> UnionFields {
+        UnionFields::try_new(
+            [0, 1],
+            [
+                Field::new("h", member.data_type().clone(), true),
+                Field::new("s", DataType::Utf8, true),
+            ],
+        )
+        .expect("valid union fields")
+    }
+
+    #[test]
+    fn the_active_member_of_a_union_is_checked() {
+        // DuckDB exports UNION(h HUGEINT, s VARCHAR) as a sparse union.
+        let h = hugeint(vec![Some(HUGEINT_MAX), None, Some(5)]);
+        let s: ArrayRef = Arc::new(StringArray::from(vec![None, Some("x"), None]));
+        let sparse = UnionArray::try_new(
+            union_fields(&h),
+            ScalarBuffer::from(vec![0_i8, 1, 0]),
+            None,
+            vec![Arc::clone(&h), s],
+        )
+        .expect("valid sparse union");
+        let dense_h = hugeint(vec![Some(5), Some(HUGEINT_MAX)]);
+        let dense_s: ArrayRef = Arc::new(StringArray::from(vec!["x"]));
+        let dense = UnionArray::try_new(
+            union_fields(&dense_h),
+            ScalarBuffer::from(vec![0_i8, 1, 0]),
+            Some(ScalarBuffer::from(vec![0, 0, 1])),
+            vec![dense_h, dense_s],
+        )
+        .expect("valid dense union");
+        for array in [Arc::new(sparse) as ArrayRef, Arc::new(dense)] {
+            let overflow = find_decimal_overflow(&batch(vec![("u", array)])).expect("an overflow");
+            assert_eq!(
+                (overflow.column.as_str(), overflow.value.as_str()),
+                ("u.h", "170141183460469231731687303715884105727")
+            );
+        }
+    }
+
+    #[test]
+    fn an_inactive_union_member_is_not_read() {
+        // Row 0 selects `s`, so the HUGEINT member's slot at row 0 is unreachable.
+        let h = hugeint(vec![Some(HUGEINT_MAX), Some(5)]);
+        let s: ArrayRef = Arc::new(StringArray::from(vec![Some("x"), None]));
+        let sparse = UnionArray::try_new(
+            union_fields(&h),
+            ScalarBuffer::from(vec![1_i8, 0]),
+            None,
+            vec![h, s],
+        )
+        .expect("valid sparse union");
+        let batch = batch(vec![("u", Arc::new(sparse) as ArrayRef)]);
+        assert_eq!(find_decimal_overflow(&batch), None);
     }
 }

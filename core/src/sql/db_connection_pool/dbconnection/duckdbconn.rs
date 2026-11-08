@@ -22,7 +22,7 @@ use snafu::{prelude::*, ResultExt};
 use tokio::sync::mpsc::Sender;
 
 use crate::sql::db_connection_pool::runtime::run_sync_with_tokio;
-use crate::util::decimal::{find_decimal_overflow, DecimalOverflow};
+use crate::util::decimal::find_decimal_overflow;
 use crate::util::schema::SchemaValidator;
 use crate::UnsupportedTypeAction;
 
@@ -50,8 +50,6 @@ pub enum Error {
         path: Arc<str>,
         source: std::io::Error,
     },
-    #[snafu(display("{source}. Cast the column to VARCHAR at the source to read the value. DuckDB exports its HUGEINT type, which holds up to 39 digits, as Decimal128(38, 0)"))]
-    DecimalOverflow { source: DecimalOverflow },
 }
 
 pub trait DuckDBSyncParameter: ToSql + Sync + Send + DynClone {
@@ -734,8 +732,8 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, DuckDBPar
                     for batch in stmt.stream_arrow(params, Arc::clone(&query_schema))? {
                         // DuckDB exports a HUGEINT as Decimal128(38, 0), so a 39-digit
                         // value arrives past its type's precision and would read back wrong.
-                        if let Some(source) = find_decimal_overflow(&batch) {
-                            return Ok(Err(Error::DecimalOverflow { source }.into()));
+                        if let Some(overflow) = find_decimal_overflow(&batch) {
+                            return Ok(Err(overflow.into()));
                         }
                         if let Err(e) = blocking_channel_send(&batch_tx, batch) {
                             return Ok(Err(e));
