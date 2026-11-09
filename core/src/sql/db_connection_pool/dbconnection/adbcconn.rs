@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::Sender;
 
 use crate::sql::db_connection_pool::runtime::run_sync_with_tokio;
+use crate::util::decimal::find_decimal_overflow;
 
 use super::DbConnection;
 use super::Result;
@@ -455,6 +456,11 @@ where
                         }
                         for batch in results {
                             let b = batch.boxed().context(super::UnableToQueryArrowSnafu)?;
+                            // The driver hands over Arrow that nothing has checked, and
+                            // a decimal past its precision would be read back wrong.
+                            if let Some(overflow) = find_decimal_overflow(&b) {
+                                return Err(overflow.into());
+                            }
                             blocking_channel_send(&batch_tx, b)?;
                         }
                         Ok(())
