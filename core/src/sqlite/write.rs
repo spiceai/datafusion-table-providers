@@ -225,7 +225,7 @@ fn timestamp_literals_as_stored_text(
                     ) {
                         return Ok(Transformed::no(expr));
                     }
-                    let as_instant = |column: &Expr, literal: &Expr| -> Option<i64> {
+                    let as_instant = |column: &Expr, literal: &Expr| -> Option<Instant> {
                         let Expr::Column(column) = column else {
                             return None;
                         };
@@ -236,32 +236,62 @@ fn timestamp_literals_as_stored_text(
                         let DataType::Timestamp(..) = field.data_type() else {
                             return None;
                         };
-                        timestamp_literal_nanos(value)
+                        timestamp_literal_instant(value)
                     };
-                    if let Some(nanos) = as_instant(left, right) {
-                        return Ok(Transformed::yes(compare_instants(left, *op, nanos)));
-                    }
-                    if let Some(nanos) = as_instant(right, left) {
-                        return Ok(Transformed::yes(compare_instants(
-                            right,
-                            op.swap().unwrap_or(*op),
-                            nanos,
-                        )));
-                    }
-                    Ok(Transformed::no(expr))
+                    let rewritten = if let Some(instant) = as_instant(left, right) {
+                        compare_instants(left, *op, instant)
+                    } else if let Some(instant) = as_instant(right, left) {
+                        op.swap()
+                            .and_then(|swapped| compare_instants(right, swapped, instant))
+                    } else {
+                        None
+                    };
+                    Ok(match rewritten {
+                        Some(rewritten) => Transformed::yes(rewritten),
+                        None => Transformed::no(expr),
+                    })
                 })
                 .data()
         })
         .collect()
 }
 
-/// A timestamp literal's instant in nanoseconds, or `None` for anything else.
-fn timestamp_literal_nanos(value: &ScalarValue) -> Option<i64> {
+/// An instant as a UTC epoch second and the nanoseconds past it, kept apart so that a second,
+/// millisecond or microsecond timestamp outside the range an `i64` of nanoseconds holds (about
+/// 1677 to 2262) keeps its fraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Instant {
+    second: i64,
+    nanosecond: u32,
+}
+
+impl Instant {
+    /// The instant `value` units of `per_second` units each past the epoch.
+    fn from_units(value: i64, per_second: i64) -> Self {
+        let nanos_per_unit = 1_000_000_000 / per_second;
+        Self {
+            second: value.div_euclid(per_second),
+            // Less than 1_000_000_000, so it fits a `u32`.
+            nanosecond: u32::try_from(value.rem_euclid(per_second) * nanos_per_unit)
+                .unwrap_or_default(),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_nanos(nanos: i64) -> Self {
+        Self::from_units(nanos, 1_000_000_000)
+    }
+}
+
+/// A timestamp literal's instant, or `None` for anything else.
+fn timestamp_literal_instant(value: &ScalarValue) -> Option<Instant> {
     match value {
-        ScalarValue::TimestampSecond(Some(v), _) => v.checked_mul(1_000_000_000),
-        ScalarValue::TimestampMillisecond(Some(v), _) => v.checked_mul(1_000_000),
-        ScalarValue::TimestampMicrosecond(Some(v), _) => v.checked_mul(1_000),
-        ScalarValue::TimestampNanosecond(Some(v), _) => Some(*v),
+        ScalarValue::TimestampSecond(Some(v), _) => Some(Instant::from_units(*v, 1)),
+        ScalarValue::TimestampMillisecond(Some(v), _) => Some(Instant::from_units(*v, 1_000)),
+        ScalarValue::TimestampMicrosecond(Some(v), _) => Some(Instant::from_units(*v, 1_000_000)),
+        ScalarValue::TimestampNanosecond(Some(v), _) => {
+            Some(Instant::from_units(*v, 1_000_000_000))
+        }
         _ => None,
     }
 }
@@ -279,8 +309,11 @@ fn timestamp_assignments_as_stored_text(
         .map(|(name, value)| {
             let text = match (&value, schema.field_with_name(&name)) {
                 (Expr::Literal(literal, _), Ok(field)) => match field.data_type() {
-                    DataType::Timestamp(_, timezone) => timestamp_literal_nanos(literal)
-                        .map(|nanos| super::timestamp_text(nanos, timezone.as_deref())),
+                    DataType::Timestamp(_, timezone) => timestamp_literal_instant(literal)
+                        .and_then(|instant| {
+                            chrono::DateTime::from_timestamp(instant.second, instant.nanosecond)
+                        })
+                        .map(|datetime| super::datetime_text(datetime, timezone.as_deref())),
                     _ => None,
                 },
                 _ => None,
@@ -351,9 +384,79 @@ fn as_integer(expr: Expr) -> Expr {
     ))
 }
 
+fn glob(pattern: &str, value: Expr) -> Expr {
+    sqlite_call("glob", vec![text(pattern), value])
+}
+
+/// The digits of a stored timestamp's fraction, the run of digits after the `.` that follows
+/// its seconds (empty when there are none). A `1` is put before them, so that their leading
+/// zeros survive the cast to an integer that stops at the first non-digit (an offset, a space
+/// or the end), and is dropped again after it.
+fn stored_fraction_digits(column: &Expr) -> Expr {
+    let after_point = sqlite_call("substr", vec![column.clone(), int(21)]);
+    let marked = as_integer(binary(text("1"), Operator::StringConcat, after_point));
+    sqlite_call(
+        "substr",
+        vec![binary(marked, Operator::StringConcat, text("")), int(2)],
+    )
+}
+
+fn stored_has_fraction(column: &Expr) -> Expr {
+    binary(
+        sqlite_call("substr", vec![column.clone(), int(20), int(1)]),
+        Operator::Eq,
+        text("."),
+    )
+}
+
+/// Whether the whole of a stored timestamp's text has a shape some writer stores:
+/// `YYYY-MM-DD` and `hh:mm:ss` with a `T` or a space between them, then optionally a `.` and
+/// one to nine digits, then optionally `Z`, or a `+hh:mm` or `-hh:mm` offset with or without a
+/// space before it. Anything else, such as `2026-10-26T05:56:16.bad`, is not a timestamp, so it
+/// must not parse as the second its first 19 characters name.
+fn stored_shape_is_valid(column: &Expr) -> Expr {
+    let date_and_time = glob(
+        "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][T ][0-9][0-9]:[0-9][0-9]:[0-9][0-9]",
+        sqlite_call("substr", vec![column.clone(), int(1), int(19)]),
+    );
+    let digit_count = || sqlite_call("length", vec![stored_fraction_digits(column)]);
+    // Comparisons rather than `NOT` or `BETWEEN`, which `filters_to_sql` does not render.
+    let no_fraction = binary(
+        sqlite_call("substr", vec![column.clone(), int(20), int(1)]),
+        Operator::NotEq,
+        text("."),
+    );
+    let fraction = no_fraction.or(binary(digit_count(), Operator::GtEq, int(1)).and(binary(
+        digit_count(),
+        Operator::LtEq,
+        int(9),
+    )));
+    let rest = sqlite_call(
+        "iif",
+        vec![
+            stored_has_fraction(column),
+            sqlite_call(
+                "substr",
+                vec![
+                    column.clone(),
+                    binary(int(21), Operator::Plus, digit_count()),
+                ],
+            ),
+            sqlite_call("substr", vec![column.clone(), int(20)]),
+        ],
+    );
+    let suffix = rest
+        .clone()
+        .in_list(vec![text(""), text("Z")], false)
+        .or(glob("[+-][0-9][0-9]:[0-9][0-9]", rest.clone()))
+        .or(glob(" [+-][0-9][0-9]:[0-9][0-9]", rest));
+    date_and_time.and(fraction).and(suffix)
+}
+
 /// The whole UTC epoch second a stored timestamp names, from its first 19 characters (the date
 /// and time of day, with a `T` or a space between them) and a trailing `+hh:mm` or `-hh:mm`
-/// offset if it has one. Text with no offset is UTC, as both naive timestamps and an old
+/// offset if it has one, or `NULL` when the text as a whole is not a timestamp (see
+/// [`stored_shape_is_valid`]). Text with no offset is UTC, as both naive timestamps and an old
 /// `UPDATE`'s text are. The fraction is left out: `strftime` rounds it to milliseconds, which
 /// can carry it into the next second.
 fn stored_epoch_second(column: &Expr) -> Expr {
@@ -367,26 +470,29 @@ fn stored_epoch_second(column: &Expr) -> Expr {
         ],
     );
     let date_and_time = sqlite_call("substr", vec![column.clone(), int(1), int(19)]);
-    as_integer(sqlite_call(
+    let second = as_integer(sqlite_call(
         "strftime",
         vec![
             text("%s"),
             binary(date_and_time, Operator::StringConcat, offset),
         ],
-    ))
+    ));
+    // `iif` takes its last argument when the shape check is false or `NULL` (a `NULL` row):
+    // `nullif(0, 0)`, a `NULL` that `filters_to_sql` renders, unlike a `NULL` literal.
+    sqlite_call(
+        "iif",
+        vec![
+            stored_shape_is_valid(column),
+            second,
+            sqlite_call("nullif", vec![int(0), int(0)]),
+        ],
+    )
 }
 
 /// The nanoseconds past its second a stored timestamp names, from the digits after the `.` that
-/// follows its seconds, or 0 when it has none. A `1` is put before the digits, so that their
-/// leading zeros survive the cast to an integer that stops at the first non-digit (an offset, a
-/// space or the end), and is dropped again before the digits are padded to nine.
+/// follows its seconds (see [`stored_fraction_digits`]) padded to nine, or 0 when it has none.
 fn stored_nanosecond(column: &Expr) -> Expr {
-    let after_point = sqlite_call("substr", vec![column.clone(), int(21)]);
-    let marked = as_integer(binary(text("1"), Operator::StringConcat, after_point));
-    let digits = sqlite_call(
-        "substr",
-        vec![binary(marked, Operator::StringConcat, text("")), int(2)],
-    );
+    let digits = stored_fraction_digits(column);
     let padded = sqlite_call(
         "substr",
         vec![
@@ -395,11 +501,7 @@ fn stored_nanosecond(column: &Expr) -> Expr {
             int(9),
         ],
     );
-    let has_fraction = binary(
-        sqlite_call("substr", vec![column.clone(), int(20), int(1)]),
-        Operator::Eq,
-        text("."),
-    );
+    let has_fraction = stored_has_fraction(column);
     // `+ second * 0` makes the nanosecond `NULL` exactly when the second is, so that a `NULL`
     // or unparseable row leaves every comparison unknown rather than false, as it was before:
     // `flag = (ts = <cutoff>)` must not match a row whose `flag` is false and `ts` is `NULL`.
@@ -410,14 +512,14 @@ fn stored_nanosecond(column: &Expr) -> Expr {
     )
 }
 
-/// Compares the instant `column`'s text names with the instant `nanos`, as `column <op> nanos`,
+/// Compares the instant `column`'s text names with `instant`, as `column <op> instant`,
 /// by comparing (UTC epoch second, nanosecond) pairs in order. Every format a row may be stored
 /// in parses to the same pair for the same instant, whatever its separator, fraction width or
 /// offset, so rows compare by instant even across a DST change. A `NULL`, or text that is not a
-/// timestamp, makes the comparison unknown and matches no row.
-fn compare_instants(column: &Expr, op: Operator, nanos: i64) -> Expr {
-    let cutoff_second = int(nanos.div_euclid(1_000_000_000));
-    let cutoff_nanosecond = int(nanos.rem_euclid(1_000_000_000));
+/// timestamp, makes the comparison unknown and matches no row. `None` for any other operator.
+fn compare_instants(column: &Expr, op: Operator, instant: Instant) -> Option<Expr> {
+    let cutoff_second = int(instant.second);
+    let cutoff_nanosecond = int(i64::from(instant.nanosecond));
     let second = || stored_epoch_second(column);
     let nanosecond = || stored_nanosecond(column);
     let same_second = || binary(second(), Operator::Eq, cutoff_second.clone());
@@ -428,7 +530,7 @@ fn compare_instants(column: &Expr, op: Operator, nanos: i64) -> Expr {
             cutoff_nanosecond.clone(),
         )))
     };
-    match op {
+    Some(match op {
         Operator::Eq => same_second().and(binary(
             nanosecond(),
             Operator::Eq,
@@ -445,8 +547,8 @@ fn compare_instants(column: &Expr, op: Operator, nanos: i64) -> Expr {
         }
         Operator::Lt | Operator::LtEq => ordered(Operator::Lt, op),
         Operator::Gt | Operator::GtEq => ordered(Operator::Gt, op),
-        _ => binary(column.clone(), op, int(nanos)),
-    }
+        _ => return None,
+    })
 }
 
 struct SqliteDeletionSink {
@@ -694,7 +796,10 @@ mod tests {
     use datafusion::arrow::array::UInt64Array;
     use datafusion::logical_expr::{col, lit};
 
-    use super::{compare_instants, expr, filters_to_sql, Operator};
+    use super::{
+        compare_instants, expr, filters_to_sql, timestamp_assignments_as_stored_text,
+        timestamp_literals_as_stored_text, Expr, Instant, Operator,
+    };
     use crate::sqlite::SqliteTableProviderFactory;
     use crate::util::test::MockExec;
 
@@ -1574,7 +1679,8 @@ mod tests {
     /// The ids of the rows whose stored `ts` text compares `<op>` the instant `nanos`, under the
     /// filter a delete or an update sends to SQLite.
     fn ids_comparing(op: Operator, nanos: i64, rows: &[Option<&str>]) -> Vec<i64> {
-        let filter = compare_instants(&col("ts"), op, nanos);
+        let filter =
+            compare_instants(&col("ts"), op, Instant::from_nanos(nanos)).expect("comparison");
         let sql_where = filters_to_sql(&[filter], Some(expr::Engine::SQLite)).expect("renders");
         let conn = rusqlite::Connection::open_in_memory().expect("opens");
         conn.execute("CREATE TABLE t (id INTEGER, ts TEXT)", [])
@@ -1633,7 +1739,15 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE t (id INTEGER, flag BOOLEAN, ts TEXT);
              INSERT INTO t VALUES (1, false, NULL), (2, false, 'not a timestamp'),
-                                  (3, false, '2026-10-26T05:56:16');",
+                                  (3, false, '2026-10-26T05:56:16'),
+                                  (4, false, '2026-10-26T05:56:16.bad'),
+                                  (5, false, '2026-10-26T05:56:16.'),
+                                  (6, false, '2026-10-26T05:56:16junk'),
+                                  (7, false, '2026-10-26T05:56:16.0000000001'),
+                                  (8, false, '2026-10-26T05:56:16+10'),
+                                  (9, false, '2026-10-26 05:56:16.5 +10:00x'),
+                                  (10, false, '2026-10-26X05:56:16'),
+                                  (11, false, '2026-10-26T05:56:16.5Zbad');",
         )
         .expect("creates");
         for op in [
@@ -1644,7 +1758,11 @@ mod tests {
             Operator::Gt,
             Operator::GtEq,
         ] {
-            let filter = col("flag").eq(compare_instants(&col("ts"), op, cutoff));
+            let filter =
+                col("flag").eq(
+                    compare_instants(&col("ts"), op, Instant::from_nanos(cutoff))
+                        .expect("comparison"),
+                );
             let sql_where = filters_to_sql(&[filter], Some(expr::Engine::SQLite)).expect("renders");
             let mut statement = conn
                 .prepare(&format!("SELECT id FROM t WHERE {sql_where} ORDER BY id"))
@@ -1659,6 +1777,113 @@ mod tests {
                 _ => vec![],
             };
             assert_eq!(ids, expected, "flag = (ts {op} cutoff)");
+        }
+    }
+
+    /// The ids of the rows of a `ts TEXT` column matching `filter` once its timestamp literals
+    /// are rewritten for a `ts` column of `data_type`.
+    fn ids_matching_rewritten(data_type: DataType, filter: Expr, rows: &[&str]) -> Vec<i64> {
+        use datafusion::arrow::datatypes::Field;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", data_type, true)]));
+        let filters = timestamp_literals_as_stored_text(vec![filter], &schema).expect("rewrites");
+        let sql_where = filters_to_sql(&filters, Some(expr::Engine::SQLite)).expect("renders");
+        let conn = rusqlite::Connection::open_in_memory().expect("opens");
+        conn.execute("CREATE TABLE t (id INTEGER, ts TEXT)", [])
+            .expect("creates");
+        for (id, ts) in (1_i64..).zip(rows) {
+            conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![id, ts])
+                .expect("inserts");
+        }
+        let mut statement = conn
+            .prepare(&format!("SELECT id FROM t WHERE {sql_where} ORDER BY id"))
+            .expect("prepares");
+        statement
+            .query_map([], |row| row.get(0))
+            .expect("queries")
+            .collect::<Result<Vec<i64>, _>>()
+            .expect("reads")
+    }
+
+    #[test]
+    fn test_a_cutoff_past_the_nanosecond_range_keeps_its_fraction() {
+        use datafusion::arrow::datatypes::TimeUnit;
+        use datafusion::common::ScalarValue;
+
+        // 2300-01-01T00:00:00Z, past what an i64 of nanoseconds holds.
+        let second: i64 = 10_413_792_000;
+        let rows = [
+            "2300-01-01 00:00:00.250000", // inline insert, before
+            "2300-01-01T00:00:00.5",      // the cutoff
+            "2300-01-01T00:00:00.75",     // after
+            "2299-12-31T23:59:59",        // a second before
+        ];
+        let micros = ScalarValue::TimestampMicrosecond(Some(second * 1_000_000 + 500_000), None);
+        let micro_type = DataType::Timestamp(TimeUnit::Microsecond, None);
+        assert_eq!(
+            ids_matching_rewritten(micro_type.clone(), col("ts").lt(lit(micros.clone())), &rows),
+            vec![1, 4]
+        );
+        assert_eq!(
+            ids_matching_rewritten(micro_type.clone(), col("ts").eq(lit(micros.clone())), &rows),
+            vec![2]
+        );
+        // The literal on the left compares the same way.
+        assert_eq!(
+            ids_matching_rewritten(micro_type, lit(micros).lt(col("ts")), &rows),
+            vec![3]
+        );
+
+        let millis = ScalarValue::TimestampMillisecond(Some(second * 1_000 + 500), None);
+        assert_eq!(
+            ids_matching_rewritten(
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                col("ts").lt_eq(lit(millis)),
+                &rows
+            ),
+            vec![1, 2, 4]
+        );
+
+        // A second before the epoch keeps its sign and a positive fraction.
+        let before_epoch = ScalarValue::TimestampMicrosecond(Some(-1_500_000), None);
+        assert_eq!(
+            ids_matching_rewritten(
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                col("ts").eq(lit(before_epoch)),
+                &["1969-12-31T23:59:58.5", "1969-12-31T23:59:59.5"],
+            ),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn test_an_update_past_the_nanosecond_range_keeps_its_fraction() {
+        use datafusion::arrow::datatypes::{Field, TimeUnit};
+        use datafusion::common::ScalarValue;
+
+        // 2300-01-01T00:00:00.5Z.
+        let micros = 10_413_792_000 * 1_000_000 + 500_000;
+        for (timezone, expected) in [
+            (None, "2300-01-01T00:00:00.500"),
+            (Some("+10:00"), "2300-01-01T10:00:00.500+10:00"),
+        ] {
+            let timezone: Option<Arc<str>> = timezone.map(Into::into);
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, timezone.clone()),
+                true,
+            )]));
+            let assignments = timestamp_assignments_as_stored_text(
+                vec![(
+                    "ts".to_string(),
+                    lit(ScalarValue::TimestampMicrosecond(Some(micros), timezone)),
+                )],
+                &schema,
+            );
+            assert_eq!(
+                assignments[0].1,
+                Expr::Literal(ScalarValue::Utf8(Some(expected.to_string())), None)
+            );
         }
     }
 

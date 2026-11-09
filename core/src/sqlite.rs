@@ -519,7 +519,15 @@ fn to_datafusion_error(error: Error) -> DataFusionError {
 /// Both forms print the fraction only as far as it is nonzero, in 3, 6 or 9 digits, so for
 /// years 0000-9999 two values of one column compare as text in the order of their instants.
 pub(crate) fn timestamp_text(nanos: i64, timezone: Option<&str>) -> String {
-    let datetime = chrono::DateTime::from_timestamp_nanos(nanos);
+    datetime_text(chrono::DateTime::from_timestamp_nanos(nanos), timezone)
+}
+
+/// The text [`timestamp_text`] writes for `datetime`, for an instant an `i64` of nanoseconds
+/// may not hold.
+pub(crate) fn datetime_text(
+    datetime: chrono::DateTime<chrono::Utc>,
+    timezone: Option<&str>,
+) -> String {
     match timezone {
         // Handle timezone-aware timestamps with offset format like "+10:00"
         Some(tz) => match parse_timezone_offset_seconds(tz).and_then(chrono::FixedOffset::east_opt)
