@@ -13,12 +13,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "adbc_core"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d1448c5d1597ce04cf1228e9e096dc4dc0dc0d568080283824125c60b22c325"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+]
+
+[[package]]
 name = "adbc_driver_manager"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "12aa1ae565ec6d45cfe71c20b5c2b3cbd6ba5d7176ecd0c0a448e970a93c35e4"
 dependencies = [
- "adbc_core",
+ "adbc_core 0.23.0",
  "adbc_ffi",
  "arrow-array",
  "arrow-schema",
@@ -36,7 +46,7 @@ version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6851c2ab953511cf7a244aadcbc0586442fd3c67dfe371457369048880dd513"
 dependencies = [
- "adbc_core",
+ "adbc_core 0.23.0",
  "arrow-array",
  "arrow-schema",
 ]
@@ -2405,7 +2415,7 @@ dependencies = [
 name = "datafusion-table-providers"
 version = "0.12.0"
 dependencies = [
- "adbc_core",
+ "adbc_core 0.25.0",
  "adbc_driver_manager",
  "anyhow",
  "arrow",
@@ -5551,7 +5561,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c927bf1acbcc9c5c99674a55e320c15effe73fd05f069469d4af360428ac368a"
 dependencies = [
- "adbc_core",
+ "adbc_core 0.25.0",
  "r2d2",
 ]
 
