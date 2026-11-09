@@ -311,6 +311,12 @@ impl<T, P> SqlTable<T, P> {
         Arc::clone(&self.pool)
     }
 
+    #[cfg(any(
+        feature = "adbc",
+        feature = "duckdb",
+        feature = "mysql",
+        feature = "sqlite"
+    ))]
     pub(crate) fn function_support(&self) -> Option<FunctionSupport> {
         self.function_support.clone()
     }

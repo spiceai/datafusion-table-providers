@@ -1,9 +1,18 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU8, AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use mysql_async::{
     prelude::{Queryable, ToValue},
-    DriverError, Metrics, Opts, Params, PoolConstraints, PoolOpts, Row, SslOpts,
+    Conn, DriverError, Metrics, Opts, OptsBuilder, PoolConstraints, PoolOpts, Row, SslOpts,
     DEFAULT_POOL_CONSTRAINTS,
 };
 use secrecy::{ExposeSecret, SecretBox, SecretString};
@@ -61,6 +70,193 @@ pub struct MySQLConnectionPool {
     zero_date_behavior: MysqlZeroDateBehavior,
 }
 
+/// The server a connection reached, as the server reports itself. A load-balanced
+/// hostname (a cluster reader endpoint, a proxy, DNS round-robin) can reach a different
+/// server on every connection, and this names which one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySQLServerIdentity {
+    /// The host the pool connects to, as configured.
+    pub configured_host: String,
+    /// The port the pool connects to, as configured.
+    pub configured_port: u16,
+    /// The connection's id on the server, as `CONNECTION_ID()` and the process list show it.
+    pub connection_id: u32,
+    /// The server's `@@hostname`.
+    pub hostname: String,
+    /// The server's `@@port`.
+    pub port: u16,
+    /// The DB instance identifier, on Aurora MySQL (`aurora_server_id`).
+    pub aurora_server_id: Option<String>,
+}
+
+/// Called with the server a new connection reached.
+type ObserveFn = Arc<dyn Fn(&MySQLServerIdentity) + Send + Sync>;
+
+/// Reports the server each new connection reached, once per connection, as it is opened.
+///
+/// It runs as the connection's `after_connect` callback, which `mysql_async` calls once on
+/// each connection it opens, before the connection's setup statements, and not again when the
+/// pool resets the connection (`COM_RESET_CONNECTION` or `COM_CHANGE_USER`) to hand it out
+/// again. A connection is therefore reported whatever its id, including one whose id a
+/// connection to another server behind the same hostname had before it.
+#[derive(Clone)]
+struct NewConnectionObserver {
+    observe: ObserveFn,
+    server_kind: Arc<AtomicU8>,
+    /// Whether the pool is configured to connect over a Unix socket.
+    configured_socket: bool,
+}
+
+impl fmt::Debug for NewConnectionObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NewConnectionObserver")
+            .finish_non_exhaustive()
+    }
+}
+
+impl NewConnectionObserver {
+    fn new(observe: ObserveFn, opts: &Opts) -> Self {
+        Self {
+            observe,
+            server_kind: Arc::new(AtomicU8::new(SERVER_KIND_UNKNOWN)),
+            configured_socket: opts.socket().is_some(),
+        }
+    }
+
+    /// Reports the server `conn` reached. It never fails: a connection whose server does not
+    /// answer is still used, and is only missing from the reports.
+    async fn observe(&self, conn: &mut Conn) {
+        if self.is_socket_replacement(conn) && already_reported(conn).await {
+            return;
+        }
+        let connection_id = conn.id();
+        match server_identity(conn, &self.server_kind).await {
+            Ok(Some(identity)) => (self.observe)(&identity),
+            Ok(None) => tracing::debug!(
+                "MySQL connection {connection_id} gave no usable server hostname and port"
+            ),
+            Err(error) => tracing::debug!(
+                "Could not ask MySQL connection {connection_id} which server it reached: {error}"
+            ),
+        }
+    }
+
+    /// Whether `conn` replaced a TCP connection with one over the server's Unix socket. With
+    /// `prefer_socket`, on by default outside Windows, `mysql_async` reads `@@socket` on a new
+    /// TCP connection and, when the client can open that socket, opens a connection over it
+    /// and puts it in the TCP connection's place. It runs `after_connect` on the replacement
+    /// twice: as it opens it, and again where the TCP connection would have run it. A
+    /// connection over a socket the pool was not configured with is such a replacement.
+    fn is_socket_replacement(&self, conn: &Conn) -> bool {
+        !self.configured_socket && conn.opts().socket().is_some()
+    }
+}
+
+/// The user variable that marks a session as reported.
+const REPORTED_MARK: &str = "@datafusion_table_providers_reported";
+
+/// Whether this session was already reported, marking it reported if not. A user variable
+/// lives in one session, which is one physical connection, so the second `after_connect` on a
+/// socket replacement finds the mark and a new connection never does, whatever server it
+/// reached and whatever its id. The mark stays in the session until the pool next resets it.
+/// A server that rejects user variables reports a replacement twice rather than not at all.
+async fn already_reported(conn: &mut Conn) -> bool {
+    match conn
+        .query_first::<Option<u8>, _>(format!("SELECT {REPORTED_MARK}"))
+        .await
+    {
+        Ok(Some(Some(_))) => true,
+        _ => {
+            if let Err(error) = conn.query_drop(format!("SET {REPORTED_MARK} = 1")).await {
+                tracing::debug!(
+                    "Could not mark MySQL connection {} as reported: {error}",
+                    conn.id()
+                );
+            }
+            false
+        }
+    }
+}
+
+/// What the pool's servers answer, learned from the first connection asked.
+const SERVER_KIND_UNKNOWN: u8 = 0;
+/// `@@aurora_server_id` is readable: Aurora MySQL.
+const SERVER_KIND_AURORA: u8 = 1;
+/// `@@hostname` and `@@port` are readable, `@@aurora_server_id` is not: MySQL, MariaDB, TiDB,
+/// Vitess and the other MySQL-compatible servers.
+const SERVER_KIND_MYSQL: u8 = 2;
+/// Neither query is accepted, as by a proxy that rejects system variables: stop asking.
+const SERVER_KIND_UNANSWERED: u8 = 3;
+
+const WITH_AURORA: &str = "SELECT @@hostname, @@port, @@aurora_server_id";
+const WITHOUT_AURORA: &str = "SELECT @@hostname, @@port";
+
+/// Asks the server which server it is, in one query. `@@aurora_server_id` exists only on
+/// Aurora MySQL; MySQL 5.7, 8.0 and 9.7, MariaDB, TiDB and Vitess reject it with
+/// `ER_UNKNOWN_SYSTEM_VARIABLE` (1193). The first connection learns which form the pool's
+/// servers answer, from any server error rather than only that code, and later connections
+/// ask only that form, or nothing when neither is answered.
+/// Returns `None` when the server answers neither form, or with a value that is NULL or does
+/// not decode.
+async fn server_identity(
+    conn: &mut Conn,
+    server_kind: &AtomicU8,
+) -> mysql_async::Result<Option<MySQLServerIdentity>> {
+    let row: Option<Row> = match server_kind.load(Ordering::Relaxed) {
+        SERVER_KIND_UNANSWERED => return Ok(None),
+        SERVER_KIND_MYSQL => without_aurora(conn, server_kind).await?,
+        _ => match conn.query_first(WITH_AURORA).await {
+            Ok(row) => {
+                server_kind.store(SERVER_KIND_AURORA, Ordering::Relaxed);
+                row
+            }
+            Err(mysql_async::Error::Server(_)) => {
+                server_kind.store(SERVER_KIND_MYSQL, Ordering::Relaxed);
+                without_aurora(conn, server_kind).await?
+            }
+            Err(error) => return Err(error),
+        },
+    };
+    let Some(mut row) = row else {
+        return Ok(None);
+    };
+    // `take_opt` reports a value that does not decode instead of panicking, as decoding the
+    // row into a tuple would.
+    let hostname = row.take_opt::<String, _>(0).and_then(Result::ok);
+    let port = row.take_opt::<u16, _>(1).and_then(Result::ok);
+    let aurora_server_id = row
+        .take_opt::<Option<String>, _>(2)
+        .and_then(Result::ok)
+        .flatten()
+        .filter(|value| !value.is_empty());
+    Ok(hostname
+        .zip(port)
+        .map(|(hostname, port)| MySQLServerIdentity {
+            configured_host: conn.opts().ip_or_hostname().to_string(),
+            configured_port: conn.opts().tcp_port(),
+            connection_id: conn.id(),
+            hostname,
+            port,
+            aurora_server_id,
+        }))
+}
+
+/// Asks `@@hostname` and `@@port`. A server error means the pool's servers do not answer it,
+/// and the pool stops asking.
+async fn without_aurora(
+    conn: &mut Conn,
+    server_kind: &AtomicU8,
+) -> mysql_async::Result<Option<Row>> {
+    match conn.query_first(WITHOUT_AURORA).await {
+        Ok(row) => Ok(row),
+        Err(mysql_async::Error::Server(_)) => {
+            server_kind.store(SERVER_KIND_UNANSWERED, Ordering::Relaxed);
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[allow(dead_code)]
 const SETUP_QUERIES: [&str; 4] = [
     "SET time_zone = '+00:00'",
@@ -101,8 +297,53 @@ impl MySQLConnectionPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    #[allow(clippy::unused_async)]
     pub async fn new(params: HashMap<String, SecretString>) -> Result<Self> {
+        Self::new_with_pool_opts(params, |pool_opts| pool_opts).await
+    }
+
+    /// Creates a new instance of `MySQLConnectionPool`, passing the pool options through
+    /// `configure_pool` before the pool is built.
+    ///
+    /// `configure_pool` receives the pool options read from `params`: from the
+    /// `connection_string` URL when one is given, otherwise from `pool_min` and `pool_max`.
+    /// What it returns is what the pool uses on both paths, so a caller can apply pool size
+    /// limits or a connection lifetime whether or not the connection is given as a URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is a problem creating the connection pool.
+    pub async fn new_with_pool_opts(
+        params: HashMap<String, SecretString>,
+        configure_pool: impl FnOnce(PoolOpts) -> PoolOpts + Send,
+    ) -> Result<Self> {
+        Self::build(params, configure_pool, None).await
+    }
+
+    /// Creates a new instance of `MySQLConnectionPool` as [`Self::new_with_pool_opts`] does,
+    /// and calls `observe` with the server each connection the pool opens reached.
+    ///
+    /// `observe` is called once for every connection the pool opens, the pool's own test
+    /// connection included, as the connection is opened and before its first use. Finding the
+    /// server costs one query on each new connection (two on the pool's first) and none on a
+    /// connection the pool reuses. A connection whose server does not answer is opened and
+    /// used as any other, and is not reported.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is a problem creating the connection pool.
+    pub async fn new_with_pool_opts_and_observer(
+        params: HashMap<String, SecretString>,
+        configure_pool: impl FnOnce(PoolOpts) -> PoolOpts + Send,
+        observe: impl Fn(&MySQLServerIdentity) + Send + Sync + 'static,
+    ) -> Result<Self> {
+        Self::build(params, configure_pool, Some(Arc::new(observe))).await
+    }
+
+    async fn build(
+        params: HashMap<String, SecretString>,
+        configure_pool: impl FnOnce(PoolOpts) -> PoolOpts + Send,
+        observe: Option<ObserveFn>,
+    ) -> Result<Self> {
         // Remove the "mysql_" prefix from the keys to keep backward compatibility
         let params = util::remove_prefix_from_hashmap_keys(params, "mysql_");
 
@@ -189,6 +430,19 @@ impl MySQLConnectionPool {
         ));
 
         let opts = mysql_async::Opts::from(connection_string);
+        let pool_opts = configure_pool(opts.pool_opts().clone());
+        let mut opts_builder = OptsBuilder::from_opts(opts.clone()).pool_opts(pool_opts);
+        if let Some(observe) = observe {
+            let observer = NewConnectionObserver::new(observe, &opts);
+            opts_builder = opts_builder.after_connect(move |conn| {
+                let observer = observer.clone();
+                Box::pin(async move {
+                    observer.observe(conn).await;
+                    Ok(())
+                })
+            });
+        }
+        let opts = mysql_async::Opts::from(opts_builder);
 
         verify_mysql_opts(&opts).await?;
 
@@ -219,10 +473,19 @@ impl MySQLConnectionPool {
             _ => Error::MySQLConnectionError { source: err },
         })?;
 
-        let _rows: Vec<Row> = conn
-            .exec("SELECT 1", Params::Empty)
+        conn.query_drop("SELECT 1")
             .await
             .context(MySQLConnectionSnafu)?;
+
+        // Hand the test connection to the pool's first checkout rather than open another.
+        // `SELECT 1`, sent as text, leaves no session state and no prepared statement, so the
+        // connection skips the reset `mysql_async` gives a returned connection. The pool takes
+        // a returned connection back on a background task, and a checkout that started before
+        // then would open a second connection. Waiting for that task keeps the connection in
+        // the pool's accounting and under its lifetime and idle limits.
+        conn.reset_connection(false);
+        drop(conn);
+        wait_for_returned_connection(&pool.metrics()).await;
 
         Ok(Self {
             pool: Arc::new(pool),
@@ -260,6 +523,31 @@ impl MySQLConnectionPool {
 
     pub fn metrics(&self) -> Arc<Metrics> {
         self.pool.metrics()
+    }
+}
+
+/// The longest pool creation waits for its test connection to be back in the pool.
+const RETURNED_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Waits until the pool has finished with the one connection returned to it: put it among its
+/// idle connections, or closed it, as a pool whose limits keep no idle connection does. Gives
+/// up after [`RETURNED_CONNECTION_TIMEOUT`], when the next checkout opens a new connection.
+async fn wait_for_returned_connection(metrics: &Metrics) {
+    let recycled = |metrics: &Metrics| {
+        [
+            &metrics.connection_returned_to_pool,
+            &metrics.discarded_superfluous_connection,
+            &metrics.discarded_unestablished_connection,
+            &metrics.discarded_expired_connection,
+            &metrics.discarded_error_during_cleanup,
+        ]
+        .into_iter()
+        .map(|counter: &AtomicUsize| counter.load(Ordering::Acquire))
+        .sum::<usize>()
+    };
+    let deadline = Instant::now() + RETURNED_CONNECTION_TIMEOUT;
+    while recycled(metrics) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 

@@ -137,9 +137,21 @@ pub fn rows_to_arrow(
 
     if !rows.is_empty() {
         let row = &rows[0];
-        for column in row.columns().iter() {
+        for (column_index, column) in row.columns().iter().enumerate() {
             let column_name = column.name_str();
             let column_type = column.column_type();
+            let projected_field = projected_schema.as_ref().and_then(|schema| {
+                if schema.fields().len() == row.columns().len() {
+                    schema.fields().get(column_index).map(Arc::as_ref)
+                } else {
+                    let mut fields = schema
+                        .fields()
+                        .iter()
+                        .filter(|field| field.name() == column_name.as_ref());
+                    let field = fields.next()?;
+                    fields.next().is_none().then_some(field.as_ref())
+                }
+            });
             let column_is_binary = is_column_binary(column, projected_schema);
             let column_is_enum = column.flags().contains(ColumnFlags::ENUM_FLAG);
             let column_is_unsigned = column.flags().contains(ColumnFlags::UNSIGNED_FLAG);
@@ -186,9 +198,7 @@ pub fn rows_to_arrow(
             let nullable = if is_temporal && zero_date_behavior == MysqlZeroDateBehavior::Null {
                 true
             } else {
-                projected_schema
-                    .as_ref()
-                    .and_then(|schema| schema.field_with_name(&column_name).ok())
+                projected_field
                     .map(|field| field.is_nullable())
                     .unwrap_or(true)
             };

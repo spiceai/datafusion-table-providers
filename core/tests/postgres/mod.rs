@@ -30,6 +30,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, MutexGuard};
 
 mod common;
+mod complex_destination;
 mod numeric_destination;
 mod schema;
 

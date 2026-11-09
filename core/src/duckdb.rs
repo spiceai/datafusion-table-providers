@@ -83,6 +83,11 @@ pub enum Error {
     #[snafu(display("Unable to create duckdb table: {source}"))]
     UnableToCreateDuckDBTable { source: duckdb::Error },
 
+    #[snafu(display(
+        "Unable to add the primary key to DuckDB's CREATE TABLE statement, which does not end in `);`: {create_stmt}"
+    ))]
+    UnexpectedCreateTableStatement { create_stmt: String },
+
     #[snafu(display("Unable to create index on duckdb table: {source}"))]
     UnableToCreateIndexOnDuckDBTable { source: duckdb::Error },
 

@@ -382,9 +382,21 @@ impl TableManager {
             Vec::new()
         };
 
-        if !primary_keys.is_empty() && !create_stmt.contains("PRIMARY KEY") {
-            let primary_key_clause = format!(", PRIMARY KEY ({}));", primary_keys.join(", "));
-            create_stmt = create_stmt.replace(");", &primary_key_clause);
+        // `create_stmt` is DuckDB's rendering of a `CREATE TABLE ... AS SELECT`, which never
+        // carries a constraint, so the key clause is always appended. Each key column is quoted
+        // (an embedded `"` doubled) since a name like `service.instance.id`, `sentry-environment`
+        // or `2xx_count` is not a bare identifier, and the clause goes in front of the closing
+        // `);` only -- a column name may itself contain `);`.
+        if !primary_keys.is_empty() {
+            let primary_key_columns = primary_keys
+                .iter()
+                .map(|key| expr::quoted_identifier(key))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let Some(columns) = create_stmt.trim_end().strip_suffix(");") else {
+                return Err(super::Error::UnexpectedCreateTableStatement { create_stmt });
+            };
+            create_stmt = format!("{columns}, PRIMARY KEY ({primary_key_columns}));");
         }
 
         tx.execute(&create_stmt, [])
@@ -1854,6 +1866,112 @@ pub(crate) mod tests {
         );
 
         tx.rollback().expect("should rollback transaction");
+    }
+
+    /// The `PRIMARY KEY (...)` clause appended to DuckDB's generated `CREATE TABLE` wrote each
+    /// column bare, so a column whose name is not a plain identifier -- `service.instance.id`
+    /// (an OpenTelemetry attribute), `sentry-environment`, `2xx_count`, or one holding a quote --
+    /// failed to parse (`syntax error at or near "."`). Each name has to be quoted, with an
+    /// embedded quote doubled, the same way the index DDL already quotes it.
+    #[tokio::test]
+    async fn test_primary_key_on_non_identifier_column_names() {
+        let _guard = init_tracing(None);
+        let pool = get_mem_duckdb();
+
+        let names = [
+            "service.instance.id",
+            "sentry-environment",
+            "2xx_count",
+            r#"we"ird"#,
+            "PRIMARY KEY",
+        ];
+        // One table per name with that name as its sole key, plus one with all of them as a
+        // composite key, each also carrying a unique index on the key column(s) and a plain index
+        // that starts with the first key column.
+        let mut cases: Vec<Vec<&str>> = names.iter().map(|n| vec![*n]).collect();
+        cases.push(names.to_vec());
+
+        for (case_idx, key) in cases.iter().enumerate() {
+            let mut fields: Vec<arrow::datatypes::Field> = names
+                .iter()
+                .map(|n| arrow::datatypes::Field::new(*n, arrow::datatypes::DataType::Utf8, false))
+                .collect();
+            fields.push(arrow::datatypes::Field::new(
+                "v",
+                arrow::datatypes::DataType::Int64,
+                true,
+            ));
+            let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+            let table_definition = Arc::new(
+                TableDefinition::new(
+                    RelationName::new(format!("pk_case_{case_idx}")),
+                    Arc::clone(&schema),
+                )
+                .with_constraints(get_pk_constraints(key, Arc::clone(&schema)))
+                .with_indexes(vec![
+                    (
+                        ColumnReference::new(key.iter().map(|k| (*k).to_string()).collect()),
+                        IndexType::Unique,
+                    ),
+                    // Also spans `v`: an index on the key column alone would share the unique
+                    // index's name when the key is a single column.
+                    (
+                        ColumnReference::new(vec![key[0].to_string(), "v".to_string()]),
+                        IndexType::Enabled,
+                    ),
+                ]),
+            );
+
+            let mut pool_conn = Arc::clone(&pool).connect_sync().expect("to get connection");
+            let conn = pool_conn
+                .as_any_mut()
+                .downcast_mut::<DuckDbConnection>()
+                .expect("to downcast to duckdb connection");
+            let tx = conn
+                .get_underlying_conn_mut()
+                .transaction()
+                .expect("should begin transaction");
+
+            let table = TableManager::new(Arc::clone(&table_definition))
+                .with_internal(false)
+                .expect("to create table manager");
+            table
+                .create_table(Arc::clone(&pool), &tx)
+                .unwrap_or_else(|e| panic!("to create a table keyed on {key:?}: {e}"));
+
+            assert_eq!(
+                table
+                    .current_primary_keys(&tx)
+                    .expect("to read primary keys back"),
+                key.iter().map(|k| (*k).to_string()).collect::<HashSet<_>>(),
+                "primary key read back for {key:?}"
+            );
+
+            table
+                .create_indexes(&tx)
+                .unwrap_or_else(|e| panic!("to create indexes on {key:?}: {e}"));
+            assert_eq!(
+                table.current_indexes(&tx).expect("to read indexes").len(),
+                2,
+                "indexes on {key:?}"
+            );
+
+            // The key is enforced on the named column(s), not on something the parser split
+            // the name into.
+            let cols = names.iter().map(|n| expr::quoted_identifier(n)).join(", ");
+            let row = names.iter().map(|_| "'x'").join(", ");
+            let insert = format!(
+                "INSERT INTO {} ({cols}, v) VALUES ({row}, 1)",
+                table.table_name().quoted()
+            );
+            tx.execute(&insert, []).expect("first insert");
+            assert!(
+                tx.execute(&insert, []).is_err(),
+                "duplicate key on {key:?} must be rejected"
+            );
+
+            tx.rollback().expect("should rollback transaction");
+        }
     }
 
     /// `current_primary_keys` addressed the table through `pragma_table_info`, whose argument

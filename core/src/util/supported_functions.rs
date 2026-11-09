@@ -59,12 +59,24 @@ pub fn contains_unsupported_functions(
 /// fails. An expression resolves against the node's **inputs**, so those are
 /// what a per-call check needs to read an operand's type.
 ///
+/// A scan's filters use the full, qualified source schema before projection.
+///
 /// `None` means the type cannot be proven here — a leaf with no inputs, or a
 /// join whose sides cannot be merged. A check that depends on the type must
 /// treat that as "unknown" and take the safe branch rather than guess; for a
 /// rendering that is only correct for one of two column types, the safe branch
 /// is to refuse the call and let the local engine evaluate it.
 fn expression_scope(plan: &LogicalPlan) -> Option<Arc<DFSchema>> {
+    if let LogicalPlan::TableScan(scan) = plan {
+        // Scan filters resolve against the full source, including columns
+        // omitted by the scan projection.
+        return DFSchema::try_from_qualified_schema(
+            scan.table_name.clone(),
+            scan.source.schema().as_ref(),
+        )
+        .ok()
+        .map(Arc::new);
+    }
     let inputs = plan.inputs();
     match inputs.as_slice() {
         [] => None,
@@ -398,6 +410,31 @@ mod tests {
     use datafusion::prelude::{col, lit};
     use datafusion::scalar::ScalarValue;
     use std::sync::Arc;
+
+    #[test]
+    fn a_scan_filter_resolves_columns_omitted_from_its_projection() {
+        use datafusion::logical_expr::ExprSchemable as _;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Utf8, true),
+        ]));
+        let source = Arc::new(LogicalTableSource::new(schema));
+        let plan = LogicalPlanBuilder::scan_with_filters(
+            "t",
+            source,
+            Some(vec![0]),
+            vec![call("any_fn", vec![col("t.val")])],
+        )
+        .expect("filtered scan with a pruned argument")
+        .build()
+        .expect("build scan");
+        let support = FunctionSupport::new(None, None, None).with_scalar_call_support(Arc::new(
+            |call, schema| {
+                schema.and_then(|scope| call.args[0].get_type(scope).ok()) == Some(DataType::Utf8)
+            },
+        ));
+        assert!(!contains_unsupported_functions(&plan, &support).expect("check typed scan filter"));
+    }
 
     fn stub_udf(name: &str) -> Arc<ScalarUDF> {
         Arc::new(create_udf(

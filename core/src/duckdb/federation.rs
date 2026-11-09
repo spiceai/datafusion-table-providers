@@ -1,6 +1,7 @@
 use crate::sql::db_connection_pool::dbconnection::{get_schema, Error as DbError};
 use crate::sql::sql_provider_datafusion::{get_stream, to_execution_error};
 use arrow::datatypes::SchemaRef;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::sql::unparser::dialect::Dialect;
@@ -79,7 +80,10 @@ impl<T, P> SQLExecutor for DuckDBTable<T, P> {
     }
 
     fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
+        // DuckDB 1.4 cannot safely execute nested UNION statements. Keep that
+        // operation in DataFusion while allowing independent inputs to federate.
         self.base_table.can_execute_plan(plan)
+            && contains_nested_union(plan).is_ok_and(|nested| !nested)
     }
 
     async fn table_names(&self) -> DataFusionResult<Vec<String>> {
@@ -101,4 +105,31 @@ impl<T, P> SQLExecutor for DuckDBTable<T, P> {
             .map_err(|e| DbError::UnableToGetSchema { source: e })
             .map_err(to_execution_error)
     }
+}
+
+fn contains_nested_union(plan: &LogicalPlan) -> DataFusionResult<bool> {
+    let mut nested = false;
+    plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::Union(union) = node {
+            for input in &union.inputs {
+                input.apply_with_subqueries(|descendant| {
+                    if matches!(descendant, LogicalPlan::Union(_)) {
+                        nested = true;
+                        Ok(TreeNodeRecursion::Stop)
+                    } else {
+                        Ok(TreeNodeRecursion::Continue)
+                    }
+                })?;
+                if nested {
+                    break;
+                }
+            }
+        }
+        Ok(if nested {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    })?;
+    Ok(nested)
 }
