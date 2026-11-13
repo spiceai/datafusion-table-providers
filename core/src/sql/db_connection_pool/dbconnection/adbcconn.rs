@@ -118,13 +118,14 @@ pub trait CancellableStatement: Statement {
 /// reaches the running call.
 ///
 /// This needs an `adbc_driver_manager` that issues `AdbcStatementCancel` without
-/// taking the lock its other statement functions use. Published 0.23 and 0.24
-/// serialize the two, so `cancel` there waits for the `execute` it is meant to
-/// interrupt and the query is not stopped — the call still returns `Ok`, so a
-/// consumer sees a cancellation that did nothing.
+/// taking the lock its other statement functions use, which 0.25 does through
+/// `get_cancel_handle` (apache/arrow-adbc#4858). One that serializes the two
+/// makes `cancel` wait for the `execute` it is meant to interrupt, so the query
+/// is not stopped — the call still returns `Ok`, so a consumer sees a
+/// cancellation that did nothing.
 impl StatementCancelHandle for adbc_driver_manager::ManagedStatement {
     fn cancel(&mut self) -> adbc_core::error::Result<()> {
-        Statement::cancel(self)
+        self.get_cancel_handle().try_cancel()
     }
 }
 
