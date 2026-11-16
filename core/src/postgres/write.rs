@@ -30,6 +30,7 @@ use crate::util::{
 };
 
 use crate::postgres::Postgres;
+use crate::sql::sql_provider_datafusion::expr::Engine;
 
 use super::to_datafusion_error;
 
@@ -123,7 +124,7 @@ impl TableProvider for PostgresTableWriter {
         let sql_where = if filters.is_empty() {
             None
         } else {
-            Some(filters_to_sql(&filters, None)?)
+            Some(filters_to_sql(&filters, Some(Engine::Postgres))?)
         };
         let table = self.postgres.table_reference().clone();
         let postgres = self.postgres();
@@ -147,13 +148,13 @@ impl TableProvider for PostgresTableWriter {
             return make_count_exec(0);
         }
 
-        let set_clause = assignments_to_sql(&assignments, None)?;
+        let set_clause = assignments_to_sql(&assignments, Some(Engine::Postgres))?;
         let postgres = self.postgres();
 
         let sql_where = if filters.is_empty() {
             None
         } else {
-            Some(filters_to_sql(&filters, None)?)
+            Some(filters_to_sql(&filters, Some(Engine::Postgres))?)
         };
         let sql = update_statement(
             self.postgres.table_reference(),

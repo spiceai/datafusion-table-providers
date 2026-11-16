@@ -305,6 +305,12 @@ fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> 
                 let seconds = i64::from(*value) * i64::from(SECONDS_IN_DAY);
                 match engine {
                     Some(Engine::SQLite) => Ok(format!("date({seconds}, 'unixepoch')")),
+                    // `TO_TIMESTAMP` returns a `timestamptz`, which Postgres turns into a `date`
+                    // or compares with a `timestamp` in the session's time zone. Reading it back
+                    // at UTC names midnight of the day the literal holds, whatever that is.
+                    Some(Engine::Postgres) => {
+                        Ok(format!("TO_TIMESTAMP({seconds}) AT TIME ZONE 'UTC'"))
+                    }
                     _ => Ok(format!("TO_TIMESTAMP({seconds})")),
                 }
             }
@@ -322,6 +328,12 @@ fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> 
                 let seconds = value.div_euclid(1_000);
                 match engine {
                     Some(Engine::SQLite) => Ok(format!("date({seconds}, 'unixepoch')")),
+                    // `TO_TIMESTAMP` returns a `timestamptz`, which Postgres turns into a `date`
+                    // or compares with a `timestamp` in the session's time zone. Reading it back
+                    // at UTC names midnight of the day the literal holds, whatever that is.
+                    Some(Engine::Postgres) => {
+                        Ok(format!("TO_TIMESTAMP({seconds}) AT TIME ZONE 'UTC'"))
+                    }
                     _ => Ok(format!("TO_TIMESTAMP({seconds})")),
                 }
             }
@@ -2323,7 +2335,10 @@ mod tests {
         for (engine, expected) in [
             (None, "TO_TIMESTAMP(2147558400)"),
             (Some(Engine::DuckDB), "TO_TIMESTAMP(2147558400)"),
-            (Some(Engine::Postgres), "TO_TIMESTAMP(2147558400)"),
+            (
+                Some(Engine::Postgres),
+                "TO_TIMESTAMP(2147558400) AT TIME ZONE 'UTC'",
+            ),
             (Some(Engine::MySQL), "TO_TIMESTAMP(2147558400)"),
             (Some(Engine::ODBC), "TO_TIMESTAMP(2147558400)"),
             (Some(Engine::Spark), "TO_TIMESTAMP(2147558400)"),
