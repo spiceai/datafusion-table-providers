@@ -712,14 +712,24 @@ fn duckdb_timestamp_literal_nanos(expr: &Expr) -> Option<i128> {
     }
 }
 
-/// A Postgres timestamp `micros` microseconds after the UNIX epoch, built by integer interval
-/// arithmetic so every microsecond is kept. `TO_TIMESTAMP` takes a `double`, which cannot hold
-/// every microsecond of a recent epoch and rounds past them further from it, so a comparison
-/// built on it can land on the neighbouring microsecond's rows. With `timezone`, the instant is
-/// a `timestamptz`, read at UTC; without one it is a `timestamp`, which Postgres never shifts
-/// by the session's time zone.
+/// A Postgres timestamp `micros` microseconds after the UNIX epoch, kept to the microsecond.
+///
+/// `TO_TIMESTAMP` takes a `double`, which cannot hold every microsecond of a recent epoch and
+/// rounds further from it, so a comparison built on it can land on the neighbouring
+/// microsecond's rows. Instead the epoch is offset by whole days and the seconds within the last
+/// day, which a `double` holds to the microsecond. `make_interval` keeps both quantities small:
+/// before Postgres 15, `INTERVAL '<n> microseconds'` reads `<n>` as a 32-bit integer and refuses
+/// any recent epoch. With `timezone`, the instant is a `timestamptz`, read at UTC; without one it
+/// is a `timestamp`, which Postgres never shifts by the session's time zone.
 fn postgres_timestamp_literal(micros: i128, timezone: bool) -> String {
-    let timestamp = format!("(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '{micros} microseconds')");
+    const MICROS_IN_DAY: i128 = 86_400_000_000;
+    let days = micros.div_euclid(MICROS_IN_DAY);
+    let within_day = micros.rem_euclid(MICROS_IN_DAY);
+    let timestamp = format!(
+        "(TIMESTAMP '1970-01-01 00:00:00' + make_interval(days => {days}, secs => {}.{:06}))",
+        within_day / 1_000_000,
+        within_day % 1_000_000
+    );
     if timezone {
         format!("({timestamp} AT TIME ZONE 'UTC')")
     } else {
@@ -1112,7 +1122,7 @@ mod tests {
         );
         assert_eq!(
             to_sql_with_engine(&expr, Some(Engine::Postgres))?,
-            "(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '1693219803001000 microseconds')"
+            "(TIMESTAMP '1970-01-01 00:00:00' + make_interval(days => 19597, secs => 39003.001000))"
         );
         let expr = Expr::Literal(
             ScalarValue::TimestampNanosecond(
@@ -1123,7 +1133,7 @@ mod tests {
         );
         assert_eq!(
             to_sql_with_engine(&expr, Some(Engine::Postgres))?,
-            "((TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '1693219803001000 microseconds') AT TIME ZONE 'UTC')"
+            "((TIMESTAMP '1970-01-01 00:00:00' + make_interval(days => 19597, secs => 39003.001000)) AT TIME ZONE 'UTC')"
         );
 
         let expr = Expr::Literal(
@@ -1132,7 +1142,7 @@ mod tests {
         );
         assert_eq!(
             to_sql_with_engine(&expr, Some(Engine::Postgres))?,
-            "(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '1693219803001000 microseconds')"
+            "(TIMESTAMP '1970-01-01 00:00:00' + make_interval(days => 19597, secs => 39003.001000))"
         );
         let expr = Expr::Literal(
             ScalarValue::TimestampMicrosecond(
@@ -1143,7 +1153,7 @@ mod tests {
         );
         assert_eq!(
             to_sql_with_engine(&expr, Some(Engine::Postgres))?,
-            "((TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '1693219803001000 microseconds') AT TIME ZONE 'UTC')"
+            "((TIMESTAMP '1970-01-01 00:00:00' + make_interval(days => 19597, secs => 39003.001000)) AT TIME ZONE 'UTC')"
         );
 
         let expr = Expr::Literal(
@@ -1152,7 +1162,7 @@ mod tests {
         );
         assert_eq!(
             to_sql_with_engine(&expr, Some(Engine::Postgres))?,
-            "(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '1693219803001000 microseconds')"
+            "(TIMESTAMP '1970-01-01 00:00:00' + make_interval(days => 19597, secs => 39003.001000))"
         );
         let expr = Expr::Literal(
             ScalarValue::TimestampMillisecond(Some(1_693_219_803_001), Some(Arc::from("+10:00"))),
@@ -1160,7 +1170,7 @@ mod tests {
         );
         assert_eq!(
             to_sql_with_engine(&expr, Some(Engine::Postgres))?,
-            "((TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '1693219803001000 microseconds') AT TIME ZONE 'UTC')"
+            "((TIMESTAMP '1970-01-01 00:00:00' + make_interval(days => 19597, secs => 39003.001000)) AT TIME ZONE 'UTC')"
         );
 
         let expr = Expr::Literal(
@@ -1169,7 +1179,7 @@ mod tests {
         );
         assert_eq!(
             to_sql_with_engine(&expr, Some(Engine::Postgres))?,
-            "(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '1693219803000000 microseconds')"
+            "(TIMESTAMP '1970-01-01 00:00:00' + make_interval(days => 19597, secs => 39003.000000))"
         );
         let expr = Expr::Literal(
             ScalarValue::TimestampSecond(Some(1_693_219_803), Some(Arc::from("+10:00"))),
@@ -1177,7 +1187,7 @@ mod tests {
         );
         assert_eq!(
             to_sql_with_engine(&expr, Some(Engine::Postgres))?,
-            "((TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '1693219803000000 microseconds') AT TIME ZONE 'UTC')"
+            "((TIMESTAMP '1970-01-01 00:00:00' + make_interval(days => 19597, secs => 39003.000000)) AT TIME ZONE 'UTC')"
         );
 
         Ok(())
@@ -2414,11 +2424,11 @@ mod tests {
         assert_eq!(
             to_sql_with_engine(&ns(1_704_067_200_000_001_000), Some(Engine::Postgres))
                 .expect("to unparse"),
-            "(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '1704067200000001 microseconds')"
+            "(TIMESTAMP '1970-01-01 00:00:00' + make_interval(days => 19723, secs => 0.000001))"
         );
         assert_eq!(
             to_sql_with_engine(&ns(-1_000), Some(Engine::Postgres)).expect("to unparse"),
-            "(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '-1 microseconds')"
+            "(TIMESTAMP '1970-01-01 00:00:00' + make_interval(days => -1, secs => 86399.999999))"
         );
         // 9999-12-31 23:59:59.999999, where `f64` spacing is about 30 microseconds.
         let us = Expr::Literal(
@@ -2427,14 +2437,14 @@ mod tests {
         );
         assert_eq!(
             to_sql_with_engine(&us, Some(Engine::Postgres)).expect("to unparse"),
-            "(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '253402300799999999 microseconds')"
+            "(TIMESTAMP '1970-01-01 00:00:00' + make_interval(days => 2932896, secs => 86399.999999))"
         );
         // A second count past the `i64` microsecond range still renders; Postgres refuses the
-        // interval rather than Spice wrapping it to another instant.
+        // day count rather than Spice wrapping it to another instant.
         let s = Expr::Literal(ScalarValue::TimestampSecond(Some(i64::MAX), None), None);
         assert_eq!(
             to_sql_with_engine(&s, Some(Engine::Postgres)).expect("to unparse"),
-            "(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '9223372036854775807000000 microseconds')"
+            "(TIMESTAMP '1970-01-01 00:00:00' + make_interval(days => 106751991167300, secs => 55807.000000))"
         );
     }
 
@@ -2453,7 +2463,7 @@ mod tests {
             (Some(Engine::Spark), "TO_TIMESTAMP(1767225600)"),
             (
                 Some(Engine::Postgres),
-                "(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '1767225600000999 microseconds')",
+                "(TIMESTAMP '1970-01-01 00:00:00' + make_interval(days => 20454, secs => 0.000999))",
             ),
             (Some(Engine::MySQL), "FROM_UNIXTIME(1767225600.000999)"),
             (Some(Engine::SQLite), "datetime(1767225600, 'unixepoch')"),
