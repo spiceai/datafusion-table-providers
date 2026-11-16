@@ -357,14 +357,18 @@ fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> 
                     Ok(format!("datetime({}, 'unixepoch')", value / 1_000_000_000))
                 }
                 Some(Engine::Postgres) => {
-                    if timezone.is_none() {
-                        Ok(format!(
-                            "TO_TIMESTAMP({}) AT TIME ZONE 'UTC'",
-                            *value as f64 / 1_000_000_000.0
-                        ))
-                    } else {
-                        Ok(format!("TO_TIMESTAMP({})", *value as f64 / 1_000_000_000.0))
+                    // Postgres keeps microseconds. A bound between two of them has no
+                    // Postgres spelling that compares the same for every operator: rounding
+                    // it moves `<=` onto the next microsecond's rows, so it is refused.
+                    if value % 1_000 != 0 {
+                        return Err(Error::UnsupportedFilterExpr {
+                            expr: format!("{expr}"),
+                        });
                     }
+                    Ok(postgres_timestamp_literal(
+                        i128::from(*value / 1_000),
+                        timezone.is_some(),
+                    ))
                 }
                 Some(Engine::DuckDB) => {
                     duckdb_timestamp_literal(*value, TimeUnit::Nanosecond, expr)
@@ -377,13 +381,10 @@ fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> 
                     Some(Engine::SQLite) => {
                         Ok(format!("datetime({}, 'unixepoch')", value / 1_000_000))
                     }
-                    Some(Engine::Postgres) => {
-                        if timezone.is_none() {
-                            Ok(format!("TO_TIMESTAMP({seconds}) AT TIME ZONE 'UTC'"))
-                        } else {
-                            Ok(format!("TO_TIMESTAMP({seconds})"))
-                        }
-                    }
+                    Some(Engine::Postgres) => Ok(postgres_timestamp_literal(
+                        i128::from(*value),
+                        timezone.is_some(),
+                    )),
                     Some(Engine::MySQL) => Ok(format!("FROM_UNIXTIME({seconds})")),
                     Some(Engine::DuckDB) => {
                         duckdb_timestamp_literal(*value, TimeUnit::Microsecond, expr)
@@ -391,32 +392,23 @@ fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> 
                     _ => Ok(format!("TO_TIMESTAMP({})", value / 1_000_000)),
                 }
             }
-            ScalarValue::TimestampMillisecond(Some(value), timezone) => {
-                let seconds = *value as f64 / 1000.0;
-                match engine {
-                    Some(Engine::SQLite) => Ok(format!("datetime({}, 'unixepoch')", value / 1000)),
-                    Some(Engine::Postgres) => {
-                        if timezone.is_none() {
-                            Ok(format!("TO_TIMESTAMP({seconds}) AT TIME ZONE 'UTC'"))
-                        } else {
-                            Ok(format!("TO_TIMESTAMP({seconds})"))
-                        }
-                    }
-                    Some(Engine::DuckDB) => {
-                        duckdb_timestamp_literal(*value, TimeUnit::Millisecond, expr)
-                    }
-                    _ => Ok(format!("TO_TIMESTAMP({})", value / 1000)),
+            ScalarValue::TimestampMillisecond(Some(value), timezone) => match engine {
+                Some(Engine::SQLite) => Ok(format!("datetime({}, 'unixepoch')", value / 1000)),
+                Some(Engine::Postgres) => Ok(postgres_timestamp_literal(
+                    i128::from(*value) * 1_000,
+                    timezone.is_some(),
+                )),
+                Some(Engine::DuckDB) => {
+                    duckdb_timestamp_literal(*value, TimeUnit::Millisecond, expr)
                 }
-            }
+                _ => Ok(format!("TO_TIMESTAMP({})", value / 1000)),
+            },
             ScalarValue::TimestampSecond(Some(value), timezone) => match engine {
                 Some(Engine::SQLite) => Ok(format!("datetime({value}, 'unixepoch')")),
-                Some(Engine::Postgres) => {
-                    if timezone.is_none() {
-                        Ok(format!("TO_TIMESTAMP({value}) AT TIME ZONE 'UTC'"))
-                    } else {
-                        Ok(format!("TO_TIMESTAMP({value})"))
-                    }
-                }
+                Some(Engine::Postgres) => Ok(postgres_timestamp_literal(
+                    i128::from(*value) * 1_000_000,
+                    timezone.is_some(),
+                )),
                 Some(Engine::DuckDB) => duckdb_timestamp_literal(*value, TimeUnit::Second, expr),
                 _ => Ok(format!("TO_TIMESTAMP({value})")),
             },
@@ -717,6 +709,21 @@ fn duckdb_timestamp_literal_nanos(expr: &Expr) -> Option<i128> {
             Some(i128::from(millis.div_euclid(1_000)) * 1_000_000_000)
         }
         _ => None,
+    }
+}
+
+/// A Postgres timestamp `micros` microseconds after the UNIX epoch, built by integer interval
+/// arithmetic so every microsecond is kept. `TO_TIMESTAMP` takes a `double`, which cannot hold
+/// every microsecond of a recent epoch and rounds past them further from it, so a comparison
+/// built on it can land on the neighbouring microsecond's rows. With `timezone`, the instant is
+/// a `timestamptz`, read at UTC; without one it is a `timestamp`, which Postgres never shifts
+/// by the session's time zone.
+fn postgres_timestamp_literal(micros: i128, timezone: bool) -> String {
+    let timestamp = format!("(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '{micros} microseconds')");
+    if timezone {
+        format!("({timestamp} AT TIME ZONE 'UTC')")
+    } else {
+        timestamp
     }
 }
 
@@ -1105,7 +1112,7 @@ mod tests {
         );
         assert_eq!(
             to_sql_with_engine(&expr, Some(Engine::Postgres))?,
-            "TO_TIMESTAMP(1693219803.001) AT TIME ZONE 'UTC'"
+            "(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '1693219803001000 microseconds')"
         );
         let expr = Expr::Literal(
             ScalarValue::TimestampNanosecond(
@@ -1116,7 +1123,7 @@ mod tests {
         );
         assert_eq!(
             to_sql_with_engine(&expr, Some(Engine::Postgres))?,
-            "TO_TIMESTAMP(1693219803.001)"
+            "((TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '1693219803001000 microseconds') AT TIME ZONE 'UTC')"
         );
 
         let expr = Expr::Literal(
@@ -1125,7 +1132,7 @@ mod tests {
         );
         assert_eq!(
             to_sql_with_engine(&expr, Some(Engine::Postgres))?,
-            "TO_TIMESTAMP(1693219803.001) AT TIME ZONE 'UTC'"
+            "(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '1693219803001000 microseconds')"
         );
         let expr = Expr::Literal(
             ScalarValue::TimestampMicrosecond(
@@ -1136,7 +1143,7 @@ mod tests {
         );
         assert_eq!(
             to_sql_with_engine(&expr, Some(Engine::Postgres))?,
-            "TO_TIMESTAMP(1693219803.001)"
+            "((TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '1693219803001000 microseconds') AT TIME ZONE 'UTC')"
         );
 
         let expr = Expr::Literal(
@@ -1145,7 +1152,7 @@ mod tests {
         );
         assert_eq!(
             to_sql_with_engine(&expr, Some(Engine::Postgres))?,
-            "TO_TIMESTAMP(1693219803.001) AT TIME ZONE 'UTC'"
+            "(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '1693219803001000 microseconds')"
         );
         let expr = Expr::Literal(
             ScalarValue::TimestampMillisecond(Some(1_693_219_803_001), Some(Arc::from("+10:00"))),
@@ -1153,7 +1160,7 @@ mod tests {
         );
         assert_eq!(
             to_sql_with_engine(&expr, Some(Engine::Postgres))?,
-            "TO_TIMESTAMP(1693219803.001)"
+            "((TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '1693219803001000 microseconds') AT TIME ZONE 'UTC')"
         );
 
         let expr = Expr::Literal(
@@ -1162,7 +1169,7 @@ mod tests {
         );
         assert_eq!(
             to_sql_with_engine(&expr, Some(Engine::Postgres))?,
-            "TO_TIMESTAMP(1693219803) AT TIME ZONE 'UTC'"
+            "(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '1693219803000000 microseconds')"
         );
         let expr = Expr::Literal(
             ScalarValue::TimestampSecond(Some(1_693_219_803), Some(Arc::from("+10:00"))),
@@ -1170,7 +1177,7 @@ mod tests {
         );
         assert_eq!(
             to_sql_with_engine(&expr, Some(Engine::Postgres))?,
-            "TO_TIMESTAMP(1693219803)"
+            "((TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '1693219803000000 microseconds') AT TIME ZONE 'UTC')"
         );
 
         Ok(())
@@ -2392,6 +2399,45 @@ mod tests {
         );
     }
 
+    /// Postgres keeps microseconds, so a nanosecond bound between two of them is refused rather
+    /// than rounded: `ts <= '...00.000000999'` rounded up would take the `.000001` row with it.
+    /// A whole-microsecond nanosecond count is rendered exactly, as are counts far from the epoch
+    /// that a `double` could not hold to the microsecond.
+    #[test]
+    fn test_postgres_timestamp_literals_keep_every_microsecond() {
+        let ns =
+            |value: i64| Expr::Literal(ScalarValue::TimestampNanosecond(Some(value), None), None);
+        assert!(
+            to_sql_with_engine(&ns(1_704_067_200_000_000_999), Some(Engine::Postgres)).is_err(),
+            "a sub-microsecond bound must be refused"
+        );
+        assert_eq!(
+            to_sql_with_engine(&ns(1_704_067_200_000_001_000), Some(Engine::Postgres))
+                .expect("to unparse"),
+            "(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '1704067200000001 microseconds')"
+        );
+        assert_eq!(
+            to_sql_with_engine(&ns(-1_000), Some(Engine::Postgres)).expect("to unparse"),
+            "(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '-1 microseconds')"
+        );
+        // 9999-12-31 23:59:59.999999, where `f64` spacing is about 30 microseconds.
+        let us = Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(253_402_300_799_999_999), None),
+            None,
+        );
+        assert_eq!(
+            to_sql_with_engine(&us, Some(Engine::Postgres)).expect("to unparse"),
+            "(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '253402300799999999 microseconds')"
+        );
+        // A second count past the `i64` microsecond range still renders; Postgres refuses the
+        // interval rather than Spice wrapping it to another instant.
+        let s = Expr::Literal(ScalarValue::TimestampSecond(Some(i64::MAX), None), None);
+        assert_eq!(
+            to_sql_with_engine(&s, Some(Engine::Postgres)).expect("to unparse"),
+            "(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '9223372036854775807000000 microseconds')"
+        );
+    }
+
     /// The sub-second rendering is DuckDB-specific: the engines sharing the catch-all arm are
     /// untouched, and the ones with an arm of their own keep it.
     #[test]
@@ -2407,7 +2453,7 @@ mod tests {
             (Some(Engine::Spark), "TO_TIMESTAMP(1767225600)"),
             (
                 Some(Engine::Postgres),
-                "TO_TIMESTAMP(1767225600.000999) AT TIME ZONE 'UTC'",
+                "(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL '1767225600000999 microseconds')",
             ),
             (Some(Engine::MySQL), "FROM_UNIXTIME(1767225600.000999)"),
             (Some(Engine::SQLite), "datetime(1767225600, 'unixepoch')"),
