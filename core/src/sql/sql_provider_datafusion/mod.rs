@@ -657,8 +657,13 @@ fn physical_expr_to_sql(
 /// The top-level clause keywords of a query that [`SqlTable::scan_to_sql`] built and [`SqlExec`]
 /// extended (`WHERE`, `GROUP`, `HAVING`, `ORDER`, `LIMIT`), with the byte offset of each. A keyword
 /// inside a string literal, a quoted name or parentheses is not a clause, so the offsets come from
-/// the tokenizer. `None` if the query does not tokenize.
+/// the tokenizer. `None` if the query does not tokenize, or if it holds a backslash: some engines
+/// read `\'` inside a literal as a quote and others as the end of the literal, so the tokenizer
+/// cannot tell where such a literal ends.
 fn clause_keywords(sql: &str) -> Option<Vec<(Keyword, usize)>> {
+    if sql.contains('\\') {
+        return None;
+    }
     let tokens = Tokenizer::new(&GenericDialect {}, sql)
         .tokenize_with_location()
         .ok()?;
@@ -1682,6 +1687,72 @@ mod tests {
         }
 
         #[test]
+        fn test_sort_pushdown_skips_a_limit_word_when_the_query_has_no_limit() {
+            let sql = "SELECT \"name\", \"age\" FROM \"users\" WHERE \"name\" = 'x LIMIT 5'";
+            let exec = make_exec(sql);
+            assert_eq!(exec.fetch(), None);
+            match exec.try_pushdown_sort(&order_by_name()).unwrap() {
+                SortOrderPushdownResult::Exact { inner } => {
+                    let sorted = inner
+                        .downcast_ref::<SqlExec<(), &'static dyn ToString>>()
+                        .unwrap();
+                    assert_eq!(
+                        sorted.sql().unwrap(),
+                        format!("{sql} ORDER BY \"name\" ASC NULLS FIRST")
+                    );
+                }
+                other => panic!("Expected Exact, got {:?}", sort_result_name(&other)),
+            }
+        }
+
+        #[test]
+        fn test_sql_that_cannot_be_edited_takes_no_pushdown() {
+            for sql in [
+                "SELECT \"name\", \"age\" FROM \"users\" WHERE \"name\" = 'a\\'",
+                "SELECT \"name\", \"age\" FROM \"users\" WHERE \"name\" = 'a",
+            ] {
+                let exec = make_exec(sql);
+                assert!(exec.with_fetch(Some(5)).is_none(), "{sql}: limit");
+                assert!(
+                    matches!(
+                        exec.try_pushdown_sort(&order_by_name()).unwrap(),
+                        SortOrderPushdownResult::Unsupported
+                    ),
+                    "{sql}: sort"
+                );
+                let schema = exec.schema();
+                let predicate = binary(
+                    col("age", &schema).expect("column should resolve"),
+                    Operator::Gt,
+                    lit(30i16),
+                    &schema,
+                )
+                .expect("predicate should build");
+                let propagation = exec
+                    .handle_child_pushdown_result(
+                        FilterPushdownPhase::Pre,
+                        ChildPushdownResult {
+                            parent_filters: vec![ChildFilterPushdownResult {
+                                filter: predicate,
+                                child_results: vec![PushedDown::Yes],
+                            }],
+                            self_filters: vec![],
+                        },
+                        &ConfigOptions::default(),
+                    )
+                    .expect("filter pushdown should succeed");
+                assert!(propagation.updated_node.is_none(), "{sql}: filter node");
+                assert!(
+                    propagation
+                        .filters
+                        .iter()
+                        .all(|filter| matches!(filter, PushedDown::No)),
+                    "{sql}: filters"
+                );
+            }
+        }
+
+        #[test]
         fn test_table_threads_sort_pushdown_setting_into_its_plan() {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("name", DataType::Utf8, false),
@@ -2278,6 +2349,29 @@ mod tests {
             assert_eq!(
                 insert_where_clause(sql, "\"c\" > 3").unwrap(),
                 format!("{sql} AND (\"c\" > 3)")
+            );
+        }
+
+        #[test]
+        fn test_a_query_with_a_backslash_takes_no_condition() {
+            assert_eq!(
+                insert_where_clause(
+                    "SELECT * FROM t WHERE \"name\" = 'a\\' LIMIT 3",
+                    "\"c\" > 3"
+                ),
+                None
+            );
+        }
+
+        #[test]
+        fn test_offsets_after_a_multi_line_non_ascii_literal() {
+            assert_eq!(
+                insert_where_clause(
+                    "SELECT * FROM t WHERE \"name\" = 'é\nü' LIMIT 3",
+                    "\"c\" > 3"
+                )
+                .unwrap(),
+                "SELECT * FROM t WHERE \"name\" = 'é\nü' AND (\"c\" > 3) LIMIT 3"
             );
         }
 
