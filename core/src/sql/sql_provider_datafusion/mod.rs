@@ -1647,6 +1647,91 @@ mod tests {
         }
 
         #[test]
+        fn test_sort_pushdown_keeps_a_nullable_key_local_when_the_dialect_cannot_write_the_null_order(
+        ) {
+            use datafusion::sql::unparser::dialect::MySqlDialect;
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("age", DataType::Int16, false),
+            ]));
+            let pool = Arc::new(MockDBPool {})
+                as Arc<dyn DbConnectionPool<(), &'static dyn ToString> + Send + Sync>;
+            let exec = SqlExec::new(
+                None,
+                &schema,
+                pool,
+                "SELECT `name`, `age` FROM `users`".to_string(),
+                Arc::new(MySqlDialect {}),
+            )
+            .unwrap();
+            let ascending = |column: &str, index: usize| {
+                vec![PhysicalSortExpr {
+                    expr: Arc::new(Column::new(column, index)),
+                    options: SortOptions {
+                        descending: false,
+                        nulls_first: false,
+                    },
+                }]
+            };
+
+            assert!(matches!(
+                exec.try_pushdown_sort(&ascending("name", 0)).unwrap(),
+                SortOrderPushdownResult::Unsupported
+            ));
+            assert!(matches!(
+                exec.try_pushdown_sort(&ascending("age", 1)).unwrap(),
+                SortOrderPushdownResult::Exact { .. }
+            ));
+        }
+
+        #[test]
+        fn test_table_takes_the_dialect_of_its_pool() {
+            use datafusion::sql::unparser::dialect::{Dialect, MySqlDialect};
+
+            struct MySqlDialectPool {}
+
+            #[async_trait::async_trait]
+            impl DbConnectionPool<(), &'static dyn ToString> for MySqlDialectPool {
+                async fn connect(
+                    &self,
+                ) -> Result<
+                    Box<dyn DbConnection<(), &'static dyn ToString>>,
+                    Box<dyn std::error::Error + Send + Sync>,
+                > {
+                    Ok(Box::new(MockConn {}))
+                }
+
+                fn join_push_down(&self) -> JoinPushDown {
+                    JoinPushDown::Disallow
+                }
+
+                fn dialect(&self) -> Option<Arc<dyn Dialect + Send + Sync>> {
+                    Some(Arc::new(MySqlDialect {}))
+                }
+            }
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, false),
+                Field::new("Age", DataType::Int16, false),
+            ]));
+            let pool = Arc::new(MySqlDialectPool {})
+                as Arc<dyn DbConnectionPool<(), &'static dyn ToString> + Send + Sync>;
+            let table = SqlTable::new_with_schema(
+                "mock",
+                &pool,
+                schema,
+                TableReference::bare("users"),
+                None,
+            );
+
+            assert_eq!(
+                table.scan_to_sql(None, &[], None).unwrap(),
+                "SELECT `name`, `Age` FROM `users`"
+            );
+        }
+
+        #[test]
         fn test_table_threads_expression_support_into_physical_filter_pushdown() {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("name", DataType::Utf8, false),
