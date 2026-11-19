@@ -126,18 +126,13 @@ impl<T, P> SqlTable<T, P> {
             .await
             .context(UnableToGetSchemaSnafu)?;
 
-        Ok(Self {
+        Ok(Self::new_with_schema(
             name,
-            pool: Arc::clone(pool),
+            pool,
             schema,
             table_reference,
             engine,
-            dialect: pool.dialect(),
-            constraints: None,
-            function_support: None,
-            allow_physical_filter_pushdown: true,
-            allow_physical_sort_pushdown: true,
-        })
+        ))
     }
 
     pub fn new_with_schema(
