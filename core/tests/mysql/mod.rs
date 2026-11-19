@@ -22,13 +22,14 @@ use crate::arrow_record_batch_gen::*;
 use crate::docker::RunningContainer;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::TableProviderFactory;
-use datafusion::common::{Constraints, ToDFSchema};
+use datafusion::common::{Constraints, TableReference, ToDFSchema};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::CreateExternalTable;
 use datafusion::physical_plan::collect;
+use datafusion::sql::unparser::dialect::MySqlDialect;
 #[cfg(feature = "mysql-federation")]
 use datafusion_federation::schema_cast::record_convert::try_cast_to;
-use datafusion_table_providers::mysql::MySQLTableProviderFactory;
+use datafusion_table_providers::mysql::{MySQLTableFactory, MySQLTableProviderFactory};
 use secrecy::ExposeSecret;
 use tokio::sync::Mutex;
 
@@ -809,7 +810,8 @@ async fn arrow_mysql_one_way(
     > = Arc::new(pool);
     let table = SqlTable::new("mysql", &sqltable_pool, table_name, None)
         .await
-        .expect("Table should be created");
+        .expect("Table should be created")
+        .with_dialect(Arc::new(MySqlDialect {}));
 
     ctx.register_table(table_name, Arc::new(table))
         .expect("Table should be registered");
@@ -971,6 +973,69 @@ async fn test_arrow_mysql_roundtrip(
         table_name,
     )
     .await;
+}
+
+/// Collects the first column of `sql`'s result as `i32` values.
+async fn int_column(ctx: &SessionContext, sql: &str) -> Vec<Option<i32>> {
+    let batches = ctx
+        .sql(sql)
+        .await
+        .expect("query to plan")
+        .collect()
+        .await
+        .expect("query to run");
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("an Int32 column")
+                .iter()
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// A double quote in a string literal or in a column name reaches MySQL as written.
+#[test_log::test(tokio::test)]
+async fn test_mysql_sql_keeps_double_quotes() {
+    let port = crate::get_random_port();
+    let mysql_container = start_mysql_container(port).await;
+    let pool = Arc::new(
+        common::get_mysql_connection_pool(port, None)
+            .await
+            .expect("MySQL connection pool to be created"),
+    );
+    let conn = pool.connect_direct().await.expect("connection to open");
+    for statement in [
+        "CREATE TABLE quotes (id INT, name TEXT, `q\"col` INT, qcol INT)",
+        "INSERT INTO quotes VALUES (1, 'say hi', 10, 20), (2, 'say \"hi\"', 11, 21)",
+    ] {
+        conn.execute(statement, &[])
+            .await
+            .expect("setup statement to run");
+    }
+
+    let ctx = SessionContext::new();
+    let table = MySQLTableFactory::new(Arc::clone(&pool))
+        .table_provider(TableReference::bare("quotes"))
+        .await
+        .expect("table provider to be created");
+    ctx.register_table("quotes", table)
+        .expect("table to be registered");
+
+    assert_eq!(
+        int_column(&ctx, r#"SELECT id FROM quotes WHERE name = 'say "hi"'"#).await,
+        vec![Some(2)]
+    );
+    assert_eq!(
+        int_column(&ctx, r#"SELECT "q""col" FROM quotes ORDER BY id"#).await,
+        vec![Some(10), Some(11)]
+    );
+
+    mysql_container.remove().await.expect("container to stop");
 }
 
 async fn mysql_connection_id(pool: &MySQLConnectionPool) -> u64 {
