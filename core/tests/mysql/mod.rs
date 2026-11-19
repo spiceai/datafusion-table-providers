@@ -1010,8 +1010,15 @@ async fn assert_double_quotes_reach_mysql(ctx: &SessionContext, table: &str) {
     );
     assert_eq!(
         int_column(ctx, &format!(r#"SELECT "q""col" FROM {table} ORDER BY id"#)).await,
-        vec![Some(10), Some(11)],
+        vec![Some(10), Some(11), None],
         "{table}: a column whose name holds a double quote"
+    );
+    // MySQL sorts NULLs first for ASC, DataFusion last. MySqlDialect cannot write `NULLS LAST`,
+    // so the sort stays local.
+    assert_eq!(
+        int_column(ctx, &format!("SELECT qcol FROM {table} ORDER BY qcol")).await,
+        vec![Some(20), Some(21), None],
+        "{table}: NULLs sort last"
     );
 }
 
@@ -1031,7 +1038,7 @@ async fn test_mysql_sql_keeps_double_quotes() {
     let conn = pool.connect_direct().await.expect("connection to open");
     for statement in [
         "CREATE TABLE quotes (id INT, name TEXT, `q\"col` INT, qcol INT)",
-        "INSERT INTO quotes VALUES (1, 'say hi', 10, 20), (2, 'say \"hi\"', 11, 21)",
+        "INSERT INTO quotes VALUES (1, 'say hi', 10, 20), (2, 'say \"hi\"', 11, 21), (3, NULL, NULL, NULL)",
     ] {
         conn.execute(statement, &[])
             .await

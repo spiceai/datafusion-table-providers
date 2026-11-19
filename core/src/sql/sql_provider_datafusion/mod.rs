@@ -738,68 +738,18 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
         &self,
         order: &[PhysicalSortExpr],
     ) -> DataFusionResult<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
-        use datafusion::logical_expr::expr::Sort;
-        use datafusion::physical_expr::expressions::Column;
-
-        if !self.allow_physical_sort_pushdown || order.is_empty() {
+        // A dialect that cannot write `NULLS FIRST/LAST` leaves the NULL order to the database,
+        // which may differ from the one asked for, so a sort on a nullable column stays local.
+        if !self.dialect.supports_nulls_first_in_sort()
+            && order.iter().any(|key| {
+                key.expr
+                    .nullable(self.projected_schema.as_ref())
+                    .unwrap_or(true)
+            })
+        {
             return Ok(SortOrderPushdownResult::Unsupported);
         }
-
-        let unparser = Unparser::new(self.dialect());
-
-        // Build ORDER BY clause from physical sort expressions using the Unparser
-        let mut order_by_parts = Vec::with_capacity(order.len());
-        for sort_expr in order {
-            let Some(col) = sort_expr.expr.downcast_ref::<Column>() else {
-                return Ok(SortOrderPushdownResult::Unsupported);
-            };
-            let logical_sort = Sort::new(
-                Expr::Column(datafusion::common::Column::new_unqualified(col.name())),
-                !sort_expr.options.descending,
-                sort_expr.options.nulls_first,
-            );
-            let order_by_expr = unparser.sort_to_sql(&logical_sort).map_err(|e| {
-                DataFusionError::Internal(format!("Failed to unparse sort expression: {e}"))
-            })?;
-            order_by_parts.push(order_by_expr.to_string());
-        }
-
-        let order_by_clause = format!("ORDER BY {}", order_by_parts.join(", "));
-
-        // Insert ORDER BY before LIMIT (if present) or at the end
-        let sql = &self.sql;
-        let new_sql = if let Some(limit_pos) = sql.to_uppercase().rfind(" LIMIT ") {
-            format!(
-                "{} {order_by_clause}{}",
-                &sql[..limit_pos],
-                &sql[limit_pos..]
-            )
-        } else {
-            format!("{sql} {order_by_clause}")
-        };
-
-        let mut new_exec = Self {
-            projected_schema: Arc::clone(&self.projected_schema),
-            pool: Arc::clone(&self.pool),
-            sql: new_sql,
-            properties: self.properties.clone(),
-            dialect: Arc::clone(&self.dialect),
-            function_support: self.function_support.clone(),
-            allow_physical_filter_pushdown: self.allow_physical_filter_pushdown,
-            allow_physical_sort_pushdown: self.allow_physical_sort_pushdown,
-        };
-
-        // Update equivalence properties to reflect the output ordering
-        let eq_properties = EquivalenceProperties::new_with_orderings(
-            Arc::clone(&self.projected_schema),
-            vec![order.to_vec()],
-        );
-        new_exec.properties =
-            Arc::new(PlanProperties::clone(&new_exec.properties).with_eq_properties(eq_properties));
-
-        Ok(SortOrderPushdownResult::Exact {
-            inner: Arc::new(new_exec),
-        })
+        self.push_order_by(order)
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
@@ -907,6 +857,78 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
 
         let stream = futures::stream::once(fut).try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+}
+
+impl<T: 'static, P: 'static> SqlExec<T, P> {
+    /// Adds `order` to the SQL as `ORDER BY`. The caller decides whether the database returns
+    /// NULLs where `order` asks for them.
+    pub(crate) fn push_order_by(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> DataFusionResult<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        use datafusion::logical_expr::expr::Sort;
+        use datafusion::physical_expr::expressions::Column;
+
+        if !self.allow_physical_sort_pushdown || order.is_empty() {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        }
+
+        let unparser = Unparser::new(self.dialect());
+
+        // Build ORDER BY clause from physical sort expressions using the Unparser
+        let mut order_by_parts = Vec::with_capacity(order.len());
+        for sort_expr in order {
+            let Some(col) = sort_expr.expr.downcast_ref::<Column>() else {
+                return Ok(SortOrderPushdownResult::Unsupported);
+            };
+            let logical_sort = Sort::new(
+                Expr::Column(datafusion::common::Column::new_unqualified(col.name())),
+                !sort_expr.options.descending,
+                sort_expr.options.nulls_first,
+            );
+            let order_by_expr = unparser.sort_to_sql(&logical_sort).map_err(|e| {
+                DataFusionError::Internal(format!("Failed to unparse sort expression: {e}"))
+            })?;
+            order_by_parts.push(order_by_expr.to_string());
+        }
+
+        let order_by_clause = format!("ORDER BY {}", order_by_parts.join(", "));
+
+        // Insert ORDER BY before LIMIT (if present) or at the end
+        let sql = &self.sql;
+        let new_sql = if let Some(limit_pos) = sql.to_uppercase().rfind(" LIMIT ") {
+            format!(
+                "{} {order_by_clause}{}",
+                &sql[..limit_pos],
+                &sql[limit_pos..]
+            )
+        } else {
+            format!("{sql} {order_by_clause}")
+        };
+
+        let mut new_exec = Self {
+            projected_schema: Arc::clone(&self.projected_schema),
+            pool: Arc::clone(&self.pool),
+            sql: new_sql,
+            properties: self.properties.clone(),
+            dialect: Arc::clone(&self.dialect),
+            function_support: self.function_support.clone(),
+            allow_physical_filter_pushdown: self.allow_physical_filter_pushdown,
+            allow_physical_sort_pushdown: self.allow_physical_sort_pushdown,
+        };
+
+        // Update equivalence properties to reflect the output ordering
+        let eq_properties = EquivalenceProperties::new_with_orderings(
+            Arc::clone(&self.projected_schema),
+            vec![order.to_vec()],
+        );
+        new_exec.properties =
+            Arc::new(PlanProperties::clone(&new_exec.properties).with_eq_properties(eq_properties));
+
+        Ok(SortOrderPushdownResult::Exact {
+            inner: Arc::new(new_exec),
+        })
     }
 }
 
