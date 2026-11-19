@@ -26,9 +26,9 @@ use datafusion::common::{Constraints, TableReference, ToDFSchema};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::CreateExternalTable;
 use datafusion::physical_plan::collect;
-use datafusion::sql::unparser::dialect::MySqlDialect;
 #[cfg(feature = "mysql-federation")]
 use datafusion_federation::schema_cast::record_convert::try_cast_to;
+use datafusion_table_providers::common::DatabaseCatalogProvider;
 use datafusion_table_providers::mysql::{MySQLTableFactory, MySQLTableProviderFactory};
 use secrecy::ExposeSecret;
 use tokio::sync::Mutex;
@@ -810,8 +810,7 @@ async fn arrow_mysql_one_way(
     > = Arc::new(pool);
     let table = SqlTable::new("mysql", &sqltable_pool, table_name, None)
         .await
-        .expect("Table should be created")
-        .with_dialect(Arc::new(MySqlDialect {}));
+        .expect("Table should be created");
 
     ctx.register_table(table_name, Arc::new(table))
         .expect("Table should be registered");
@@ -998,7 +997,28 @@ async fn int_column(ctx: &SessionContext, sql: &str) -> Vec<Option<i32>> {
         .collect()
 }
 
-/// A double quote in a string literal or in a column name reaches MySQL as written.
+/// Checks that a double quote in a string literal or in a column name reaches MySQL as written.
+async fn assert_double_quotes_reach_mysql(ctx: &SessionContext, table: &str) {
+    assert_eq!(
+        int_column(
+            ctx,
+            &format!(r#"SELECT id FROM {table} WHERE name = 'say "hi"'"#)
+        )
+        .await,
+        vec![Some(2)],
+        "{table}: a literal that holds a double quote"
+    );
+    assert_eq!(
+        int_column(ctx, &format!(r#"SELECT "q""col" FROM {table} ORDER BY id"#)).await,
+        vec![Some(10), Some(11)],
+        "{table}: a column whose name holds a double quote"
+    );
+}
+
+/// A double quote in a string literal or in a column name reaches MySQL as written, through the
+/// MySQL table provider (scanned and federated) and through the generic catalog provider, whose
+/// tables take the pool's dialect. `name` is a SQL keyword, so a dialect that quotes it with `"`
+/// makes MySQL compare a string instead of the column.
 #[test_log::test(tokio::test)]
 async fn test_mysql_sql_keeps_double_quotes() {
     let port = crate::get_random_port();
@@ -1023,17 +1043,28 @@ async fn test_mysql_sql_keeps_double_quotes() {
         .table_provider(TableReference::bare("quotes"))
         .await
         .expect("table provider to be created");
-    ctx.register_table("quotes", table)
+    ctx.register_table("quotes", Arc::clone(&table))
         .expect("table to be registered");
+    let dyn_pool: Arc<
+        dyn DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)> + Send + Sync,
+    > = Arc::clone(&pool) as _;
+    let catalog = DatabaseCatalogProvider::try_new(dyn_pool)
+        .await
+        .expect("catalog provider to be created");
+    ctx.register_catalog("mysql", Arc::new(catalog));
 
-    assert_eq!(
-        int_column(&ctx, r#"SELECT id FROM quotes WHERE name = 'say "hi"'"#).await,
-        vec![Some(2)]
-    );
-    assert_eq!(
-        int_column(&ctx, r#"SELECT "q""col" FROM quotes ORDER BY id"#).await,
-        vec![Some(10), Some(11)]
-    );
+    assert_double_quotes_reach_mysql(&ctx, "quotes").await;
+    assert_double_quotes_reach_mysql(&ctx, "mysql.mysqldb.quotes").await;
+
+    #[cfg(feature = "mysql-federation")]
+    {
+        let federated =
+            SessionContext::new_with_state(datafusion_federation::default_session_state());
+        federated
+            .register_table("quotes", table)
+            .expect("table to be registered");
+        assert_double_quotes_reach_mysql(&federated, "quotes").await;
+    }
 
     mysql_container.remove().await.expect("container to stop");
 }
