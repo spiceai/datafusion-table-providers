@@ -7,11 +7,20 @@ on:
       - main
       - spiceai
 
+# A new push to a pull request cancels its earlier run, so superseded commits
+# don't hold runners in the shared self-hosted pool.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
+# Every job runs on the self-hosted `spiceai-dev-runners` pool. Each job skips
+# pull requests from forks so an approved fork run never executes on that pool;
+# non-PR events and same-repository pull requests still run.
 jobs:
   lint:
     name: Clippy
-    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: spiceai-dev-runners
 
     steps:
       - uses: actions/checkout@v7
@@ -35,7 +44,8 @@ jobs:
 
   build:
     name: Build (facade all-features)
-    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: spiceai-dev-runners
 
     steps:
       - uses: actions/checkout@v7
@@ -51,14 +61,17 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install ODBC
-        run: sudo apt-get install -y unixodbc-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unixodbc-dev
 
       - name: Check facade with all features
         run: cargo check -p datafusion-table-providers --all-features
 
   leaf-crates:
     name: Leaf (${{ matrix.crate }})
-    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: spiceai-dev-runners
 
     strategy:
       matrix:
@@ -91,14 +104,17 @@ jobs:
 
       - name: Install ODBC
         if: matrix.crate == 'datafusion-table-providers-odbc'
-        run: sudo apt-get install -y unixodbc-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unixodbc-dev
 
       - name: Check ${{ matrix.crate }}
         run: cargo check -p ${{ matrix.crate }}
 
   unit-test:
     name: Unit Tests
-    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: spiceai-dev-runners
 
     steps:
       - uses: actions/checkout@v7
@@ -115,6 +131,7 @@ jobs:
 
       - name: Install ODBC & Sqlite
         run: |
+          sudo apt-get update
           sudo apt-get install -y unixodbc-dev libsqliteodbc libsqlite3-dev
           curl -LsSf https://dbc.columnar.tech/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -127,7 +144,8 @@ jobs:
 
   integration-test:
     name: Integration Tests
-    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: spiceai-dev-runners
     timeout-minutes: 45
 
     env:
@@ -149,16 +167,6 @@ jobs:
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
-
-      # Free space before pulling images so we do not delete the images we need.
-      - name: Free Disk Space
-        run: |
-          sudo rm -rf \
-            /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/share/powershell /usr/share/swift /usr/local/.ghcup \
-            /usr/lib/jvm || true
-          sudo docker system prune -af >/dev/null 2>&1 || true
-          df -h
 
       - name: Cache Docker images
         id: docker-cache
@@ -224,7 +232,8 @@ jobs:
 
   scylla-integration-test:
     name: ScyllaDB Integration Tests
-    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: spiceai-dev-runners
     timeout-minutes: 25
 
     env:
@@ -262,7 +271,8 @@ jobs:
 
   python-integration-test:
     name: Python Tests
-    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: spiceai-dev-runners
 
     env:
       # Official Postgres image — CNPG variants can exceed the healthcheck window in CI.
@@ -290,6 +300,7 @@ jobs:
 
       - name: Install ODBC, Sqlite and Roapi
         run: |
+          sudo apt-get update
           sudo apt-get install -y unixodbc-dev libsqliteodbc libsqlite3-dev
           # 0.13.0 musl release panics on HTTP UI route registration; 0.12.7 is fine.
           curl -fsSL -o /tmp/roapi.tar.gz \
