@@ -10,6 +10,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use datafusion::sql::unparser::dialect::{Dialect, MySqlDialect};
 use mysql_async::{
     prelude::{Queryable, ToValue},
     Conn, DriverError, Metrics, Opts, OptsBuilder, PoolConstraints, PoolOpts, Row, SslOpts,
@@ -614,5 +615,10 @@ impl DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)> for MySQ
 
     fn join_push_down(&self) -> JoinPushDown {
         self.join_push_down.clone()
+    }
+
+    /// MySQL reads a `"`-quoted name as a string, so SQL for MySQL quotes names with backticks.
+    fn dialect(&self) -> Option<Arc<dyn Dialect + Send + Sync>> {
+        Some(Arc::new(MySqlDialect {}))
     }
 }

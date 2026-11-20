@@ -210,7 +210,7 @@ impl ExecutionPlan for MySQLSQLExec {
         }) {
             return Ok(SortOrderPushdownResult::Unsupported);
         }
-        match self.base_exec.try_pushdown_sort(order)? {
+        match self.base_exec.push_order_by(order)? {
             SortOrderPushdownResult::Exact { inner } => {
                 let base_exec = inner
                     .downcast_ref::<SqlExec<mysql_async::Conn, &'static (dyn ToValue + Sync)>>()
