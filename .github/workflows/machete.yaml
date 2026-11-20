@@ -18,8 +18,9 @@ concurrency:
 jobs:
   detect-unused-dependencies:
     name: Unused dependencies
-    # Self-hosted pool: skip pull requests from forks so an approved fork run
-    # never executes on it. Non-PR events and same-repository PRs still run.
+    # Self-hosted pool: skip pull requests from forks. A fork's pull request
+    # can edit this file, so maintainer approval of fork runs is the boundary
+    # (see pr.yaml). Non-PR events and same-repository PRs still run.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: spiceai-dev-runners
 

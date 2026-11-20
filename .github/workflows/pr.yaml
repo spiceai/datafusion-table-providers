@@ -13,9 +13,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Every job runs on the self-hosted `spiceai-dev-runners` pool. Each job skips
-# pull requests from forks so an approved fork run never executes on that pool;
-# non-PR events and same-repository pull requests still run.
+# Every job runs on the self-hosted `spiceai-dev-runners` pool and skips pull
+# requests from forks; non-PR events and same-repository pull requests still
+# run. The skip keeps an unmodified workflow from scheduling fork code on the
+# pool, but a fork's pull request runs its own copy of this file and can remove
+# it. The boundary is the repository's fork-run approval setting, which holds
+# every outside contributor's run until a maintainer approves it: don't approve
+# a fork run whose pull request changes `.github/` without reading that change.
 jobs:
   lint:
     name: Clippy
