@@ -4,7 +4,7 @@ use arrow::datatypes::{DataType, Schema, TimeUnit};
 use bigdecimal::{num_bigint::BigInt, BigDecimal};
 use datafusion::{
     common::TableReference,
-    logical_expr::{Cast, Expr, Operator},
+    logical_expr::{BinaryExpr, Cast, Expr, Operator},
     scalar::ScalarValue,
     sql::unparser::dialect::{
         DefaultDialect, Dialect, DuckDBDialect, MySqlDialect, PostgreSqlDialect, SqliteDialect,
@@ -172,6 +172,11 @@ pub fn to_sql_with_engine_and_schema(
 fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> Result<String> {
     match expr {
         Expr::BinaryExpr(binary_expr) => {
+            if let Some(Engine::Postgres) = engine {
+                if let Some(sql) = postgres_sub_microsecond_comparison(binary_expr, schema)? {
+                    return Ok(sql);
+                }
+            }
             let left = render_expr(&binary_expr.left, engine, schema)?;
             let right = render_expr(&binary_expr.right, engine, schema)?;
 
@@ -359,7 +364,9 @@ fn render_expr(expr: &Expr, engine: Option<Engine>, schema: Option<&Schema>) -> 
                 Some(Engine::Postgres) => {
                     // Postgres keeps microseconds. A bound between two of them has no
                     // Postgres spelling that compares the same for every operator: rounding
-                    // it moves `<=` onto the next microsecond's rows, so it is refused.
+                    // it moves `<=` onto the next microsecond's rows. A comparison writes it
+                    // for its operator (`postgres_sub_microsecond_comparison`); anywhere else
+                    // it is refused.
                     if value % 1_000 != 0 {
                         return Err(Error::UnsupportedFilterExpr {
                             expr: format!("{expr}"),
@@ -709,6 +716,85 @@ fn duckdb_timestamp_literal_nanos(expr: &Expr) -> Option<i128> {
             Some(i128::from(millis.div_euclid(1_000)) * 1_000_000_000)
         }
         _ => None,
+    }
+}
+
+/// A Postgres comparison between an operand and a nanosecond timestamp literal that falls between
+/// two microseconds, or `None` for any other expression. Postgres keeps microseconds, so the
+/// operand holds a whole microsecond, and the comparison is exact against the microsecond on the
+/// right side of the literal: `<` and `>=` against the next one, `<=` and `>` against the one
+/// before, and `=` and `<>` against the range between the two, which holds no microsecond.
+fn postgres_sub_microsecond_comparison(
+    binary_expr: &BinaryExpr,
+    schema: Option<&Schema>,
+) -> Result<Option<String>> {
+    let sub_microsecond = |expr: &Expr| match expr {
+        Expr::Literal(ScalarValue::TimestampNanosecond(Some(nanos), timezone), _)
+            if nanos % 1_000 != 0 =>
+        {
+            Some((*nanos, timezone.is_some()))
+        }
+        _ => None,
+    };
+    let (operand, (nanos, timezone), op) =
+        if let Some(literal) = sub_microsecond(&binary_expr.right) {
+            (&*binary_expr.left, literal, binary_expr.op)
+        } else if let Some(literal) = sub_microsecond(&binary_expr.left) {
+            let Some(op) = binary_expr.op.swap() else {
+                return Ok(None);
+            };
+            (&*binary_expr.right, literal, op)
+        } else {
+            return Ok(None);
+        };
+    if !matches!(
+        op,
+        Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+            | Operator::Eq
+            | Operator::NotEq
+    ) {
+        return Ok(None);
+    }
+    let before = i128::from(nanos.div_euclid(1_000));
+    let before_sql = postgres_timestamp_literal(before, timezone);
+    let after_sql = postgres_timestamp_literal(before + 1, timezone);
+    let operand_sql = render_expr(operand, Some(Engine::Postgres), schema)?;
+    let operand_sql = group_if_binary(operand, &operand_sql);
+    Ok(Some(match op {
+        Operator::Lt => format!("{operand_sql} < {after_sql}"),
+        Operator::GtEq => format!("{operand_sql} >= {after_sql}"),
+        Operator::LtEq => format!("{operand_sql} <= {before_sql}"),
+        Operator::Gt => format!("{operand_sql} > {before_sql}"),
+        Operator::Eq => format!("({operand_sql} > {before_sql} AND {operand_sql} < {after_sql})"),
+        _ => format!("({operand_sql} <= {before_sql} OR {operand_sql} >= {after_sql})"),
+    }))
+}
+
+/// `value`, or a nanosecond timestamp literal rounded to the nearest microsecond, as Postgres
+/// rounds a finer value it stores. For the value of an `UPDATE`'s `SET`; a comparison bound is
+/// written exactly by [`postgres_sub_microsecond_comparison`] instead.
+#[must_use]
+pub fn round_postgres_set_value(value: Expr) -> Expr {
+    match value {
+        Expr::Literal(ScalarValue::TimestampNanosecond(Some(nanos), timezone), metadata)
+            if nanos % 1_000 != 0 =>
+        {
+            let micros = nanos.div_euclid(1_000) + i64::from(nanos.rem_euclid(1_000) >= 500);
+            match micros.checked_mul(1_000) {
+                Some(rounded) => Expr::Literal(
+                    ScalarValue::TimestampNanosecond(Some(rounded), timezone),
+                    metadata,
+                ),
+                None => Expr::Literal(
+                    ScalarValue::TimestampNanosecond(Some(nanos), timezone),
+                    metadata,
+                ),
+            }
+        }
+        other => other,
     }
 }
 
@@ -2446,6 +2532,71 @@ mod tests {
             to_sql_with_engine(&s, Some(Engine::Postgres)).expect("to unparse"),
             "(TIMESTAMP '1970-01-01 00:00:00' + make_interval(days => 106751991167300, secs => 55807.000000))"
         );
+    }
+
+    /// A Postgres comparison with a bound between two microseconds is written against the
+    /// microsecond on the right side of the bound for its operator, so `now()` in a `DELETE` or an
+    /// `UPDATE` filter keeps exactly the rows the bound selects.
+    #[test]
+    fn test_postgres_sub_microsecond_bounds_compare_exactly() {
+        let ns =
+            |value: i64| Expr::Literal(ScalarValue::TimestampNanosecond(Some(value), None), None);
+        let render =
+            |expr: Expr| to_sql_with_engine(&expr, Some(Engine::Postgres)).expect("to unparse");
+        // 2024-01-01 00:00:00.000000999, between .000000 and .000001.
+        let bound = ns(1_704_067_200_000_000_999);
+        let before =
+            "(TIMESTAMP '1970-01-01 00:00:00' + make_interval(days => 19723, secs => 0.000000))";
+        let after =
+            "(TIMESTAMP '1970-01-01 00:00:00' + make_interval(days => 19723, secs => 0.000001))";
+        for (expr, expected) in [
+            (col("ts").lt(bound.clone()), format!("\"ts\" < {after}")),
+            (col("ts").gt_eq(bound.clone()), format!("\"ts\" >= {after}")),
+            (
+                col("ts").lt_eq(bound.clone()),
+                format!("\"ts\" <= {before}"),
+            ),
+            (col("ts").gt(bound.clone()), format!("\"ts\" > {before}")),
+            (
+                col("ts").eq(bound.clone()),
+                format!("(\"ts\" > {before} AND \"ts\" < {after})"),
+            ),
+            (
+                col("ts").not_eq(bound.clone()),
+                format!("(\"ts\" <= {before} OR \"ts\" >= {after})"),
+            ),
+            (bound.clone().lt(col("ts")), format!("\"ts\" > {before}")),
+            (
+                bound.clone().gt_eq(col("ts")),
+                format!("\"ts\" <= {before}"),
+            ),
+        ] {
+            assert_eq!(render(expr.clone()), expected, "{expr}");
+        }
+        // A bound before the epoch is between the same two microseconds the count floors to.
+        assert_eq!(
+            render(col("ts").lt_eq(ns(-1))),
+            "\"ts\" <= (TIMESTAMP '1970-01-01 00:00:00' + make_interval(days => -1, secs => 86399.999999))"
+        );
+        // Any other use of such a literal is still refused.
+        assert!(to_sql_with_engine(&(col("ts") - bound), Some(Engine::Postgres)).is_err());
+    }
+
+    /// An `UPDATE`'s `SET` value between two microseconds is rounded to the nearest one, which is
+    /// what Postgres stores for it.
+    #[test]
+    fn test_postgres_set_value_rounds_to_the_nearest_microsecond() {
+        let ns =
+            |value: i64| Expr::Literal(ScalarValue::TimestampNanosecond(Some(value), None), None);
+        for (value, expected) in [
+            (1_499, 1_000),
+            (1_500, 2_000),
+            (-1_499, -1_000),
+            (2_000, 2_000),
+            (i64::MAX, i64::MAX),
+        ] {
+            assert_eq!(round_postgres_set_value(ns(value)), ns(expected), "{value}");
+        }
     }
 
     /// The sub-second rendering is DuckDB-specific: the engines sharing the catch-all arm are
