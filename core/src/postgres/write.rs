@@ -150,7 +150,7 @@ impl TableProvider for PostgresTableWriter {
 
         let assignments: Vec<(String, Expr)> = assignments
             .into_iter()
-            .map(|(column, value)| (column, expr::round_postgres_set_value(value)))
+            .map(|(column, value)| (column, expr::truncate_postgres_set_value(value)))
             .collect();
         let set_clause = assignments_to_sql(&assignments, Some(Engine::Postgres))?;
         let postgres = self.postgres();

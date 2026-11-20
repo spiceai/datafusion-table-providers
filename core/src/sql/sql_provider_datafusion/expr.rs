@@ -773,26 +773,20 @@ fn postgres_sub_microsecond_comparison(
     }))
 }
 
-/// `value`, or a nanosecond timestamp literal rounded to the nearest microsecond, as Postgres
-/// rounds a finer value it stores. For the value of an `UPDATE`'s `SET`; a comparison bound is
+/// `value`, or a nanosecond timestamp literal truncated to the microsecond, as an `INSERT` through
+/// this writer stores a `timestamp`. For the value of an `UPDATE`'s `SET`; a comparison bound is
 /// written exactly by [`postgres_sub_microsecond_comparison`] instead.
 #[must_use]
-pub fn round_postgres_set_value(value: Expr) -> Expr {
+pub fn truncate_postgres_set_value(value: Expr) -> Expr {
     match value {
-        Expr::Literal(ScalarValue::TimestampNanosecond(Some(nanos), timezone), metadata)
-            if nanos % 1_000 != 0 =>
-        {
-            let micros = nanos.div_euclid(1_000) + i64::from(nanos.rem_euclid(1_000) >= 500);
-            match micros.checked_mul(1_000) {
-                Some(rounded) => Expr::Literal(
-                    ScalarValue::TimestampNanosecond(Some(rounded), timezone),
-                    metadata,
-                ),
-                None => Expr::Literal(
-                    ScalarValue::TimestampNanosecond(Some(nanos), timezone),
-                    metadata,
-                ),
-            }
+        Expr::Literal(ScalarValue::TimestampNanosecond(Some(nanos), timezone), metadata) => {
+            // Below the first whole microsecond of the `i64` range, the literal stays as it is and
+            // is refused.
+            let truncated = nanos.div_euclid(1_000).checked_mul(1_000).unwrap_or(nanos);
+            Expr::Literal(
+                ScalarValue::TimestampNanosecond(Some(truncated), timezone),
+                metadata,
+            )
         }
         other => other,
     }
@@ -2578,24 +2572,44 @@ mod tests {
             render(col("ts").lt_eq(ns(-1))),
             "\"ts\" <= (TIMESTAMP '1970-01-01 00:00:00' + make_interval(days => -1, secs => 86399.999999))"
         );
+        // A bound on a whole microsecond is written as it is, for every operator.
+        let whole = ns(1_704_067_200_000_001_000);
+        assert_eq!(
+            render(col("ts").lt(whole.clone())),
+            format!("\"ts\" < {after}")
+        );
+        assert_eq!(render(col("ts").eq(whole)), format!("\"ts\" = {after}"));
+        // A bound with a time zone is read at UTC on both sides.
+        let utc = Expr::Literal(
+            ScalarValue::TimestampNanosecond(Some(1_704_067_200_000_000_999), Some("UTC".into())),
+            None,
+        );
+        assert_eq!(
+            render(col("tstz").lt(utc)),
+            format!("\"tstz\" < ({after} AT TIME ZONE 'UTC')")
+        );
         // Any other use of such a literal is still refused.
         assert!(to_sql_with_engine(&(col("ts") - bound), Some(Engine::Postgres)).is_err());
     }
 
-    /// An `UPDATE`'s `SET` value between two microseconds is rounded to the nearest one, which is
-    /// what Postgres stores for it.
+    /// An `UPDATE`'s `SET` value between two microseconds is truncated to the microsecond, as an
+    /// `INSERT` stores it.
     #[test]
-    fn test_postgres_set_value_rounds_to_the_nearest_microsecond() {
+    fn test_postgres_set_value_truncates_to_the_microsecond() {
         let ns =
             |value: i64| Expr::Literal(ScalarValue::TimestampNanosecond(Some(value), None), None);
         for (value, expected) in [
             (1_499, 1_000),
-            (1_500, 2_000),
-            (-1_499, -1_000),
+            (1_999, 1_000),
+            (-1_499, -2_000),
             (2_000, 2_000),
-            (i64::MAX, i64::MAX),
+            (i64::MIN, i64::MIN),
         ] {
-            assert_eq!(round_postgres_set_value(ns(value)), ns(expected), "{value}");
+            assert_eq!(
+                truncate_postgres_set_value(ns(value)),
+                ns(expected),
+                "{value}"
+            );
         }
     }
 
