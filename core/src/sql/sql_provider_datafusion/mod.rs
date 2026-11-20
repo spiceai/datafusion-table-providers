@@ -131,18 +131,13 @@ impl<T, P> SqlTable<T, P> {
             .await
             .context(UnableToGetSchemaSnafu)?;
 
-        Ok(Self {
+        Ok(Self::new_with_schema(
             name,
-            pool: Arc::clone(pool),
+            pool,
             schema,
             table_reference,
             engine,
-            dialect: None,
-            constraints: None,
-            function_support: None,
-            allow_physical_filter_pushdown: true,
-            allow_physical_sort_pushdown: true,
-        })
+        ))
     }
 
     pub fn new_with_schema(
@@ -158,7 +153,7 @@ impl<T, P> SqlTable<T, P> {
             schema: schema.into(),
             table_reference: table_reference.into(),
             engine,
-            dialect: None,
+            dialect: pool.dialect(),
             constraints: None,
             function_support: None,
             allow_physical_filter_pushdown: true,
@@ -800,69 +795,18 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
         &self,
         order: &[PhysicalSortExpr],
     ) -> DataFusionResult<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
-        use datafusion::logical_expr::expr::Sort;
-        use datafusion::physical_expr::expressions::Column;
-
-        if !self.allow_physical_sort_pushdown || order.is_empty() {
+        // A dialect that cannot write `NULLS FIRST/LAST` leaves the NULL order to the database,
+        // which may differ from the one asked for, so a sort on a nullable column stays local.
+        if !self.dialect.supports_nulls_first_in_sort()
+            && order.iter().any(|key| {
+                key.expr
+                    .nullable(self.projected_schema.as_ref())
+                    .unwrap_or(true)
+            })
+        {
             return Ok(SortOrderPushdownResult::Unsupported);
         }
-
-        let unparser = Unparser::new(self.dialect());
-
-        // Build ORDER BY clause from physical sort expressions using the Unparser
-        let mut order_by_parts = Vec::with_capacity(order.len());
-        for sort_expr in order {
-            let Some(col) = sort_expr.expr.downcast_ref::<Column>() else {
-                return Ok(SortOrderPushdownResult::Unsupported);
-            };
-            let logical_sort = Sort::new(
-                Expr::Column(datafusion::common::Column::new_unqualified(col.name())),
-                !sort_expr.options.descending,
-                sort_expr.options.nulls_first,
-            );
-            let order_by_expr = unparser.sort_to_sql(&logical_sort).map_err(|e| {
-                DataFusionError::Internal(format!("Failed to unparse sort expression: {e}"))
-            })?;
-            order_by_parts.push(order_by_expr.to_string());
-        }
-
-        let order_by_clause = format!("ORDER BY {}", order_by_parts.join(", "));
-
-        // Insert ORDER BY before LIMIT (if present) or at the end
-        let sql = &self.sql;
-        let Some(limit_at) = limit_offset(sql) else {
-            return Ok(SortOrderPushdownResult::Unsupported);
-        };
-        let new_sql = match limit_at {
-            Some(limit_at) => {
-                let (head, tail) = sql.split_at(limit_at);
-                join_clause(head, &format!(" {order_by_clause}"), tail)
-            }
-            None => format!("{sql} {order_by_clause}"),
-        };
-
-        let mut new_exec = Self {
-            projected_schema: Arc::clone(&self.projected_schema),
-            pool: Arc::clone(&self.pool),
-            sql: new_sql,
-            properties: self.properties.clone(),
-            dialect: Arc::clone(&self.dialect),
-            function_support: self.function_support.clone(),
-            allow_physical_filter_pushdown: self.allow_physical_filter_pushdown,
-            allow_physical_sort_pushdown: self.allow_physical_sort_pushdown,
-        };
-
-        // Update equivalence properties to reflect the output ordering
-        let eq_properties = EquivalenceProperties::new_with_orderings(
-            Arc::clone(&self.projected_schema),
-            vec![order.to_vec()],
-        );
-        new_exec.properties =
-            Arc::new(PlanProperties::clone(&new_exec.properties).with_eq_properties(eq_properties));
-
-        Ok(SortOrderPushdownResult::Exact {
-            inner: Arc::new(new_exec),
-        })
+        self.push_order_by(order)
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
@@ -973,6 +917,79 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
 
         let stream = futures::stream::once(fut).try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+}
+
+impl<T: 'static, P: 'static> SqlExec<T, P> {
+    /// Adds `order` to the SQL as `ORDER BY`. The caller decides whether the database returns
+    /// NULLs where `order` asks for them.
+    pub(crate) fn push_order_by(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> DataFusionResult<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        use datafusion::logical_expr::expr::Sort;
+        use datafusion::physical_expr::expressions::Column;
+
+        if !self.allow_physical_sort_pushdown || order.is_empty() {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        }
+
+        let unparser = Unparser::new(self.dialect());
+
+        // Build ORDER BY clause from physical sort expressions using the Unparser
+        let mut order_by_parts = Vec::with_capacity(order.len());
+        for sort_expr in order {
+            let Some(col) = sort_expr.expr.downcast_ref::<Column>() else {
+                return Ok(SortOrderPushdownResult::Unsupported);
+            };
+            let logical_sort = Sort::new(
+                Expr::Column(datafusion::common::Column::new_unqualified(col.name())),
+                !sort_expr.options.descending,
+                sort_expr.options.nulls_first,
+            );
+            let order_by_expr = unparser.sort_to_sql(&logical_sort).map_err(|e| {
+                DataFusionError::Internal(format!("Failed to unparse sort expression: {e}"))
+            })?;
+            order_by_parts.push(order_by_expr.to_string());
+        }
+
+        let order_by_clause = format!("ORDER BY {}", order_by_parts.join(", "));
+
+        // Insert ORDER BY before LIMIT (if present) or at the end
+        let sql = &self.sql;
+        let Some(limit_at) = limit_offset(sql) else {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        };
+        let new_sql = match limit_at {
+            Some(limit_at) => {
+                let (head, tail) = sql.split_at(limit_at);
+                join_clause(head, &format!(" {order_by_clause}"), tail)
+            }
+            None => format!("{sql} {order_by_clause}"),
+        };
+
+        let mut new_exec = Self {
+            projected_schema: Arc::clone(&self.projected_schema),
+            pool: Arc::clone(&self.pool),
+            sql: new_sql,
+            properties: self.properties.clone(),
+            dialect: Arc::clone(&self.dialect),
+            function_support: self.function_support.clone(),
+            allow_physical_filter_pushdown: self.allow_physical_filter_pushdown,
+            allow_physical_sort_pushdown: self.allow_physical_sort_pushdown,
+        };
+
+        // Update equivalence properties to reflect the output ordering
+        let eq_properties = EquivalenceProperties::new_with_orderings(
+            Arc::clone(&self.projected_schema),
+            vec![order.to_vec()],
+        );
+        new_exec.properties =
+            Arc::new(PlanProperties::clone(&new_exec.properties).with_eq_properties(eq_properties));
+
+        Ok(SortOrderPushdownResult::Exact {
+            inner: Arc::new(new_exec),
+        })
     }
 }
 
@@ -1781,6 +1798,91 @@ mod tests {
                 SortOrderPushdownResult::Unsupported => {}
                 other => panic!("Expected Unsupported, got {:?}", sort_result_name(&other)),
             }
+        }
+
+        #[test]
+        fn test_sort_pushdown_keeps_a_nullable_key_local_when_the_dialect_cannot_write_the_null_order(
+        ) {
+            use datafusion::sql::unparser::dialect::MySqlDialect;
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("age", DataType::Int16, false),
+            ]));
+            let pool = Arc::new(MockDBPool {})
+                as Arc<dyn DbConnectionPool<(), &'static dyn ToString> + Send + Sync>;
+            let exec = SqlExec::new(
+                None,
+                &schema,
+                pool,
+                "SELECT `name`, `age` FROM `users`".to_string(),
+                Arc::new(MySqlDialect {}),
+            )
+            .unwrap();
+            let ascending = |column: &str, index: usize| {
+                vec![PhysicalSortExpr {
+                    expr: Arc::new(Column::new(column, index)),
+                    options: SortOptions {
+                        descending: false,
+                        nulls_first: false,
+                    },
+                }]
+            };
+
+            assert!(matches!(
+                exec.try_pushdown_sort(&ascending("name", 0)).unwrap(),
+                SortOrderPushdownResult::Unsupported
+            ));
+            assert!(matches!(
+                exec.try_pushdown_sort(&ascending("age", 1)).unwrap(),
+                SortOrderPushdownResult::Exact { .. }
+            ));
+        }
+
+        #[test]
+        fn test_table_takes_the_dialect_of_its_pool() {
+            use datafusion::sql::unparser::dialect::{Dialect, MySqlDialect};
+
+            struct MySqlDialectPool {}
+
+            #[async_trait::async_trait]
+            impl DbConnectionPool<(), &'static dyn ToString> for MySqlDialectPool {
+                async fn connect(
+                    &self,
+                ) -> Result<
+                    Box<dyn DbConnection<(), &'static dyn ToString>>,
+                    Box<dyn std::error::Error + Send + Sync>,
+                > {
+                    Ok(Box::new(MockConn {}))
+                }
+
+                fn join_push_down(&self) -> JoinPushDown {
+                    JoinPushDown::Disallow
+                }
+
+                fn dialect(&self) -> Option<Arc<dyn Dialect + Send + Sync>> {
+                    Some(Arc::new(MySqlDialect {}))
+                }
+            }
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, false),
+                Field::new("Age", DataType::Int16, false),
+            ]));
+            let pool = Arc::new(MySqlDialectPool {})
+                as Arc<dyn DbConnectionPool<(), &'static dyn ToString> + Send + Sync>;
+            let table = SqlTable::new_with_schema(
+                "mock",
+                &pool,
+                schema,
+                TableReference::bare("users"),
+                None,
+            );
+
+            assert_eq!(
+                table.scan_to_sql(None, &[], None).unwrap(),
+                "SELECT `name`, `Age` FROM `users`"
+            );
         }
 
         #[test]

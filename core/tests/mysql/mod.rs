@@ -22,13 +22,14 @@ use crate::arrow_record_batch_gen::*;
 use crate::docker::RunningContainer;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::TableProviderFactory;
-use datafusion::common::{Constraints, ToDFSchema};
+use datafusion::common::{Constraints, TableReference, ToDFSchema};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::CreateExternalTable;
 use datafusion::physical_plan::collect;
 #[cfg(feature = "mysql-federation")]
 use datafusion_federation::schema_cast::record_convert::try_cast_to;
-use datafusion_table_providers::mysql::MySQLTableProviderFactory;
+use datafusion_table_providers::common::DatabaseCatalogProvider;
+use datafusion_table_providers::mysql::{MySQLTableFactory, MySQLTableProviderFactory};
 use secrecy::ExposeSecret;
 use tokio::sync::Mutex;
 
@@ -971,6 +972,108 @@ async fn test_arrow_mysql_roundtrip(
         table_name,
     )
     .await;
+}
+
+/// Collects the first column of `sql`'s result as `i32` values.
+async fn int_column(ctx: &SessionContext, sql: &str) -> Vec<Option<i32>> {
+    let batches = ctx
+        .sql(sql)
+        .await
+        .expect("query to plan")
+        .collect()
+        .await
+        .expect("query to run");
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("an Int32 column")
+                .iter()
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Checks that a double quote in a string literal or in a column name reaches MySQL as written.
+async fn assert_double_quotes_reach_mysql(ctx: &SessionContext, table: &str) {
+    assert_eq!(
+        int_column(
+            ctx,
+            &format!(r#"SELECT id FROM {table} WHERE name = 'say "hi"'"#)
+        )
+        .await,
+        vec![Some(2)],
+        "{table}: a literal that holds a double quote"
+    );
+    assert_eq!(
+        int_column(ctx, &format!(r#"SELECT "q""col" FROM {table} ORDER BY id"#)).await,
+        vec![Some(10), Some(11), None],
+        "{table}: a column whose name holds a double quote"
+    );
+    // MySQL sorts NULLs first for ASC, DataFusion last. MySqlDialect cannot write `NULLS LAST`,
+    // so the sort stays local.
+    assert_eq!(
+        int_column(ctx, &format!("SELECT qcol FROM {table} ORDER BY qcol")).await,
+        vec![Some(20), Some(21), None],
+        "{table}: NULLs sort last"
+    );
+}
+
+/// A double quote in a string literal or in a column name reaches MySQL as written, through the
+/// MySQL table provider (scanned and federated) and through the generic catalog provider, whose
+/// tables take the pool's dialect. `name` is a SQL keyword, so a dialect that quotes it with `"`
+/// makes MySQL compare a string instead of the column.
+#[test_log::test(tokio::test)]
+async fn test_mysql_sql_keeps_double_quotes() {
+    let port = crate::get_random_port();
+    let mysql_container = start_mysql_container(port).await;
+    let pool = Arc::new(
+        common::get_mysql_connection_pool(port, None)
+            .await
+            .expect("MySQL connection pool to be created"),
+    );
+    let conn = pool.connect_direct().await.expect("connection to open");
+    for statement in [
+        "CREATE TABLE quotes (id INT, name TEXT, `q\"col` INT, qcol INT)",
+        "INSERT INTO quotes VALUES (1, 'say hi', 10, 20), (2, 'say \"hi\"', 11, 21), (3, NULL, NULL, NULL)",
+    ] {
+        conn.execute(statement, &[])
+            .await
+            .expect("setup statement to run");
+    }
+
+    let ctx = SessionContext::new();
+    let table = MySQLTableFactory::new(Arc::clone(&pool))
+        .table_provider(TableReference::bare("quotes"))
+        .await
+        .expect("table provider to be created");
+    ctx.register_table("quotes", Arc::clone(&table))
+        .expect("table to be registered");
+    let dyn_pool: Arc<
+        dyn DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)> + Send + Sync,
+    > = Arc::clone(&pool) as _;
+    let catalog = DatabaseCatalogProvider::try_new(dyn_pool)
+        .await
+        .expect("catalog provider to be created");
+    ctx.register_catalog("mysql", Arc::new(catalog));
+
+    assert_double_quotes_reach_mysql(&ctx, "quotes").await;
+    assert_double_quotes_reach_mysql(&ctx, "mysql.mysqldb.quotes").await;
+
+    #[cfg(feature = "mysql-federation")]
+    {
+        let federated =
+            SessionContext::new_with_state(datafusion_federation::default_session_state());
+        federated
+            .register_table("quotes", table)
+            .expect("table to be registered");
+        assert_double_quotes_reach_mysql(&federated, "quotes").await;
+    }
+
+    mysql_container.remove().await.expect("container to stop");
 }
 
 async fn mysql_connection_id(pool: &MySQLConnectionPool) -> u64 {

@@ -42,10 +42,7 @@ pub(super) fn get_mysql_params(
         SecretString::from("disabled".to_string()),
     );
     if let Some(tz) = time_zone {
-        params.insert(
-            "mysql_connection_time_zone".to_string(),
-            SecretString::from(tz.to_string()),
-        );
+        params.insert("time_zone".to_string(), SecretString::from(tz.to_string()));
     }
     params.insert(
         "mysql_pool_min".to_string(),

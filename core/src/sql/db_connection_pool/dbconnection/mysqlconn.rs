@@ -199,7 +199,7 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
         projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream> {
         let params_vec: Vec<_> = params.iter().map(|&p| p.to_value()).collect();
-        let sql = sql.replace('"', "");
+        let sql = sql.to_string();
 
         let conn = Arc::clone(&self.conn);
         let zero_date_behavior = self.zero_date_behavior;

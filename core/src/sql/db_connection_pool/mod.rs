@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use datafusion::sql::unparser::dialect::Dialect;
 use dbconnection::DbConnection;
 use secrecy::SecretString;
 use std::sync::Arc;
@@ -75,6 +76,12 @@ pub trait DbConnectionPool<T, P: 'static> {
     async fn connect(&self) -> Result<Box<dyn DbConnection<T, P>>>;
 
     fn join_push_down(&self) -> JoinPushDown;
+
+    /// The dialect for SQL sent through this pool's connections. A `SqlTable` built on the pool
+    /// uses it unless it is given another; `None` means `DefaultDialect`.
+    fn dialect(&self) -> Option<Arc<dyn Dialect + Send + Sync>> {
+        None
+    }
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
