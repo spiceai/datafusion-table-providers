@@ -19,7 +19,7 @@ use datafusion::{
     sql::sqlparser::{
         dialect::GenericDialect,
         keywords::Keyword,
-        tokenizer::{Token, Tokenizer},
+        tokenizer::{Token, Tokenizer, Whitespace},
     },
     sql::unparser::{
         dialect::{DefaultDialect, Dialect},
@@ -654,7 +654,9 @@ fn physical_expr_to_sql(
 /// inside a string literal, a quoted name or parentheses is not a clause, so the offsets come from
 /// the tokenizer. `None` if the query does not tokenize, or if it holds a backslash: some engines
 /// read `\'` inside a literal as a quote and others as the end of the literal, so the tokenizer
-/// cannot tell where such a literal ends.
+/// cannot tell where such a literal ends. Also `None` if the tokenizer finds a comment: the SQL
+/// written here holds none, and engines differ on where a comment starts (`--x` is a comment for
+/// most of them and two minus signs for MySQL).
 fn clause_keywords(sql: &str) -> Option<Vec<(Keyword, usize)>> {
     if sql.contains('\\') {
         return None;
@@ -671,6 +673,9 @@ fn clause_keywords(sql: &str) -> Option<Vec<(Keyword, usize)>> {
         match &token.token {
             Token::LParen => depth += 1,
             Token::RParen => depth = depth.saturating_sub(1),
+            Token::Whitespace(
+                Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_),
+            ) => return None,
             Token::Word(word)
                 if depth == 0
                     && word.quote_style.is_none()
@@ -1727,6 +1732,7 @@ mod tests {
             for sql in [
                 "SELECT \"name\", \"age\" FROM \"users\" WHERE \"name\" = 'a\\'",
                 "SELECT \"name\", \"age\" FROM \"users\" WHERE \"name\" = 'a",
+                "SELECT \"name\", \"age\" FROM \"users\" WHERE (--\"age\" > 0) LIMIT 3",
             ] {
                 let exec = make_exec(sql);
                 assert!(exec.with_fetch(Some(5)).is_none(), "{sql}: limit");
@@ -2256,6 +2262,13 @@ mod tests {
         }
 
         #[test]
+        fn test_fetch_reads_the_limit_after_a_non_ascii_literal() {
+            // `ŉ` is two bytes and its uppercase form three.
+            let exec = make_exec("SELECT * FROM t WHERE \"name\" = 'ŉ' LIMIT 5");
+            assert_eq!(exec.fetch(), Some(5));
+        }
+
+        #[test]
         fn test_fetch_with_order_by_and_limit() {
             let exec = make_exec("SELECT * FROM t ORDER BY a LIMIT 10");
             assert_eq!(exec.fetch(), Some(10));
@@ -2427,6 +2440,10 @@ mod tests {
             assert_eq!(
                 insert_where_clause(sql, "\"c\" > 3").unwrap(),
                 format!("{sql} AND (\"c\" > 3)")
+            );
+            assert_eq!(
+                insert_where_clause("SELECT \"a LIMIT b\" FROM t", "\"c\" > 3").unwrap(),
+                "SELECT \"a LIMIT b\" FROM t WHERE \"c\" > 3"
             );
             let sql = "SELECT `a WHERE b` FROM t LIMIT 2";
             assert_eq!(
