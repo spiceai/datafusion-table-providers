@@ -34,12 +34,16 @@ impl ClickHouseTable {
             None => identifier.to_string(),
         };
 
-        let columns = projected_schema
-            .fields()
-            .iter()
-            .map(|f| quote_identifier(f.name()))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let columns = if projected_schema.fields().is_empty() {
+            "1".to_string()
+        } else {
+            projected_schema
+                .fields()
+                .iter()
+                .map(|f| quote_identifier(f.name()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
 
         let limit_expr = match limit {
             Some(limit) => format!("LIMIT {limit}"),
@@ -165,6 +169,20 @@ mod tests {
         assert!(
             sql.contains("FROM companies_param_view(name='Gizmo Corp.')"),
             "expected parameterized view expression in SQL: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_build_sql_for_empty_projection_selects_a_placeholder() {
+        let table = new_clickhouse_table(None);
+
+        let sql = table
+            .build_sql(Some(&vec![]), &[], None)
+            .expect("build sql for empty projection");
+
+        assert!(
+            sql.starts_with("SELECT 1 FROM companies_param_view"),
+            "expected a placeholder column for an empty projection: {sql}"
         );
     }
 

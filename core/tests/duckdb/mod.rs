@@ -476,10 +476,10 @@ mod empty_projection {
     use datafusion::arrow::array::Int64Array;
     use datafusion::execution::context::SessionContext;
     use datafusion::sql::TableReference;
+    use datafusion_table_providers::duckdb::DuckDBTableFactory;
     use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
     use datafusion_table_providers::sql::db_connection_pool::dbconnection::DbConnection;
     use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-    use datafusion_table_providers::duckdb::DuckDBTableFactory;
     use std::sync::Arc;
 
     async fn count_of(ctx: &SessionContext, sql: &str) -> i64 {
@@ -537,9 +537,6 @@ mod empty_projection {
         );
         // A non-empty projection still works (guards against regressing the
         // normal scan path).
-        assert_eq!(
-            count_of(&ctx, "SELECT count(id) AS n FROM orders").await,
-            3
-        );
+        assert_eq!(count_of(&ctx, "SELECT count(id) AS n FROM orders").await, 3);
     }
 }
