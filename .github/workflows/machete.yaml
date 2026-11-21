@@ -11,6 +11,11 @@ on:
       - .github/workflows/machete.yml
       - ./**/Cargo.toml
 
+# This job only reads the repository. Without this, the token gets the
+# repository's default permissions, which include write access.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -18,10 +23,22 @@ concurrency:
 jobs:
   detect-unused-dependencies:
     name: Unused dependencies
-    runs-on: ubuntu-latest
+    # Self-hosted pool: skip pull requests from forks. A fork's pull request
+    # can edit this file, so maintainer approval of fork runs is the boundary
+    # (see pr.yaml). Non-PR events and same-repository PRs still run.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: spiceai-dev-runners
 
     steps:
       - uses: actions/checkout@v7
 
+      # bnjbvr/cargo-machete's installer moves the binary into /usr/local/bin,
+      # which the self-hosted runner user can't write. install-action puts it in
+      # the cargo bin directory and checks its sha256.
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+
       - name: Machete
-        uses: bnjbvr/cargo-machete@main
+        run: cargo machete
