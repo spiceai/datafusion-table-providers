@@ -7,6 +7,11 @@ on:
       - main
       - spiceai
 
+# The jobs only read the repository. Without this, the token gets the
+# repository's default permissions, which include write access.
+permissions:
+  contents: read
+
 # A new push to a pull request cancels its earlier run, so superseded commits
 # don't hold runners in the shared self-hosted pool.
 concurrency:

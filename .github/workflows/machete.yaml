@@ -11,6 +11,11 @@ on:
       - .github/workflows/machete.yml
       - ./**/Cargo.toml
 
+# This job only reads the repository. Without this, the token gets the
+# repository's default permissions, which include write access.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
