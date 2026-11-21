@@ -14,7 +14,9 @@ use datafusion::{
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
 };
 
-use crate::sql::sql_provider_datafusion::{expr, project_schema_safe, SqlExec};
+use crate::sql::sql_provider_datafusion::{
+    apply_local_filters, expr, project_schema_safe, split_scan_filters, SqlExec,
+};
 
 use super::ClickHouseTable;
 
@@ -92,21 +94,32 @@ impl TableProvider for ClickHouseTable {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let sql = self.build_sql(projection, filters, limit)?;
+        let (in_sql, local) = split_scan_filters(self, filters)?;
+        let (scan_projection, scan_filters, scan_limit) = if local.is_empty() {
+            (projection, filters, limit)
+        } else {
+            (None, in_sql.as_slice(), None)
+        };
+        let sql = self.build_sql(scan_projection, scan_filters, scan_limit)?;
         let exec = SqlExec::new(
-            projection,
+            scan_projection,
             &self.schema(),
             self.pool.clone(),
             sql,
             Arc::clone(&self.dialect),
         )?;
-
-        Ok(Arc::new(exec))
+        if local.is_empty() {
+            return Ok(Arc::new(exec));
+        }
+        // This exec has no function support of its own, so physical filter pushdown would
+        // write the refused filters back into its SQL.
+        let exec = Arc::new(exec.with_allow_physical_filter_pushdown(false));
+        apply_local_filters(state, exec, &self.schema(), projection, &local, limit)
     }
 }
 

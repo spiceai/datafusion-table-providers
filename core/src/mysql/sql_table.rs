@@ -11,7 +11,8 @@ use std::fmt::Display;
 use std::{fmt, sync::Arc};
 
 use crate::sql::sql_provider_datafusion::{
-    self, get_stream, to_execution_error, Result as SqlResult, SqlExec, SqlTable,
+    self, apply_local_filters, get_stream, split_scan_filters, to_execution_error,
+    Result as SqlResult, SqlExec, SqlTable,
 };
 use datafusion::{
     arrow::datatypes::SchemaRef,
@@ -110,12 +111,17 @@ impl TableProvider for MySQLTable {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        return self.create_physical_plan(projection, &self.schema(), filters, limit);
+        let (in_sql, local) = split_scan_filters(self, filters)?;
+        if local.is_empty() {
+            return self.create_physical_plan(projection, &self.schema(), filters, limit);
+        }
+        let plan = self.create_physical_plan(None, &self.schema(), &in_sql, None)?;
+        apply_local_filters(state, plan, &self.schema(), projection, &local, limit)
     }
 }
 

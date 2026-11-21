@@ -721,6 +721,118 @@ async fn test_sqlite_federation_keeps_unsupported_function_local() {
     );
 }
 
+/// A scan keeps a filter its function support refuses out of the SQL it sends to
+/// `SQLite`, even when the caller never asked the pushdown check, and after the physical
+/// optimizer runs. The rows still match every filter.
+#[tokio::test]
+async fn test_sqlite_scan_keeps_a_refused_filter_out_of_the_sql() {
+    use datafusion::catalog::TableProvider;
+    use datafusion::logical_expr::{col, lit, Expr};
+    use datafusion::physical_planner::DefaultPhysicalPlanner;
+    use datafusion::scalar::ScalarValue;
+    use datafusion_table_providers::sqlite::sql_table::SQLiteTable;
+    use datafusion_table_providers::util::supported_functions::FunctionSupport;
+
+    let table_name = "refused_filter_test";
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("b", DataType::Utf8, true),
+        Field::new("n", DataType::Int64, true),
+    ]));
+    let record_batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec![
+                Some("a\\b"),
+                Some("plain"),
+                Some("a\\b"),
+            ])),
+            Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(-3)])),
+        ],
+    )
+    .expect("record batch should be created");
+
+    let pool = SqliteConnectionPoolFactory::new(
+        ":memory:",
+        Mode::Memory,
+        std::time::Duration::from_millis(5000),
+    )
+    .build()
+    .await
+    .expect("Sqlite connection pool to be created");
+    let conn = pool
+        .connect()
+        .await
+        .expect("Sqlite connection should be established");
+    let conn = conn.as_async().expect("async connection");
+    conn.execute(
+        &CreateTableBuilder::new(Arc::clone(&schema), table_name).build_sqlite(),
+        &[],
+    )
+    .await
+    .expect("Sqlite table should be created");
+    conn.execute(
+        &InsertBuilder::new(&TableReference::from(table_name), &vec![record_batch])
+            .build_sqlite(None)
+            .expect("SQLite insert statement should be constructed"),
+        &[],
+    )
+    .await
+    .expect("Sqlite data should be inserted");
+
+    let refuse_backslash = FunctionSupport::new(None, None, None).with_expression_support(
+        Arc::new(|expr: &Expr, _: Option<&datafusion::common::DFSchema>| {
+            !matches!(expr, Expr::Literal(ScalarValue::Utf8(Some(s)), _) if s.contains('\\'))
+        }),
+    );
+    let pool: Arc<DynSqliteConnectionPool> = Arc::new(pool);
+    let table = SQLiteTable::new_with_schema(&pool, Arc::clone(&schema), table_name, None)
+        .with_function_support(Some(refuse_backslash));
+
+    let ctx = SessionContext::new();
+    let state = ctx.state();
+    let filters = [col("b").eq(lit("a\\b")), col("n").gt(lit(0_i64))];
+    let plan = table
+        .scan(&state, Some(&vec![1]), &filters, Some(10))
+        .await
+        .expect("scan should plan");
+    let plan = DefaultPhysicalPlanner::default()
+        .optimize_physical_plan(plan, &state, |_, _| {})
+        .expect("plan should optimize");
+    let display = datafusion::physical_plan::displayable(plan.as_ref())
+        .indent(true)
+        .to_string();
+    let sql_lines: Vec<_> = display
+        .lines()
+        .filter(|line| line.contains("SQLiteSqlExec"))
+        .collect();
+    assert_eq!(sql_lines.len(), 1, "{display}");
+    assert!(
+        !sql_lines[0].contains('\\'),
+        "the refused filter reached SQLite:\n{display}"
+    );
+    assert!(
+        sql_lines[0].contains("> 0"),
+        "the accepted filter must stay in the SQL:\n{display}"
+    );
+
+    let batches = collect(plan, ctx.task_ctx())
+        .await
+        .expect("scan should run");
+    let values: Vec<Option<i64>> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("n is Int64")
+                .iter()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(values, vec![Some(1)], "{display}");
+}
+
 #[cfg(feature = "sqlite-federation")]
 async fn plan_display(ctx: &SessionContext, sql: &str) -> String {
     let physical_plan = ctx

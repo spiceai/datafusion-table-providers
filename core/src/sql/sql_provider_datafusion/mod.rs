@@ -393,14 +393,104 @@ impl<T, P> TableProvider for SqlTable<T, P> {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let sql = self.scan_to_sql(projection, filters, limit)?;
-        return self.create_physical_plan(projection, sql);
+        let (in_sql, local) = split_scan_filters(self, filters)?;
+        if local.is_empty() {
+            let sql = self.scan_to_sql(projection, filters, limit)?;
+            return self.create_physical_plan(projection, sql);
+        }
+        let sql = self.scan_to_sql(None, &in_sql, None)?;
+        let plan = self.create_physical_plan(None, sql)?;
+        apply_local_filters(state, plan, &self.schema(), projection, &local, limit)
     }
+}
+
+/// Splits a scan's `filters` into the ones `provider` accepts as `Exact` pushdown, which
+/// its SQL may hold, and the rest.
+///
+/// A scan can be handed filters its caller never offered to
+/// [`TableProvider::supports_filters_pushdown`], or ones the optimizer changed after it
+/// did (constant folding runs on a scan's filters). A filter the check refuses must not
+/// be written into the SQL, because the engine may read it differently; such filters go
+/// to [`apply_local_filters`].
+pub fn split_scan_filters(
+    provider: &dyn TableProvider,
+    filters: &[Expr],
+) -> DataFusionResult<(Vec<Expr>, Vec<Expr>)> {
+    let support = provider.supports_filters_pushdown(&filters.iter().collect::<Vec<_>>())?;
+    if support.len() != filters.len() {
+        return Err(DataFusionError::Internal(format!(
+            "pushdown support answered for {} of {} scan filters",
+            support.len(),
+            filters.len()
+        )));
+    }
+    let mut in_sql = Vec::new();
+    let mut local = Vec::new();
+    for (filter, support) in filters.iter().zip(support) {
+        if support == TableProviderFilterPushDown::Exact {
+            in_sql.push(filter.clone());
+        } else {
+            local.push(filter.clone());
+        }
+    }
+    Ok((in_sql, local))
+}
+
+/// Applies `local` filters to `plan`, a scan of every column of `schema`, then the scan's
+/// `projection` and `limit`.
+pub fn apply_local_filters(
+    state: &dyn Session,
+    plan: Arc<dyn ExecutionPlan>,
+    schema: &SchemaRef,
+    projection: Option<&Vec<usize>>,
+    local: &[Expr],
+    limit: Option<usize>,
+) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    let mut plan = plan;
+    // A scan's filters can name a column with its table; the scanned schema has none.
+    let local = datafusion::logical_expr::expr_rewriter::unnormalize_cols(local.iter().cloned());
+    if let Some(predicate) = datafusion::logical_expr::utils::conjunction(local) {
+        let df_schema = datafusion::common::DFSchema::try_from(Arc::clone(schema))?;
+        let predicate = state.create_physical_expr(predicate, &df_schema)?;
+        plan = Arc::new(datafusion::physical_plan::filter::FilterExec::try_new(
+            predicate, plan,
+        )?);
+    }
+    if let Some(projection) = projection {
+        let columns = projection
+            .iter()
+            .map(|&index| {
+                let field = schema.fields().get(index).ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "projection index {index} is out of range for a table with {} columns",
+                        schema.fields().len()
+                    ))
+                })?;
+                let column: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(
+                    datafusion::physical_expr::expressions::Column::new(field.name(), index),
+                );
+                Ok((column, field.name().clone()))
+            })
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        plan = Arc::new(
+            datafusion::physical_plan::projection::ProjectionExec::try_new(columns, plan)?,
+        );
+    }
+    if let Some(limit) = limit {
+        plan = Arc::new(datafusion::physical_plan::limit::GlobalLimitExec::new(
+            Arc::new(
+                datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(plan),
+            ),
+            0,
+            Some(limit),
+        ));
+    }
+    Ok(plan)
 }
 
 impl<T, P> Display for SqlTable<T, P> {
@@ -1111,6 +1201,72 @@ mod tests {
             } else {
                 Ok(sql_table)
             }
+        }
+
+        /// A scan keeps a filter its own pushdown check refuses out of the SQL, even when
+        /// the caller never asked the check, and applies it above the scan.
+        #[tokio::test]
+        async fn scan_keeps_a_refused_filter_out_of_the_sql(
+        ) -> Result<(), Box<dyn Error + Send + Sync>> {
+            use crate::sql::sql_provider_datafusion::SqlExec;
+            use crate::util::supported_functions::{ExpressionSupport, FunctionSupport};
+            use datafusion::datasource::TableProvider;
+            use datafusion::execution::context::SessionContext;
+            use datafusion::logical_expr::Expr;
+            use datafusion::physical_plan::ExecutionPlan;
+            use datafusion::scalar::ScalarValue;
+
+            fn sql_of(plan: &Arc<dyn ExecutionPlan>) -> Option<String> {
+                let any: &dyn Any = plan.as_ref();
+                if let Some(exec) = any.downcast_ref::<SqlExec<(), &'static dyn ToString>>() {
+                    return exec.sql().ok();
+                }
+                plan.children().into_iter().find_map(sql_of)
+            }
+
+            let refuse_backslash: ExpressionSupport = Arc::new(
+                |expr, _| !matches!(expr, Expr::Literal(ScalarValue::Utf8(Some(s)), _) if s.contains('\\')),
+            );
+            let table = new_sql_table("users", Some(Arc::new(SqliteDialect {})))?
+                .with_function_support(Some(
+                    FunctionSupport::new(None, None, None)
+                        .with_expression_support(refuse_backslash),
+                ));
+            let state = SessionContext::new().state();
+            let filters = [col("name").eq(lit("a\\'b")), col("age").gt(lit(3_i16))];
+
+            let plan = table
+                .scan(&state, Some(&vec![1]), &filters, Some(5))
+                .await?;
+            let sql = sql_of(&plan).expect("the plan reads through a SqlExec");
+            assert_eq!(
+                sql,
+                "SELECT `name`, `age`, `createdDate`, `userId`, `active`, `5e48` FROM `users` WHERE (`age` > 3)"
+            );
+            let shown = datafusion::physical_plan::displayable(plan.as_ref())
+                .indent(true)
+                .to_string();
+            assert!(shown.contains("FilterExec: name@0 = a\\'b"), "{shown}");
+            assert!(
+                shown.contains("GlobalLimitExec: skip=0, fetch=5"),
+                "{shown}"
+            );
+            let names: Vec<_> = plan
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            assert_eq!(names, ["age"]);
+
+            let plan = table
+                .scan(&state, Some(&vec![1]), &filters[1..], Some(5))
+                .await?;
+            assert_eq!(
+                sql_of(&plan).as_deref(),
+                Some("SELECT `age` FROM `users` WHERE (`age` > 3) LIMIT 5")
+            );
+            Ok(())
         }
 
         #[tokio::test]
