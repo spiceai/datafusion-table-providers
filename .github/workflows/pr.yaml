@@ -47,6 +47,13 @@ jobs:
 
       - run: cargo clippy --all-features -- -D warnings
 
+      # Linking the integration tests needs libsqlite3.so, which the hosted
+      # image ships and the self-hosted pool's image doesn't.
+      - name: Install Sqlite
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+
       # `make test` runs only `--lib`, so nothing else in CI compiles the
       # integration suite. Type-check it here (no Docker required) so it can't
       # silently rot.
