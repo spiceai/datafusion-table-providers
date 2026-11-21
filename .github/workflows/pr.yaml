@@ -222,12 +222,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libaio1t64 wget unzip || sudo apt-get install -y libaio1 wget unzip
           wget -q https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linuxx64.zip
-          mkdir -p /opt/oracle
-          unzip -q instantclient-basiclite-linuxx64.zip -d /opt/oracle -x "META-INF/*"
-          IC_DIR=$(ls -d /opt/oracle/instantclient*)
+          # Unpack into the job's temp directory: on the self-hosted pool the runner user can't write to /opt.
+          ORACLE_DIR="$RUNNER_TEMP/oracle"
+          mkdir -p "$ORACLE_DIR"
+          unzip -q instantclient-basiclite-linuxx64.zip -d "$ORACLE_DIR" -x "META-INF/*"
+          IC_DIR=$(ls -d "$ORACLE_DIR"/instantclient*)
           # Ubuntu 22.04+ renamed libaio.so.1 to libaio.so.1t64; the Instant Client still looks for the old name.
           if [ -f /usr/lib/x86_64-linux-gnu/libaio.so.1t64 ] && [ ! -f "$IC_DIR/libaio.so.1" ]; then
-            sudo ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 "$IC_DIR/libaio.so.1"
+            ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 "$IC_DIR/libaio.so.1"
           fi
           echo "LD_LIBRARY_PATH=$IC_DIR" >> "$GITHUB_ENV"
 
