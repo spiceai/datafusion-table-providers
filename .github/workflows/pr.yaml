@@ -135,6 +135,8 @@ jobs:
       - name: Install ADBC drivers
         run: |
           curl -LsSf https://dbc.columnar.tech/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
           dbc install sqlite
           dbc install duckdb
 
