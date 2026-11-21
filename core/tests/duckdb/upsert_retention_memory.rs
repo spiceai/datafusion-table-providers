@@ -75,6 +75,15 @@ const DEFAULT_WARMUP_CYCLES: usize = 20;
 /// the signal this test is built around. A workload that holds steady stays
 /// well below it.
 const DEFAULT_MEMORY_LIMIT: &str = "256MB";
+/// DuckDB worker threads for the instance.
+///
+/// DuckDB defaults to one thread per CPU it can use, and how far RSS climbs
+/// over this run grows with the thread count. On Linux, growth past the
+/// baseline measured about 105-155 MiB at 4 and 16 threads, 262 MiB at 32,
+/// and 450-490 MiB at 64, past [`DEFAULT_MAX_GROWTH_MB`].
+/// Pinning the thread count keeps the workload, and so the thresholds here,
+/// the same on a 4-vCPU runner and a many-core machine.
+const DEFAULT_DUCKDB_THREADS: usize = 4;
 /// Rows older than this (seconds) and flagged deleted are trimmed by retention.
 const DEFAULT_RETENTION_WINDOW_SECS: i64 = 900;
 /// Allowed absolute RSS growth past the post-warmup baseline.
@@ -94,6 +103,7 @@ struct StressConfig {
     reader_pause: Duration,
     warmup_cycles: usize,
     memory_limit: String,
+    duckdb_threads: usize,
     retention_window_secs: i64,
     op_timeout: Duration,
     max_growth_bytes: u64,
@@ -121,6 +131,7 @@ impl StressConfig {
             // Keep at least a few measured cycles after the warmup.
             warmup_cycles: warmup_cycles.min(cycles.saturating_sub(3)),
             memory_limit: env_string("DUCKDB_MEM_TEST_MEMORY_LIMIT", DEFAULT_MEMORY_LIMIT),
+            duckdb_threads: env_usize("DUCKDB_MEM_TEST_THREADS", DEFAULT_DUCKDB_THREADS).max(1),
             retention_window_secs: env_i64(
                 "DUCKDB_MEM_TEST_RETENTION_WINDOW_SECS",
                 DEFAULT_RETENTION_WINDOW_SECS,
@@ -638,6 +649,38 @@ fn duckdb_memory_report(table: &Arc<dyn TableProvider>) -> Option<String> {
     }
 }
 
+/// Sets DuckDB's `threads` on the instance behind `table` and returns the value
+/// a second connection reads back.
+///
+/// `threads` is an instance-wide setting, so setting it on one pooled
+/// connection covers the writer and every reader; reading it back from another
+/// connection checks exactly that, and fails the test rather than letting it
+/// run at the machine's default.
+fn pin_duckdb_threads(table: &Arc<dyn TableProvider>, threads: usize) -> i64 {
+    let writer = table
+        .downcast_ref::<DuckDBTableWriter>()
+        .expect("the DuckDB table provider is a DuckDBTableWriter");
+    let pool = writer.pool();
+
+    let mut setter = Arc::clone(&pool)
+        .connect_sync()
+        .expect("a pooled DuckDB connection");
+    DuckDB::duckdb_conn(&mut setter)
+        .expect("the pooled connection is a DuckDB connection")
+        .conn
+        .execute_batch(&format!("SET threads = {threads}"))
+        .expect("DuckDB accepts the threads setting");
+
+    let mut reader = pool
+        .connect_sync()
+        .expect("a second pooled DuckDB connection");
+    DuckDB::duckdb_conn(&mut reader)
+        .expect("the pooled connection is a DuckDB connection")
+        .conn
+        .query_row("SELECT current_setting('threads')", [], |row| row.get(0))
+        .expect("DuckDB reports its threads setting")
+}
+
 async fn count_rows(ctx: &SessionContext, table_name: &str) -> u64 {
     let batches = ctx
         // `COUNT(*)` plans to an empty projection, which trips a schema
@@ -736,9 +779,17 @@ async fn upsert_with_retention_under_query_load_does_not_grow_memory(
     ctx.register_table(dataset_name.as_str(), Arc::clone(&dataset))
         .expect("dataset is registered");
 
+    let duckdb_threads = pin_duckdb_threads(&dataset, cfg.duckdb_threads);
+    assert_eq!(
+        usize::try_from(duckdb_threads).ok(),
+        Some(cfg.duckdb_threads),
+        "DuckDB reports threads = {duckdb_threads} after setting it to {}",
+        cfg.duckdb_threads
+    );
+
     tracing::info!(
         "starting {} cycles ({} rows/cycle, {} columns, key space {}, payload {}B, \
-         {} readers, memory_limit {})",
+         {} readers, memory_limit {}, {} DuckDB threads)",
         cfg.cycles,
         cfg.rows_per_cycle,
         schema.fields().len(),
@@ -746,6 +797,7 @@ async fn upsert_with_retention_under_query_load_does_not_grow_memory(
         cfg.payload_bytes,
         cfg.readers,
         cfg.memory_limit,
+        duckdb_threads,
     );
 
     let stop = Arc::new(AtomicBool::new(false));
