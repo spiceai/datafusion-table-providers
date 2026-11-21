@@ -8,10 +8,29 @@ on:
       - spiceai
       - spiceai-*
 
+# The jobs only read the repository. Without this, the token gets the
+# repository's default permissions, which include write access.
+permissions:
+  contents: read
+
+# A new push to a pull request cancels its earlier run, so superseded commits
+# don't hold runners in the shared self-hosted pool.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Every job runs on the self-hosted `spiceai-dev-runners` pool and skips pull
+# requests from forks; non-PR events and same-repository pull requests still
+# run. The skip keeps an unmodified workflow from scheduling fork code on the
+# pool, but a fork's pull request runs its own copy of this file and can remove
+# it. The boundary is the repository's fork-run approval setting, which holds
+# every outside contributor's run until a maintainer approves it: don't approve
+# a fork run whose pull request changes `.github/` without reading that change.
 jobs:
   lint:
     name: Clippy
-    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: spiceai-dev-runners
 
     steps:
       - uses: actions/checkout@v6
@@ -33,6 +52,13 @@ jobs:
 
       - run: cargo clippy --all-features -- -D warnings
 
+      # Linking the integration tests needs libsqlite3.so, which the hosted
+      # image ships and the self-hosted pool's image doesn't.
+      - name: Install Sqlite
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+
       # `make test` runs only `--lib`, so nothing else in CI compiles the
       # integration suite. Type-check it here (no Docker required) so it can't
       # silently rot.
@@ -41,7 +67,8 @@ jobs:
 
   build:
     name: Build (${{ matrix.features }})
-    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: spiceai-dev-runners
 
     strategy:
       matrix:
@@ -74,7 +101,8 @@ jobs:
 
   integration-test:
     name: Tests
-    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: spiceai-dev-runners
 
     env:
       PG_DOCKER_IMAGE: ghcr.io/cloudnative-pg/postgresql:16-bookworm
@@ -110,44 +138,17 @@ jobs:
             docker save -o /tmp/docker-images/mysql.tar ${{ env.MYSQL_DOCKER_IMAGE }}
           fi
 
-      - name: Free Disk Space
-        run: |
-          sudo docker rmi $(docker image ls -aq) >/dev/null 2>&1 || true
-          sudo rm -rf \
-            /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/share/powershell /usr/share/swift /usr/local/.ghcup \
-            /usr/lib/jvm || true
-          echo "some directories deleted"
-          sudo apt-get update >/dev/null 2>&1
-          sudo apt install aptitude -y >/dev/null 2>&1 || true
-          sudo aptitude purge aria2 ansible azure-cli shellcheck rpm xorriso zsync \
-            esl-erlang firefox gfortran-8 gfortran-9 google-chrome-stable \
-            google-cloud-sdk imagemagick \
-            libmagickcore-dev libmagickwand-dev libmagic-dev ant ant-optional kubectl \
-            mercurial apt-transport-https mono-complete libmysqlclient \
-            yarn chrpath libssl-dev libxft-dev \
-            libfreetype6 libfreetype6-dev libfontconfig1 libfontconfig1-dev \
-            snmp pollinate libpq-dev postgresql-client powershell ruby-full \
-            sphinxsearch subversion mongodb-org azure-cli microsoft-edge-stable \
-            -y -f >/dev/null 2>&1 || true
-          sudo aptitude purge google-cloud-sdk -f -y >/dev/null 2>&1 || true
-          sudo aptitude purge microsoft-edge-stable -f -y >/dev/null 2>&1 || true
-          sudo apt purge microsoft-edge-stable -f -y >/dev/null 2>&1 || true
-          sudo aptitude purge '~n ^php' -f -y >/dev/null 2>&1 || true
-          sudo aptitude purge '~n ^dotnet' -f -y >/dev/null 2>&1 || true
-          sudo apt-get autoremove -y >/dev/null 2>&1 || true
-          sudo apt-get autoclean -y >/dev/null 2>&1 || true
-          echo "some packages purged"
-          df -h
-
       - name: Install ODBC & Sqlite
         run: |
+          sudo apt-get update
           sudo apt-get install -y unixodbc-dev
           sudo apt-get install -y libsqlite3-dev
 
       - name: Install ADBC drivers
         run: |
           curl -LsSf https://dbc.columnar.tech/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
           dbc install sqlite
           dbc install duckdb
 
@@ -156,7 +157,8 @@ jobs:
 
   duckdb-integration-test:
     name: DuckDB Tests (release)
-    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: spiceai-dev-runners
   
     timeout-minutes: 60
 
@@ -176,7 +178,8 @@ jobs:
 
   python-integration-test:
     name: Python Tests
-    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: spiceai-dev-runners
 
     steps:
       - uses: actions/checkout@v6
@@ -203,6 +206,7 @@ jobs:
 
       - name: Install ODBC, Sqlite and Roapi
         run: |
+          sudo apt-get update
           sudo apt-get install -y unixodbc-dev libsqliteodbc
           sudo apt-get install -y libsqlite3-dev
           rustup toolchain install nightly
