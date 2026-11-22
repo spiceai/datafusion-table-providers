@@ -1496,6 +1496,98 @@ async fn test_postgres_update_without_filter(container_manager: &Mutex<Container
     assert_eq!(names, vec!["all", "all"]);
 }
 
+/// A `SET` value and a filter bound between two microseconds, as `now()` gives on Linux: the
+/// value is stored truncated to the microsecond, and the bound selects exactly the rows it bounds.
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn test_postgres_dml_with_a_timestamp_between_two_microseconds(
+    container_manager: &Mutex<ContainerManager>,
+) {
+    let mut cm = container_manager.lock().await;
+    if !cm.claimed {
+        cm.claimed = true;
+        start_container(&mut cm).await;
+    }
+    let port = cm.port;
+    let table_name = "dml_sub_microsecond";
+
+    let pool = common::get_postgres_connection_pool(port)
+        .await
+        .expect("pool");
+    let db_conn = pool.connect_direct().await.expect("connect");
+    db_conn
+        .conn
+        .batch_execute(&format!(
+            r#"CREATE TABLE "{table_name}" (id INT, ts TIMESTAMP);
+               INSERT INTO "{table_name}" VALUES
+                 (0, '2024-01-01 00:00:00'),
+                 (1, '2024-01-01 00:00:00.000001'),
+                 (2, '2024-01-01 00:00:00.000002');"#
+        ))
+        .await
+        .expect("create table");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new(
+            "ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ]));
+    let pool = Arc::new(pool);
+    let sqltable_pool: Arc<DynPostgresConnectionPool> = Arc::clone(&pool) as _;
+    let read_provider = Arc::new(
+        SqlTable::new("postgres", &sqltable_pool, table_name, None)
+            .await
+            .expect("SqlTable"),
+    );
+    let postgres = Postgres::new(table_name.into(), pool, schema, Constraints::default());
+    let writer: Arc<dyn TableProvider> = PostgresTableWriter::create(read_provider, postgres, None);
+    let ctx = SessionContext::new();
+
+    // 2024-01-01 00:00:00.0000015, between the rows at .000001 and .000002.
+    let between = lit(datafusion::scalar::ScalarValue::TimestampNanosecond(
+        Some(1_704_067_200_000_001_500),
+        None,
+    ));
+
+    let plan = writer
+        .update(
+            &ctx.state(),
+            vec![("ts".to_string(), between.clone())],
+            vec![col("id").eq(lit(0))],
+        )
+        .await
+        .expect("update");
+    assert_eq!(extract_dml_count(plan).await, 1);
+
+    let plan = writer
+        .delete_from(&ctx.state(), vec![col("ts").lt_eq(between)])
+        .await
+        .expect("delete_from");
+    assert_eq!(extract_dml_count(plan).await, 2);
+
+    let pool = common::get_postgres_connection_pool(port)
+        .await
+        .expect("pool");
+    let db_conn = pool.connect_direct().await.expect("connect");
+    let rows = db_conn
+        .conn
+        .query(
+            &format!(
+                r#"SELECT id, to_char(ts, 'YYYY-MM-DD HH24:MI:SS.US') FROM "{table_name}" ORDER BY id"#
+            ),
+            &[],
+        )
+        .await
+        .expect("query");
+    let remaining: Vec<(i32, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(
+        remaining,
+        vec![(2, "2024-01-01 00:00:00.000002".to_string())]
+    );
+}
+
 #[rstest]
 #[test_log::test(tokio::test)]
 async fn test_postgres_partitioned_table_query(container_manager: &Mutex<ContainerManager>) {
