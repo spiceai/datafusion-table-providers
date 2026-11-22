@@ -16,6 +16,11 @@ use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
     common::Constraints,
+    sql::sqlparser::{
+        dialect::GenericDialect,
+        keywords::Keyword,
+        tokenizer::{Token, Tokenizer, Whitespace},
+    },
     sql::unparser::{
         dialect::{DefaultDialect, Dialect},
         Unparser,
@@ -644,43 +649,104 @@ fn physical_expr_to_sql(
         .map(|e| e.to_string())
 }
 
-/// Insert additional WHERE conditions into a SQL string.
-/// Handles the case where a WHERE clause already exists (appends with AND)
-/// and where it doesn't (inserts WHERE before ORDER BY / LIMIT / end).
-fn insert_where_clause(sql: &str, conditions: &str) -> String {
-    let upper = sql.to_uppercase();
-
-    // Find existing WHERE clause
-    if let Some(where_pos) = upper.find(" WHERE ") {
-        // Find the end of the WHERE clause (before ORDER BY, LIMIT, GROUP BY, HAVING)
-        let after_where = where_pos + 7; // skip " WHERE "
-
-        // Find the position of the next major clause
-        let next_clause_pos = [" ORDER BY ", " LIMIT ", " GROUP BY ", " HAVING "]
-            .iter()
-            .filter_map(|kw| upper[after_where..].find(kw).map(|p| after_where + p))
-            .min()
-            .unwrap_or(sql.len());
-
-        format!(
-            "{} AND ({conditions}){}",
-            &sql[..next_clause_pos],
-            &sql[next_clause_pos..]
-        )
-    } else {
-        // No WHERE clause — insert before ORDER BY / LIMIT or at end
-        let insert_pos = [" ORDER BY ", " LIMIT ", " GROUP BY ", " HAVING "]
-            .iter()
-            .filter_map(|kw| upper.find(kw))
-            .min()
-            .unwrap_or(sql.len());
-
-        format!(
-            "{} WHERE {conditions}{}",
-            &sql[..insert_pos],
-            &sql[insert_pos..]
-        )
+/// The top-level clause keywords of a query that [`SqlTable::scan_to_sql`] built and [`SqlExec`]
+/// extended (`WHERE`, `GROUP`, `HAVING`, `ORDER`, `LIMIT`), with the byte offset of each. A keyword
+/// inside a string literal, a quoted name or parentheses is not a clause, so the offsets come from
+/// the tokenizer. `None` if the query does not tokenize, or if it holds a backslash: some engines
+/// read `\'` inside a literal as a quote and others as the end of the literal, so the tokenizer
+/// cannot tell where such a literal ends. Also `None` if the tokenizer finds a comment: the SQL
+/// written here holds none, and engines differ on where a comment starts (`--x` is a comment for
+/// most of them and two minus signs for MySQL).
+fn clause_keywords(sql: &str) -> Option<Vec<(Keyword, usize)>> {
+    if sql.contains('\\') {
+        return None;
     }
+    let tokens = Tokenizer::new(&GenericDialect {}, sql)
+        .tokenize_with_location()
+        .ok()?;
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(sql.match_indices('\n').map(|(at, _)| at + 1))
+        .collect();
+    let mut depth = 0usize;
+    let mut clauses = Vec::new();
+    for token in tokens {
+        match &token.token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth = depth.saturating_sub(1),
+            Token::Whitespace(
+                Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_),
+            ) => return None,
+            Token::Word(word)
+                if depth == 0
+                    && word.quote_style.is_none()
+                    && matches!(
+                        word.keyword,
+                        Keyword::WHERE
+                            | Keyword::GROUP
+                            | Keyword::HAVING
+                            | Keyword::ORDER
+                            | Keyword::LIMIT
+                    ) =>
+            {
+                let start = token.span.start;
+                let line_start =
+                    *line_starts.get(usize::try_from(start.line).ok()?.checked_sub(1)?)?;
+                let column = usize::try_from(start.column).ok()?.checked_sub(1)?;
+                let (at, _) = sql[line_start..].char_indices().nth(column)?;
+                clauses.push((word.keyword, line_start + at));
+            }
+            _ => {}
+        }
+    }
+    Some(clauses)
+}
+
+/// Joins `head` and `tail` with one space, without doubling the space `head` may end with.
+fn join_clause(head: &str, middle: &str, tail: &str) -> String {
+    if tail.is_empty() {
+        format!("{}{middle}", head.trim_end())
+    } else {
+        format!("{}{middle} {tail}", head.trim_end())
+    }
+}
+
+/// Inserts additional WHERE conditions into a SQL string: appended with `AND` to an existing
+/// `WHERE`, or as a new `WHERE` before `GROUP BY`, `HAVING`, `ORDER BY` or `LIMIT`. `None` if the
+/// query does not tokenize.
+fn insert_where_clause(sql: &str, conditions: &str) -> Option<String> {
+    let clauses = clause_keywords(sql)?;
+    let next_after = |from: usize| {
+        clauses
+            .iter()
+            .find(|(keyword, at)| *at > from && *keyword != Keyword::WHERE)
+            .map_or(sql.len(), |(_, at)| *at)
+    };
+    Some(
+        match clauses
+            .iter()
+            .find(|(keyword, _)| *keyword == Keyword::WHERE)
+        {
+            Some((_, where_at)) => {
+                let (head, tail) = sql.split_at(next_after(*where_at));
+                join_clause(head, &format!(" AND ({conditions})"), tail)
+            }
+            None => {
+                let (head, tail) = sql.split_at(next_after(0));
+                join_clause(head, &format!(" WHERE {conditions}"), tail)
+            }
+        },
+    )
+}
+
+/// The byte offset of the query's top-level `LIMIT`, `None` if it has none or does not tokenize.
+fn limit_offset(sql: &str) -> Option<Option<usize>> {
+    clause_keywords(sql).map(|clauses| {
+        clauses
+            .iter()
+            .rev()
+            .find(|(keyword, _)| *keyword == Keyword::LIMIT)
+            .map(|(_, at)| *at)
+    })
 }
 
 impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
@@ -723,10 +789,11 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
     }
 
     fn fetch(&self) -> Option<usize> {
-        let upper = self.sql.to_uppercase();
-        let limit_pos = upper.rfind(" LIMIT ")?;
-        let after_limit = &self.sql[limit_pos + 7..]; // skip " LIMIT "
-        after_limit.trim().parse::<usize>().ok()
+        let limit_at = limit_offset(&self.sql)??;
+        self.sql[limit_at + "LIMIT".len()..]
+            .trim()
+            .parse::<usize>()
+            .ok()
     }
 
     fn try_pushdown_sort(
@@ -751,13 +818,11 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
         let limit = limit?;
 
         let sql = &self.sql;
-        let upper = sql.to_uppercase();
 
         // Replace existing LIMIT or append one
-        let new_sql = if let Some(limit_pos) = upper.rfind(" LIMIT ") {
-            format!("{} LIMIT {limit}", &sql[..limit_pos])
-        } else {
-            format!("{sql} LIMIT {limit}")
+        let new_sql = match limit_offset(sql)? {
+            Some(limit_at) => format!("{} LIMIT {limit}", sql[..limit_at].trim_end()),
+            None => format!("{sql} LIMIT {limit}"),
         };
 
         Some(Arc::new(Self {
@@ -818,8 +883,13 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
 
         let where_clause = accepted_filters.join(" AND ");
 
-        // Insert WHERE conditions into the SQL
-        let new_sql = insert_where_clause(&self.sql, &where_clause);
+        // Insert WHERE conditions into the SQL. A query that does not tokenize keeps its filters
+        // above the scan.
+        let Some(new_sql) = insert_where_clause(&self.sql, &where_clause) else {
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                filter_results.iter().map(|_| PushedDown::No).collect(),
+            ));
+        };
 
         let new_exec = Self {
             projected_schema: Arc::clone(&self.projected_schema),
@@ -892,14 +962,15 @@ impl<T: 'static, P: 'static> SqlExec<T, P> {
 
         // Insert ORDER BY before LIMIT (if present) or at the end
         let sql = &self.sql;
-        let new_sql = if let Some(limit_pos) = sql.to_uppercase().rfind(" LIMIT ") {
-            format!(
-                "{} {order_by_clause}{}",
-                &sql[..limit_pos],
-                &sql[limit_pos..]
-            )
-        } else {
-            format!("{sql} {order_by_clause}")
+        let Some(limit_at) = limit_offset(sql) else {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        };
+        let new_sql = match limit_at {
+            Some(limit_at) => {
+                let (head, tail) = sql.split_at(limit_at);
+                join_clause(head, &format!(" {order_by_clause}"), tail)
+            }
+            None => format!("{sql} {order_by_clause}"),
         };
 
         let mut new_exec = Self {
@@ -1611,6 +1682,100 @@ mod tests {
         }
 
         #[test]
+        fn test_limit_and_sort_pushdown_skip_a_limit_word_inside_a_literal() {
+            let sql = "SELECT \"name\", \"age\" FROM \"users\" WHERE \"name\" = 'speed LIMIT 50'";
+            let exec = make_exec(sql);
+            assert_eq!(exec.fetch(), None);
+
+            let limited = exec.with_fetch(Some(5)).expect("a limit to be pushed");
+            let limited = limited
+                .downcast_ref::<SqlExec<(), &'static dyn ToString>>()
+                .unwrap();
+            assert_eq!(limited.sql().unwrap(), format!("{sql} LIMIT 5"));
+            assert_eq!(limited.fetch(), Some(5));
+
+            match limited.try_pushdown_sort(&order_by_name()).unwrap() {
+                SortOrderPushdownResult::Exact { inner } => {
+                    let sorted = inner
+                        .downcast_ref::<SqlExec<(), &'static dyn ToString>>()
+                        .unwrap();
+                    assert_eq!(
+                        sorted.sql().unwrap(),
+                        format!("{sql} ORDER BY \"name\" ASC NULLS FIRST LIMIT 5")
+                    );
+                }
+                other => panic!("Expected Exact, got {:?}", sort_result_name(&other)),
+            }
+        }
+
+        #[test]
+        fn test_sort_pushdown_skips_a_limit_word_when_the_query_has_no_limit() {
+            let sql = "SELECT \"name\", \"age\" FROM \"users\" WHERE \"name\" = 'x LIMIT 5'";
+            let exec = make_exec(sql);
+            assert_eq!(exec.fetch(), None);
+            match exec.try_pushdown_sort(&order_by_name()).unwrap() {
+                SortOrderPushdownResult::Exact { inner } => {
+                    let sorted = inner
+                        .downcast_ref::<SqlExec<(), &'static dyn ToString>>()
+                        .unwrap();
+                    assert_eq!(
+                        sorted.sql().unwrap(),
+                        format!("{sql} ORDER BY \"name\" ASC NULLS FIRST")
+                    );
+                }
+                other => panic!("Expected Exact, got {:?}", sort_result_name(&other)),
+            }
+        }
+
+        #[test]
+        fn test_sql_that_cannot_be_edited_takes_no_pushdown() {
+            for sql in [
+                "SELECT \"name\", \"age\" FROM \"users\" WHERE \"name\" = 'a\\'",
+                "SELECT \"name\", \"age\" FROM \"users\" WHERE \"name\" = 'a",
+                "SELECT \"name\", \"age\" FROM \"users\" WHERE (--\"age\" > 0) LIMIT 3",
+            ] {
+                let exec = make_exec(sql);
+                assert!(exec.with_fetch(Some(5)).is_none(), "{sql}: limit");
+                assert!(
+                    matches!(
+                        exec.try_pushdown_sort(&order_by_name()).unwrap(),
+                        SortOrderPushdownResult::Unsupported
+                    ),
+                    "{sql}: sort"
+                );
+                let schema = exec.schema();
+                let predicate = binary(
+                    col("age", &schema).expect("column should resolve"),
+                    Operator::Gt,
+                    lit(30i16),
+                    &schema,
+                )
+                .expect("predicate should build");
+                let propagation = exec
+                    .handle_child_pushdown_result(
+                        FilterPushdownPhase::Pre,
+                        ChildPushdownResult {
+                            parent_filters: vec![ChildFilterPushdownResult {
+                                filter: predicate,
+                                child_results: vec![PushedDown::Yes],
+                            }],
+                            self_filters: vec![],
+                        },
+                        &ConfigOptions::default(),
+                    )
+                    .expect("filter pushdown should succeed");
+                assert!(propagation.updated_node.is_none(), "{sql}: filter node");
+                assert!(
+                    propagation
+                        .filters
+                        .iter()
+                        .all(|filter| matches!(filter, PushedDown::No)),
+                    "{sql}: filters"
+                );
+            }
+        }
+
+        #[test]
         fn test_table_threads_sort_pushdown_setting_into_its_plan() {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("name", DataType::Utf8, false),
@@ -2097,6 +2262,13 @@ mod tests {
         }
 
         #[test]
+        fn test_fetch_reads_the_limit_after_a_non_ascii_literal() {
+            // `ŉ` is two bytes and its uppercase form three.
+            let exec = make_exec("SELECT * FROM t WHERE \"name\" = 'ŉ' LIMIT 5");
+            assert_eq!(exec.fetch(), Some(5));
+        }
+
+        #[test]
         fn test_fetch_with_order_by_and_limit() {
             let exec = make_exec("SELECT * FROM t ORDER BY a LIMIT 10");
             assert_eq!(exec.fetch(), Some(10));
@@ -2227,35 +2399,35 @@ mod tests {
         #[test]
         fn test_no_existing_where() {
             let sql = "SELECT * FROM t";
-            let result = insert_where_clause(sql, "\"a\" > 1");
+            let result = insert_where_clause(sql, "\"a\" > 1").unwrap();
             assert_eq!(result, "SELECT * FROM t WHERE \"a\" > 1");
         }
 
         #[test]
         fn test_existing_where() {
             let sql = "SELECT * FROM t WHERE \"b\" = 2";
-            let result = insert_where_clause(sql, "\"a\" > 1");
+            let result = insert_where_clause(sql, "\"a\" > 1").unwrap();
             assert_eq!(result, "SELECT * FROM t WHERE \"b\" = 2 AND (\"a\" > 1)");
         }
 
         #[test]
         fn test_no_where_with_order_by() {
             let sql = "SELECT * FROM t ORDER BY a";
-            let result = insert_where_clause(sql, "\"x\" = 1");
+            let result = insert_where_clause(sql, "\"x\" = 1").unwrap();
             assert_eq!(result, "SELECT * FROM t WHERE \"x\" = 1 ORDER BY a");
         }
 
         #[test]
         fn test_no_where_with_limit() {
             let sql = "SELECT * FROM t LIMIT 10";
-            let result = insert_where_clause(sql, "\"x\" = 1");
+            let result = insert_where_clause(sql, "\"x\" = 1").unwrap();
             assert_eq!(result, "SELECT * FROM t WHERE \"x\" = 1 LIMIT 10");
         }
 
         #[test]
         fn test_existing_where_with_order_by_and_limit() {
             let sql = "SELECT * FROM t WHERE \"a\" = 1 ORDER BY b LIMIT 5";
-            let result = insert_where_clause(sql, "\"c\" > 3");
+            let result = insert_where_clause(sql, "\"c\" > 3").unwrap();
             assert_eq!(
                 result,
                 "SELECT * FROM t WHERE \"a\" = 1 AND (\"c\" > 3) ORDER BY b LIMIT 5"
@@ -2263,9 +2435,77 @@ mod tests {
         }
 
         #[test]
+        fn test_clause_words_in_literals_and_quoted_names_are_not_clauses() {
+            let sql = "SELECT \"a LIMIT b\" FROM t WHERE (\"name\" = 'x ORDER BY y LIMIT 1 GROUP BY z HAVING w')";
+            assert_eq!(
+                insert_where_clause(sql, "\"c\" > 3").unwrap(),
+                format!("{sql} AND (\"c\" > 3)")
+            );
+            assert_eq!(
+                insert_where_clause("SELECT \"a LIMIT b\" FROM t", "\"c\" > 3").unwrap(),
+                "SELECT \"a LIMIT b\" FROM t WHERE \"c\" > 3"
+            );
+            let sql = "SELECT `a WHERE b` FROM t LIMIT 2";
+            assert_eq!(
+                insert_where_clause(sql, "`c` > 3").unwrap(),
+                "SELECT `a WHERE b` FROM t WHERE `c` > 3 LIMIT 2"
+            );
+        }
+
+        #[test]
+        fn test_clause_words_in_a_bare_literal_are_not_clauses() {
+            let sql = "SELECT * FROM t WHERE \"name\" = 'x ORDER BY y LIMIT 1'";
+            assert_eq!(
+                insert_where_clause(sql, "\"c\" > 3").unwrap(),
+                format!("{sql} AND (\"c\" > 3)")
+            );
+        }
+
+        #[test]
+        fn test_clause_words_inside_parentheses_are_not_clauses() {
+            let sql =
+                "SELECT * FROM t WHERE (\"a\" IN (SELECT \"b\" FROM u ORDER BY \"b\" LIMIT 3))";
+            assert_eq!(
+                insert_where_clause(sql, "\"c\" > 3").unwrap(),
+                format!("{sql} AND (\"c\" > 3)")
+            );
+        }
+
+        #[test]
+        fn test_a_query_with_a_backslash_takes_no_condition() {
+            assert_eq!(
+                insert_where_clause(
+                    "SELECT * FROM t WHERE \"name\" = 'a\\' LIMIT 3",
+                    "\"c\" > 3"
+                ),
+                None
+            );
+        }
+
+        #[test]
+        fn test_offsets_after_a_multi_line_non_ascii_literal() {
+            assert_eq!(
+                insert_where_clause(
+                    "SELECT * FROM t WHERE \"name\" = 'é\nü' LIMIT 3",
+                    "\"c\" > 3"
+                )
+                .unwrap(),
+                "SELECT * FROM t WHERE \"name\" = 'é\nü' AND (\"c\" > 3) LIMIT 3"
+            );
+        }
+
+        #[test]
+        fn test_a_query_that_does_not_tokenize_takes_no_condition() {
+            assert_eq!(
+                insert_where_clause("SELECT * FROM t WHERE \"a\" = 'x", "\"c\" > 3"),
+                None
+            );
+        }
+
+        #[test]
         fn test_no_where_with_order_by_and_limit() {
             let sql = "SELECT * FROM t ORDER BY b LIMIT 5";
-            let result = insert_where_clause(sql, "\"c\" > 3");
+            let result = insert_where_clause(sql, "\"c\" > 3").unwrap();
             assert_eq!(result, "SELECT * FROM t WHERE \"c\" > 3 ORDER BY b LIMIT 5");
         }
     }
