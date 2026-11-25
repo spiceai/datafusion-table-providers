@@ -14,7 +14,7 @@ use datafusion::{
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
 };
 
-use crate::sql::sql_provider_datafusion::{expr, project_schema_safe, SqlExec};
+use crate::sql::sql_provider_datafusion::{expr, plan_sql_scan, project_schema_safe, SqlExec};
 
 use super::ClickHouseTable;
 
@@ -92,21 +92,34 @@ impl TableProvider for ClickHouseTable {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let sql = self.build_sql(projection, filters, limit)?;
-        let exec = SqlExec::new(
+        plan_sql_scan(
+            self,
+            state,
             projection,
-            &self.schema(),
-            self.pool.clone(),
-            sql,
-            Arc::clone(&self.dialect),
-        )?;
-
-        Ok(Arc::new(exec))
+            filters,
+            limit,
+            |projection, sql_filters, limit| {
+                let sql = self.build_sql(projection, sql_filters, limit)?;
+                let exec = SqlExec::new(
+                    projection,
+                    &self.schema(),
+                    self.pool.clone(),
+                    sql,
+                    Arc::clone(&self.dialect),
+                )?;
+                // This exec has no function support of its own, so physical filter pushdown
+                // would write the filters kept out of its SQL back into it.
+                let all_in_sql = sql_filters.len() == filters.len();
+                Ok(Arc::new(
+                    exec.with_allow_physical_filter_pushdown(all_in_sql),
+                ))
+            },
+        )
     }
 }
 
