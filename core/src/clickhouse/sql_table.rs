@@ -14,9 +14,7 @@ use datafusion::{
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
 };
 
-use crate::sql::sql_provider_datafusion::{
-    apply_local_filters, expr, project_schema_safe, split_scan_filters, SqlExec,
-};
+use crate::sql::sql_provider_datafusion::{expr, plan_sql_scan, project_schema_safe, SqlExec};
 
 use super::ClickHouseTable;
 
@@ -99,27 +97,29 @@ impl TableProvider for ClickHouseTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let (in_sql, local) = split_scan_filters(self, filters)?;
-        let (scan_projection, scan_filters, scan_limit) = if local.is_empty() {
-            (projection, filters, limit)
-        } else {
-            (None, in_sql.as_slice(), None)
-        };
-        let sql = self.build_sql(scan_projection, scan_filters, scan_limit)?;
-        let exec = SqlExec::new(
-            scan_projection,
-            &self.schema(),
-            self.pool.clone(),
-            sql,
-            Arc::clone(&self.dialect),
-        )?;
-        if local.is_empty() {
-            return Ok(Arc::new(exec));
-        }
-        // This exec has no function support of its own, so physical filter pushdown would
-        // write the refused filters back into its SQL.
-        let exec = Arc::new(exec.with_allow_physical_filter_pushdown(false));
-        apply_local_filters(state, exec, &self.schema(), projection, &local, limit)
+        plan_sql_scan(
+            self,
+            state,
+            projection,
+            filters,
+            limit,
+            |projection, sql_filters, limit| {
+                let sql = self.build_sql(projection, sql_filters, limit)?;
+                let exec = SqlExec::new(
+                    projection,
+                    &self.schema(),
+                    self.pool.clone(),
+                    sql,
+                    Arc::clone(&self.dialect),
+                )?;
+                // This exec has no function support of its own, so physical filter pushdown
+                // would write the filters kept out of its SQL back into it.
+                let all_in_sql = sql_filters.len() == filters.len();
+                Ok(Arc::new(
+                    exec.with_allow_physical_filter_pushdown(all_in_sql),
+                ))
+            },
+        )
     }
 }
 

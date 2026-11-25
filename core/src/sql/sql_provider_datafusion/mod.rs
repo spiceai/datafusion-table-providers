@@ -398,26 +398,54 @@ impl<T, P> TableProvider for SqlTable<T, P> {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let (in_sql, local) = split_scan_filters(self, filters)?;
-        if local.is_empty() {
-            let sql = self.scan_to_sql(projection, filters, limit)?;
-            return self.create_physical_plan(projection, sql);
-        }
-        let sql = self.scan_to_sql(None, &in_sql, None)?;
-        let plan = self.create_physical_plan(None, sql)?;
-        apply_local_filters(state, plan, &self.schema(), projection, &local, limit)
+        plan_sql_scan(
+            self,
+            state,
+            projection,
+            filters,
+            limit,
+            |projection, filters, limit| {
+                let sql = self.scan_to_sql(projection, filters, limit)?;
+                self.create_physical_plan(projection, sql)
+            },
+        )
     }
 }
 
-/// Splits a scan's `filters` into the ones `provider` accepts as `Exact` pushdown, which
-/// its SQL may hold, and the rest.
+/// Plans a scan of `provider` whose SQL holds only the filters `provider` accepts as
+/// `Exact` pushdown.
+///
+/// `plan_sql` plans the SQL scan for a projection, filters and limit. When `provider`
+/// refuses some of `filters`, `plan_sql` gets no projection, the accepted filters and no
+/// limit, and the refused filters, `projection` and `limit` are applied above its plan.
 ///
 /// A scan can be handed filters its caller never offered to
 /// [`TableProvider::supports_filters_pushdown`], or ones the optimizer changed after it
 /// did (constant folding runs on a scan's filters). A filter the check refuses must not
-/// be written into the SQL, because the engine may read it differently; such filters go
-/// to [`apply_local_filters`].
-pub fn split_scan_filters(
+/// be written into the SQL, because the engine may read it differently.
+pub fn plan_sql_scan(
+    provider: &dyn TableProvider,
+    state: &dyn Session,
+    projection: Option<&Vec<usize>>,
+    filters: &[Expr],
+    limit: Option<usize>,
+    plan_sql: impl FnOnce(
+        Option<&Vec<usize>>,
+        &[Expr],
+        Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>>,
+) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    let (in_sql, local) = split_scan_filters(provider, filters)?;
+    if local.is_empty() {
+        return plan_sql(projection, filters, limit);
+    }
+    let plan = plan_sql(None, &in_sql, None)?;
+    apply_local_filters(state, plan, &provider.schema(), projection, &local, limit)
+}
+
+/// Splits a scan's `filters` into the ones `provider` accepts as `Exact` pushdown and the
+/// rest.
+fn split_scan_filters(
     provider: &dyn TableProvider,
     filters: &[Expr],
 ) -> DataFusionResult<(Vec<Expr>, Vec<Expr>)> {
@@ -443,7 +471,7 @@ pub fn split_scan_filters(
 
 /// Applies `local` filters to `plan`, a scan of every column of `schema`, then the scan's
 /// `projection` and `limit`.
-pub fn apply_local_filters(
+fn apply_local_filters(
     state: &dyn Session,
     plan: Arc<dyn ExecutionPlan>,
     schema: &SchemaRef,

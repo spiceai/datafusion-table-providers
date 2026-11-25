@@ -10,8 +10,7 @@ use std::fmt::Display;
 use std::{fmt, sync::Arc};
 
 use crate::sql::sql_provider_datafusion::{
-    apply_local_filters, get_stream, split_scan_filters, to_execution_error, Result as SqlResult,
-    SqlExec, SqlTable,
+    get_stream, plan_sql_scan, to_execution_error, Result as SqlResult, SqlExec, SqlTable,
 };
 use datafusion::{
     arrow::datatypes::SchemaRef,
@@ -120,14 +119,17 @@ impl<T, P> TableProvider for SQLiteTable<T, P> {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let (in_sql, local) = split_scan_filters(self, filters)?;
-        if local.is_empty() {
-            let sql = self.base_table.scan_to_sql(projection, filters, limit)?;
-            return self.create_physical_plan(projection, &self.schema(), sql);
-        }
-        let sql = self.base_table.scan_to_sql(None, &in_sql, None)?;
-        let plan = self.create_physical_plan(None, &self.schema(), sql)?;
-        apply_local_filters(state, plan, &self.schema(), projection, &local, limit)
+        plan_sql_scan(
+            self,
+            state,
+            projection,
+            filters,
+            limit,
+            |projection, filters, limit| {
+                let sql = self.base_table.scan_to_sql(projection, filters, limit)?;
+                self.create_physical_plan(projection, &self.schema(), sql)
+            },
+        )
     }
 }
 
